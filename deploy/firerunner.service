@@ -1,0 +1,33 @@
+[Unit]
+Description=firerunner - ephemeral Firecracker microVM GitHub Actions runners
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/firerunner/firerunner.env
+ExecStart=/usr/local/bin/firerunner
+Restart=on-failure
+RestartSec=5
+
+# The process needs KVM and network/tap management. Run as a dedicated,
+# non-login user with only the capabilities it requires.
+User=firerunner
+Group=firerunner
+SupplementaryGroups=kvm
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/tmp/firerunner
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

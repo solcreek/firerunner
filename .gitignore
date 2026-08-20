@@ -1,0 +1,11 @@
+# firerunner binary
+/firerunner
+/bin/
+
+# local runtime artifacts
+*.ext4
+*.sock
+*.log
+
+# editor / OS
+.DS_Store
