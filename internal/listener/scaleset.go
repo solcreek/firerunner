@@ -63,28 +63,48 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 		return nil, err
 	}
 
-	scaleSet, err := client.CreateRunnerScaleSet(ctx, &scaleset.RunnerScaleSet{
+	desired := &scaleset.RunnerScaleSet{
 		Name:          cfg.Name,
 		RunnerGroupID: groupID,
 		Labels:        buildLabels(cfg.Name, cfg.Labels),
 		// Ephemeral golden images are rebuilt out of band; the runner agent must
 		// not self-update (GitHub official guidance for image-based runners).
 		RunnerSetting: scaleset.RunnerSetting{DisableUpdate: true},
-	})
+	}
+
+	// Get-or-create: a scale set with this name may already exist from a prior
+	// (possibly unclean) run. Reuse it so restarts are idempotent instead of
+	// failing with "runner scale set already exists".
+	existing, err := client.GetRunnerScaleSet(ctx, groupID, cfg.Name)
 	if err != nil {
-		return nil, fmt.Errorf("create runner scale set: %w", err)
+		return nil, fmt.Errorf("look up runner scale set: %w", err)
+	}
+	var scaleSet *scaleset.RunnerScaleSet
+	reused := existing != nil
+	if reused {
+		scaleSet, err = client.UpdateRunnerScaleSet(ctx, existing.ID, desired)
+		if err != nil {
+			return nil, fmt.Errorf("update runner scale set: %w", err)
+		}
+	} else {
+		scaleSet, err = client.CreateRunnerScaleSet(ctx, desired)
+		if err != nil {
+			return nil, fmt.Errorf("create runner scale set: %w", err)
+		}
 	}
 	client.SetSystemInfo(systemInfo(cfg, scaleSet.ID))
 
 	session, err := client.MessageSessionClient(ctx, scaleSet.ID, owner)
 	if err != nil {
-		// Best-effort cleanup of the scale set we just created.
-		_ = client.DeleteRunnerScaleSet(context.WithoutCancel(ctx), scaleSet.ID)
+		if !reused {
+			// Best-effort cleanup of the scale set we just created.
+			_ = client.DeleteRunnerScaleSet(context.WithoutCancel(ctx), scaleSet.ID)
+		}
 		return nil, fmt.Errorf("open message session: %w", err)
 	}
 
 	cfg.Logger.Info("registered runner scale set",
-		"name", cfg.Name, "scaleSetID", scaleSet.ID, "group", cfg.RunnerGroup)
+		"name", cfg.Name, "scaleSetID", scaleSet.ID, "group", cfg.RunnerGroup, "reused", reused)
 
 	return &ScaleSet{cfg: cfg, log: cfg.Logger, client: client, session: session, scaleSetID: scaleSet.ID}, nil
 }
