@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,9 +30,9 @@ func (jitStub) Generate(context.Context, core.RunnerSpec) (string, string, error
 
 func TestPlan(t *testing.T) {
 	cases := []struct {
-		name                    string
-		desired, running, max   int
-		want                    int
+		name                  string
+		desired, running, max int
+		want                  int
 	}{
 		{"none wanted", 0, 0, 4, 0},
 		{"scale from zero", 3, 0, 4, 3},
@@ -94,5 +95,44 @@ func TestReconcileZeroDoesNothing(t *testing.T) {
 	s.Drain()
 	if got := s.Running(); got != 0 {
 		t.Fatalf("running=%d want 0", got)
+	}
+}
+
+func TestMaintainsMinimumAfterExit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	launched := make(chan string, 32)
+	block := make(chan struct{})
+	var count int32
+	prov := provFunc(func(ctx context.Context, name, jit string, spec core.RunnerSpec) error {
+		launched <- name
+		if atomic.AddInt32(&count, 1) == 1 {
+			return nil // first microVM finishes its job and exits immediately
+		}
+		<-block // replacement stays "running" so we can observe it
+		return nil
+	})
+	s := New(Options{Max: 4, Min: 1, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 1) // warm pool of 1; that VM exits and must be replenished
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-launched:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected a replacement launch after exit; got %d launches", i)
+		}
+	}
+	if got := s.Running(); got != 1 {
+		t.Fatalf("running=%d want 1 (pool refilled to Min)", got)
+	}
+
+	// Shutdown must stop replenishment, not fight the drain.
+	cancel()
+	close(block)
+	s.Drain()
+	if got := s.Running(); got != 0 {
+		t.Fatalf("running=%d want 0 after drain", got)
 	}
 }

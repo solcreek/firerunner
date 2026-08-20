@@ -20,6 +20,7 @@ type JITSource interface {
 // Options configures a Scheduler.
 type Options struct {
 	Max         int
+	Min         int
 	Spec        core.RunnerSpec
 	Provisioner provisioner.Provisioner
 	JIT         JITSource
@@ -77,10 +78,14 @@ func (s *Scheduler) Reconcile(ctx context.Context, desired int) {
 
 func (s *Scheduler) launchOne(ctx context.Context) {
 	defer s.wg.Done()
+	// This runs before wg.Done above (defers are LIFO), so the WaitGroup counter
+	// stays >=1 while maintainMinimum may Add a replacement — avoiding a
+	// concurrent-Add-during-Drain race.
 	defer func() {
 		s.mu.Lock()
 		s.running--
 		s.mu.Unlock()
+		s.maintainMinimum(ctx)
 	}()
 
 	name, jit, err := s.opts.JIT.Generate(ctx, s.opts.Spec)
@@ -91,6 +96,19 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 	if err := s.opts.Provisioner.Launch(ctx, name, jit, s.opts.Spec); err != nil {
 		s.opts.Logger.Error("launch microVM", "runner", name, "err", err)
 	}
+}
+
+// maintainMinimum tops the warm pool back up to Min after a microVM exits. GitHub
+// only pushes a desired-count message when job demand changes, so without this a
+// burst that drains the pool would leave it below Min until the next job arrives —
+// exactly when the following burst is most likely and the warm-pool latency win
+// matters most. It no-ops during shutdown (ctx cancelled) so it never relaunches
+// VMs that Drain is trying to reap.
+func (s *Scheduler) maintainMinimum(ctx context.Context) {
+	if s.opts.Min <= 0 || ctx.Err() != nil {
+		return
+	}
+	s.Reconcile(ctx, s.opts.Min)
 }
 
 // Running returns the current number of in-flight microVMs.

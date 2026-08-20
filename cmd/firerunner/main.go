@@ -80,6 +80,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	sched := scheduler.New(scheduler.Options{
 		Max:         cfg.MaxRunners,
+		Min:         cfg.MinRunners,
 		Spec:        cfg.RunnerSpec(),
 		Provisioner: prov,
 		JIT:         lis.JIT(),
