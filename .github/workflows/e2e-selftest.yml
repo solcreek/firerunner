@@ -1,0 +1,19 @@
+name: e2e-selftest
+
+# Manual smoke test for a live firerunner scale set. Requires an operator to
+# have a firerunner listener online whose scale-set name matches `runs-on`.
+on:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: firerunner
+    steps:
+      - name: Report microVM identity
+        run: |
+          echo "hello from firerunner microVM"
+          uname -a
+          id
+          echo "runner: $RUNNER_NAME os=$RUNNER_OS arch=$RUNNER_ARCH"
+          nproc
+          free -m || true
