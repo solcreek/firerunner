@@ -1,0 +1,62 @@
+name: stress
+
+# Concurrency stress test: fan out N identical build+test jobs at once to
+# simulate a burst of PRs/commits all triggering checks simultaneously, then
+# compare GitHub-hosted (ubuntu-latest) against the self-hosted firerunner
+# scale set. Per-job queue->start and run durations are read back from the
+# Actions API, so nothing extra is baked into the guest.
+#
+# Dispatch examples:
+#   gh workflow run stress.yml -f runner=firerunner   -f fanout=4
+#   gh workflow run stress.yml -f runner=firerunner   -f fanout=8
+#   gh workflow run stress.yml -f runner=ubuntu-latest -f fanout=8
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: runner label to fan out onto
+        type: choice
+        default: firerunner
+        options: [firerunner, ubuntu-latest]
+      fanout:
+        description: number of parallel jobs to launch at once
+        type: string
+        default: "4"
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        # Emit [1,2,..,fanout] so the fan job creates that many matrix legs,
+        # all queued at the same instant when this job finishes.
+        run: |
+          echo "matrix=$(jq -cn --argjson n ${{ inputs.fanout }} '[range(1; $n + 1)]')" >> "$GITHUB_OUTPUT"
+
+  fan:
+    needs: prep
+    strategy:
+      fail-fast: false
+      matrix:
+        n: ${{ fromJSON(needs.prep.outputs.matrix) }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: Runner info
+        run: |
+          echo "leg=${{ matrix.n }} runner=${{ inputs.runner }}"
+          echo "nproc=$(nproc)"
+          free -m | head -2 || true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./... -count=1
