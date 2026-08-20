@@ -33,16 +33,19 @@ guest.
 
 ## What the boot service does (MMDS → JIT)
 
-At boot the guest fetches its runner JIT config from Firecracker MMDS v2:
+At boot the guest fetches its runner JIT config from Firecracker MMDS v2. This
+is implemented by [`assets/firerunner-run.sh`](assets/firerunner-run.sh), started
+by [`assets/firerunner-runner.service`](assets/firerunner-runner.service):
 
 1. Grab an MMDS token: `PUT http://169.254.169.254/latest/api/token`
    (`X-metadata-token-ttl-seconds`).
-2. `GET http://169.254.169.254/` with `X-metadata-token` → the JSON firerunner
-   put there (`{"jitconfig": "<base64>"}`).
+2. `GET http://169.254.169.254/jitconfig` with `X-metadata-token` → the base64
+   JIT config firerunner published (from `{"jitconfig": "<base64>"}`).
 3. Run `./run.sh --jitconfig <base64>` (ephemeral; auto-deregisters after one
-   job).
-4. When the job finishes the runner exits; the boot service issues `reboot -f`
-   so the VMM exits and the host reaps the microVM.
+   job). The runner runs as root (`RUNNER_ALLOW_RUNASROOT`) — the whole microVM
+   is disposable, and it lets the boot service issue the final reboot.
+4. On exit the boot service issues `reboot -f`; with `reboot=k` on the kernel
+   cmdline this makes the VMM exit and the host reaps the microVM.
 
 A static `/etc/resolv.conf` (matching `--dns-servers`) is baked in because the
 egress allowlist only permits the configured resolvers.
@@ -50,17 +53,19 @@ egress allowlist only permits the configured resolvers.
 ## Building
 
 ```bash
-# On a Linux KVM host:
+# On a Linux KVM host, as root, with debootstrap installed:
 sudo ./build-rootfs.sh \
   --tier firerunner-4c8g \
   --runner-version 2.320.0 \
   --out /var/lib/firerunner/golden-4c8g.ext4
 ```
 
-See `build-rootfs.sh` for the (scaffolded) steps: create/format the ext4 image,
-bootstrap a minimal base, install `actions/runner`, drop in the boot service +
-resolv.conf, then unmount. The result is an immutable file firerunner
-reflink-clones per job.
+`build-rootfs.sh` creates/formats the ext4 image, debootstraps a minimal Debian
+base (systemd + git/curl/iproute2), installs `actions/runner` and runs its
+`installdependencies.sh`, drops in the boot service + a static resolv.conf,
+enables the service, and (for the docker tier) installs Docker. The result is an
+immutable file firerunner reflink-clones per job. Requires `debootstrap`,
+`mkfs.ext4`, `curl` and `tar` on the host.
 
 ## Rebuild policy
 

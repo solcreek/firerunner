@@ -1,0 +1,17 @@
+[Unit]
+Description=firerunner ephemeral JIT runner (one job, then self-destruct)
+After=network-online.target
+Wants=network-online.target
+# Nothing to do after the runner; the service self-destructs the microVM.
+DefaultDependencies=no
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/firerunner-run.sh
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

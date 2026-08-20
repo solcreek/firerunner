@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
 # build-rootfs.sh — build a firerunner golden rootfs (ext4) with the official
-# actions/runner agent and an MMDS-JIT boot service pre-installed.
+# actions/runner agent and the MMDS-JIT boot service pre-installed. Each microVM
+# is reflink-cloned from the result, boots this image, runs one job, and
+# self-destructs (see images/assets/firerunner-run.sh).
 #
-# This is a SCAFFOLD: it lays out the required steps and fails fast on missing
-# host tooling. It must run on a Linux host as root; it cannot run on macOS.
+# Debian guest, built via debootstrap. Linux + root only; cannot run on macOS.
 #
 # Usage:
 #   sudo ./build-rootfs.sh --tier firerunner-4c8g \
@@ -12,11 +13,16 @@
 #
 set -euo pipefail
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ASSETS="$HERE/assets"
+
 TIER="firerunner-4c8g"
 RUNNER_VERSION=""            # empty => resolve latest from GitHub releases
 OUT=""
 SIZE_MB=8192
 DNS_SERVERS="1.1.1.1 8.8.8.8"
+SUITE="bookworm"
+MIRROR="http://deb.debian.org/debian"
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -27,6 +33,8 @@ while [[ $# -gt 0 ]]; do
     --out)            OUT="$2"; shift 2 ;;
     --size-mb)        SIZE_MB="$2"; shift 2 ;;
     --dns-servers)    DNS_SERVERS="${2//,/ }"; shift 2 ;;
+    --suite)          SUITE="$2"; shift 2 ;;
+    --mirror)         MIRROR="$2"; shift 2 ;;
     *) die "unknown flag: $1" ;;
   esac
 done
@@ -40,7 +48,7 @@ case "$TIER" in
   *) die "unknown tier: $TIER (want firerunner-4c8g or firerunner-8c16g-docker)" ;;
 esac
 
-for t in mkfs.ext4 curl tar; do
+for t in mkfs.ext4 curl tar debootstrap; do
   command -v "$t" >/dev/null || die "missing required tool: $t"
 done
 
@@ -52,50 +60,71 @@ if [[ -z "$RUNNER_VERSION" ]]; then
   [[ -n "$RUNNER_VERSION" ]] || die "could not resolve latest actions/runner version"
 fi
 
-echo ">> tier=$TIER runner=$RUNNER_VERSION out=$OUT size=${SIZE_MB}MB"
+echo ">> tier=$TIER runner=$RUNNER_VERSION out=$OUT size=${SIZE_MB}MB suite=$SUITE"
 
 WORK="$(mktemp -d)"
 MNT="$WORK/mnt"
 mkdir -p "$MNT"
-cleanup() { mountpoint -q "$MNT" && umount "$MNT"; rm -rf "$WORK"; }
+cleanup() {
+  for m in dev/pts dev proc sys; do
+    mountpoint -q "$MNT/$m" && umount -l "$MNT/$m" || true
+  done
+  mountpoint -q "$MNT" && umount "$MNT" || true
+  rm -rf "$WORK"
+}
 trap cleanup EXIT
 
-# 1. Create + format the ext4 image.
+in_chroot() { chroot "$MNT" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive "$@"; }
+
+# 1. Create + format the ext4 image and mount it.
 truncate -s "${SIZE_MB}M" "$OUT"
 mkfs.ext4 -q -F "$OUT"
 mount -o loop "$OUT" "$MNT"
 
-# 2. Bootstrap a minimal base filesystem into $MNT.
-#    TODO: choose a bootstrapper for the host distro, e.g.
-#      Debian/Ubuntu: debootstrap --variant=minbase stable "$MNT"
-#      Arch:          pacstrap -c "$MNT" base
-#    then install: git, ca-certificates, and (for the docker tier) docker.
-echo ">> TODO: bootstrap base rootfs into $MNT"
+# 2. Bootstrap a minimal Debian base with an init and the tools the runner and
+#    the boot service need.
+BASE_PKGS="systemd-sysv,ca-certificates,curl,tar,git,iproute2,sudo,jq"
+debootstrap --variant=minbase --include="$BASE_PKGS" "$SUITE" "$MNT" "$MIRROR"
+
+# Bind mounts for chroot package operations.
+mount --bind /dev "$MNT/dev"
+mount --bind /dev/pts "$MNT/dev/pts"
+mount -t proc proc "$MNT/proc"
+mount -t sysfs sys "$MNT/sys"
 
 # 3. Install the official actions/runner agent.
-#    TODO:
-#      arch=x64
-#      url=https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${arch}-${RUNNER_VERSION}.tar.gz
-#      install -d "$MNT/opt/runner"
-#      curl -fsSL "$url" | tar -xz -C "$MNT/opt/runner"
-#      "$MNT/opt/runner/bin/installdependencies.sh"  # via chroot
-echo ">> TODO: install actions/runner v$RUNNER_VERSION into /opt/runner"
+arch="x64"
+runner_url="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${arch}-${RUNNER_VERSION}.tar.gz"
+install -d "$MNT/opt/runner"
+echo ">> downloading actions/runner v$RUNNER_VERSION"
+curl -fsSL "$runner_url" | tar -xz -C "$MNT/opt/runner"
+in_chroot /opt/runner/bin/installdependencies.sh
 
-# 4. Install the MMDS-JIT boot service (reads jitconfig from MMDS, runs one job,
-#    then reboot -f to self-destruct). See images/README.md for the contract.
-#    TODO: install a systemd unit or init script calling fetch-jit-and-run.
-echo ">> TODO: install MMDS-JIT boot service"
+# 4. Install the MMDS-JIT boot service (fetch jitconfig -> run one job ->
+#    reboot -f). See images/assets/.
+install -m 0755 "$ASSETS/firerunner-run.sh" "$MNT/usr/local/bin/firerunner-run.sh"
+install -m 0644 "$ASSETS/firerunner-runner.service" "$MNT/etc/systemd/system/firerunner-runner.service"
+in_chroot systemctl enable firerunner-runner.service
+# Disable getty/login prompts -- the microVM is headless and single-purpose.
+in_chroot systemctl mask serial-getty@ttyS0.service || true
 
 # 5. Bake a static resolv.conf matching the egress allowlist's --dns-servers.
+rm -f "$MNT/etc/resolv.conf"
 {
   for ns in $DNS_SERVERS; do echo "nameserver $ns"; done
 } > "$MNT/etc/resolv.conf"
 
-# 6. (docker tier) enable the Docker daemon at boot.
+# 6. (docker tier) install and enable Docker for jobs using container:/services.
 if [[ "$TIER" == "firerunner-8c16g-docker" ]]; then
-  echo ">> TODO: enable dockerd in the golden image"
+  echo ">> installing Docker for the docker tier"
+  in_chroot apt-get update
+  in_chroot apt-get install -y --no-install-recommends docker.io
+  in_chroot systemctl enable docker.service
 fi
+
+# Trim apt caches to keep the image lean.
+in_chroot apt-get clean || true
+rm -rf "$MNT/var/lib/apt/lists/"* "$MNT/var/cache/apt/archives/"*.deb
 
 sync
 echo ">> golden image written: $OUT"
-echo ">> NOTE: complete the TODO steps above before using in production."
