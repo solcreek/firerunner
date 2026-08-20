@@ -217,3 +217,42 @@ func TestLogWriter(t *testing.T) {
 		t.Fatalf("Write = %d, %v", n, err)
 	}
 }
+
+func TestCleanupStaleJobDirs(t *testing.T) {
+	work := t.TempDir()
+	// Two stale job dirs (each identified by an fc.sock) plus artefacts that must
+	// survive: the nft rulesets and the logs dir.
+	for _, name := range []string{"firerunner-aaaa1111", "firerunner-bbbb2222"} {
+		dir := filepath.Join(work, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "fc.sock"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(work, "logs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"firerunner.nft", "firerunner-forward.nft"} {
+		if err := os.WriteFile(filepath.Join(work, f), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// MaxVMs=1 with an unusual prefix keeps the tap sweep from touching any real
+	// host interface.
+	f := NewFirecracker(FirecrackerConfig{WorkDir: work, TapPrefix: "frunittest", MaxVMs: 1}, testLogger())
+	f.CleanupStale(context.Background())
+
+	for _, name := range []string{"firerunner-aaaa1111", "firerunner-bbbb2222"} {
+		if _, err := os.Stat(filepath.Join(work, name)); !os.IsNotExist(err) {
+			t.Errorf("job dir %s not removed (err=%v)", name, err)
+		}
+	}
+	for _, keep := range []string{"logs", "firerunner.nft", "firerunner-forward.nft"} {
+		if _, err := os.Stat(filepath.Join(work, keep)); err != nil {
+			t.Errorf("%s should be preserved: %v", keep, err)
+		}
+	}
+}

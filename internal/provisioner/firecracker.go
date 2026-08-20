@@ -371,6 +371,40 @@ func (f *Firecracker) configure(ctx context.Context, sock, rootfs string, n vmNe
 	return nil
 }
 
+// CleanupStale reclaims host resources left behind by microVMs from a previous,
+// uncleanly terminated run (SIGKILL, OOM, power loss). It is safe to call once at
+// startup because the process owns no microVMs yet, so any matching tap device or
+// job dir is definitively stale. Orphaned firecracker processes are reaped by the
+// systemd cgroup on crash; this closes what survives that: per-slot tap devices
+// (a host-namespace resource whose lifetime isn't bound to the VMM, so leaks here
+// eventually exhaust the slot space) and per-job work dirs (reflink rootfs clones
+// and sockets whose teardown defer never ran).
+func (f *Firecracker) CleanupStale(ctx context.Context) {
+	for slot := 0; slot < f.cfg.MaxVMs; slot++ {
+		tap := fmt.Sprintf("%s%d", f.cfg.TapPrefix, slot)
+		if _, err := net.InterfaceByName(tap); err != nil {
+			continue // not present
+		}
+		if err := f.teardownTap(ctx, tap); err != nil {
+			f.log.Warn("remove stale tap", "tap", tap, "err", err)
+			continue
+		}
+		f.log.Info("removed stale tap", "tap", tap)
+	}
+
+	// A job dir is uniquely identified by its firecracker API socket, so globbing
+	// for fc.sock avoids ever touching the nft rulesets or logs dir in WorkDir.
+	socks, _ := filepath.Glob(filepath.Join(f.cfg.WorkDir, "*", "fc.sock"))
+	for _, sock := range socks {
+		dir := filepath.Dir(sock)
+		if err := os.RemoveAll(dir); err != nil {
+			f.log.Warn("remove stale job dir", "dir", dir, "err", err)
+			continue
+		}
+		f.log.Info("removed stale job dir", "dir", dir)
+	}
+}
+
 func (f *Firecracker) setupTap(ctx context.Context, n vmNet) error {
 	for _, c := range tapUpCommands(n) {
 		if err := f.run(ctx, c[0], c[1:]...); err != nil {

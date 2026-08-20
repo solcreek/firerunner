@@ -105,6 +105,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		return sched.Running()
 	}
 
+	// Reclaim taps and job dirs orphaned by a previous unclean exit before we
+	// start allocating new slots, so a crash-restart cycle can't exhaust them.
+	prov.CleanupStale(ctx)
+
 	if err := prov.SetupNetwork(ctx); err != nil {
 		return fmt.Errorf("setup network: %w", err)
 	}
