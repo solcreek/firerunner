@@ -92,7 +92,8 @@ ephemeral runners.
 
 - Linux bare-metal host with KVM (`/dev/kvm`).
 - `firecracker` binary, a guest kernel (vmlinux), and a golden rootfs image
-  with `actions/runner` + a JIT-reading boot service pre-installed.
+  with `actions/runner` + a JIT-reading boot service pre-installed (see
+  [`images/`](images/README.md) for the build tooling and rebuild policy).
 - A reflink-capable filesystem (btrfs or XFS) for the work directory.
 - `iproute2` (`ip`) and `nftables` (`nft`) on the host; `CAP_NET_ADMIN` and the
   ability to set `net.ipv4.ip_forward`.

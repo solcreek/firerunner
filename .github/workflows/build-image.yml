@@ -1,0 +1,45 @@
+name: build-image
+
+# Rebuilds the firerunner golden rootfs images. GitHub only supports self-hosted
+# runner agents released in the last 30 days, so we rebuild monthly (well within
+# the window) and on demand. Rebuilding also folds in base-OS security updates.
+
+on:
+  schedule:
+    # 03:17 on the 1st of every month (off-peak, avoids the top-of-hour rush).
+    - cron: "17 3 1 * *"
+  workflow_dispatch:
+    inputs:
+      runner_version:
+        description: "actions/runner version to pin (blank = latest)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Requires a Linux KVM host with loop-mount + mkfs.ext4 (self-hosted).
+    runs-on: [self-hosted, kvm]
+    strategy:
+      fail-fast: false
+      matrix:
+        tier:
+          - firerunner-4c8g
+          - firerunner-8c16g-docker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build golden rootfs (${{ matrix.tier }})
+        run: |
+          sudo images/build-rootfs.sh \
+            --tier "${{ matrix.tier }}" \
+            --runner-version "${{ inputs.runner_version }}" \
+            --out "/var/lib/firerunner/${{ matrix.tier }}.ext4"
+
+      # The image is published in place on the host; firerunner reflink-clones it
+      # per job. No artifact upload — these files are large and host-local.
+      - name: Report
+        run: ls -lh "/var/lib/firerunner/${{ matrix.tier }}.ext4"
