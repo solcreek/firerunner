@@ -11,8 +11,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/linyiru/firerunner/internal/core"
-	"github.com/linyiru/firerunner/internal/provisioner"
+	"github.com/solcreek/firerunner/internal/core"
+	"github.com/solcreek/firerunner/internal/provisioner"
 )
 
 // Config is the fully-resolved firerunner configuration.

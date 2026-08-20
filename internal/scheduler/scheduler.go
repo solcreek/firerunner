@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/linyiru/firerunner/internal/core"
-	"github.com/linyiru/firerunner/internal/provisioner"
+	"github.com/solcreek/firerunner/internal/core"
+	"github.com/solcreek/firerunner/internal/provisioner"
 )
 
 // JITSource generates a just-in-time runner registration for a new microVM.

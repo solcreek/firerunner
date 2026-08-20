@@ -13,7 +13,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/linyiru/firerunner/internal/core"
+	"github.com/solcreek/firerunner/internal/core"
 )
 
 // FirecrackerConfig configures the direct-Firecracker provisioner. It

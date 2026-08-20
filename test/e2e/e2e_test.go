@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/linyiru/firerunner/internal/core"
-	"github.com/linyiru/firerunner/internal/provisioner"
+	"github.com/solcreek/firerunner/internal/core"
+	"github.com/solcreek/firerunner/internal/provisioner"
 )
 
 func requireKVM(t *testing.T) (kernel, golden string) {

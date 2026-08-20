@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/linyiru/firerunner/internal/core"
+	"github.com/solcreek/firerunner/internal/core"
 )
 
 func testLogger() *slog.Logger {

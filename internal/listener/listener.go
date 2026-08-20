@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/linyiru/firerunner/internal/core"
+	"github.com/solcreek/firerunner/internal/core"
 )
 
 // DesiredFunc is invoked whenever the desired runner count is known.

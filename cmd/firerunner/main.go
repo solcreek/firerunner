@@ -13,10 +13,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/linyiru/firerunner/internal/config"
-	"github.com/linyiru/firerunner/internal/listener"
-	"github.com/linyiru/firerunner/internal/provisioner"
-	"github.com/linyiru/firerunner/internal/scheduler"
+	"github.com/solcreek/firerunner/internal/config"
+	"github.com/solcreek/firerunner/internal/listener"
+	"github.com/solcreek/firerunner/internal/provisioner"
+	"github.com/solcreek/firerunner/internal/scheduler"
 )
 
 func main() {
