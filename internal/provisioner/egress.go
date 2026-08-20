@@ -116,7 +116,7 @@ func buildNFTRuleset(cfg egressRuleset) string {
 	fmt.Fprintf(&b, "table ip %s {\n", natTable)
 
 	if !cfg.Open {
-		fmt.Fprintf(&b, "\tset allowed {\n\t\ttype ipv4_addr\n\t\tflags interval\n")
+		fmt.Fprintf(&b, "\tset allowed {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\tauto-merge\n")
 		if len(cfg.Allowed) > 0 {
 			fmt.Fprintf(&b, "\t\telements = { %s }\n", strings.Join(cfg.Allowed, ", "))
 		}

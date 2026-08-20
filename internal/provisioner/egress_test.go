@@ -84,8 +84,9 @@ func TestBuildNFTRulesetAllowlist(t *testing.T) {
 			t.Errorf("missing table-replace line %q", want)
 		}
 	}
-	// Allowlist set + elements.
-	if !strings.Contains(out, "set allowed {") || !strings.Contains(out, "flags interval") {
+	// Allowlist set + elements. auto-merge lets nftables fold the overlapping
+	// CIDRs GitHub publishes in /meta (real nft rejects conflicting intervals).
+	if !strings.Contains(out, "set allowed {") || !strings.Contains(out, "flags interval") || !strings.Contains(out, "auto-merge") {
 		t.Errorf("missing allowed set:\n%s", out)
 	}
 	for _, cidr := range rs.Allowed {
