@@ -43,5 +43,11 @@ fi
 
 cd "$RUNNER_DIR"
 export RUNNER_ALLOW_RUNASROOT=1
+# systemd oneshot services start with a bare environment; HOME/USER are not
+# guaranteed. Tools invoked by the job (e.g. `go env GOPATH`, which derives a
+# default GOPATH of $HOME/go) fail when HOME is unset. We run as root in the
+# throwaway microVM, so anchor them explicitly.
+export HOME=/root
+export USER=root
 # Ephemeral JIT runner: registers, runs one job, then auto-deregisters.
 ./run.sh --jitconfig "$jit" || echo "firerunner: runner exited non-zero" >&2
