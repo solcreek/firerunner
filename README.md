@@ -140,6 +140,28 @@ firerunner \
 All flags can also be set via `FR_*` environment variables (see
 `config.example.env`).
 
+### Warm pool (`--min-runners`)
+
+Every job runs in a fresh microVM, so by default a runner is cold-booted only
+once a job is queued. The microVM itself boots in well under a second, but the
+GitHub runner agent still has to start and open its session to GitHub before it
+can accept work — so the *first* job after an idle period waits for that
+one-time connect.
+
+Set `--min-runners N` (env `FR_MIN_RUNNERS`) to keep `N` microVMs pre-booted and
+already registered (`Listening for Jobs`). A queued job is then handed to a warm
+runner immediately, and firerunner launches a replacement to refill the pool.
+This trades idle capacity for lower pickup latency:
+
+| `--min-runners` | Pickup                                   | Idle cost                              |
+| --------------- | ---------------------------------------- | -------------------------------------- |
+| `0` (default)   | cold boot + runner connect per job       | none                                   |
+| `1`+            | job handed to a waiting runner           | `N ×` (`--vcpu` / `--mem-mib`) held idle |
+
+Warm runners are still single-use and ephemeral: a pre-booted VM that has not
+run a job is discarded like any other once it does. Size the pool to your peak
+concurrency — `--max-runners` still caps the total.
+
 ## License
 
 [MIT](./LICENSE)

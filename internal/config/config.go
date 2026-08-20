@@ -64,7 +64,7 @@ func FromFlags(args []string) (*Config, error) {
 	fs.StringVar(&c.RunnerGroup, "runner-group", env("FR_RUNNER_GROUP", "default"), "runner group name")
 	fs.StringVar(&labels, "labels", env("FR_LABELS", ""), "extra comma-separated runs-on labels")
 	fs.IntVar(&c.MaxRunners, "max-runners", envInt("FR_MAX_RUNNERS", 4), "max concurrent microVMs")
-	fs.IntVar(&c.MinRunners, "min-runners", envInt("FR_MIN_RUNNERS", 0), "warm/pre-provisioned microVMs")
+	fs.IntVar(&c.MinRunners, "min-runners", envInt("FR_MIN_RUNNERS", 0), "warm pool size: microVMs kept pre-booted and registered so jobs start without a cold boot (0 = on-demand; higher = faster pickup, more idle RAM)")
 
 	fs.StringVar(&c.Token, "token", env("FR_TOKEN", ""), "GitHub PAT (use a GitHub App in production)")
 	fs.StringVar(&c.AppClientID, "app-client-id", env("FR_APP_CLIENT_ID", ""), "GitHub App client id")
