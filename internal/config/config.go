@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/solcreek/firerunner/internal/core"
 	"github.com/solcreek/firerunner/internal/provisioner"
@@ -81,6 +82,12 @@ func FromFlags(args []string) (*Config, error) {
 	fs.StringVar(&c.Firecracker.ExtIface, "ext-iface", env("FR_EXT_IFACE", ""), "host external interface for microVM egress NAT (required)")
 	fs.StringVar(&c.Firecracker.LogDir, "log-dir", env("FR_LOG_DIR", ""), "directory for per-runner console logs (off-VM log forwarding)")
 
+	var egress, dnsServers string
+	var metaRefresh time.Duration
+	fs.StringVar(&egress, "egress", env("FR_EGRESS", "api,actions,git,dns,packages,ntp"), "comma-separated egress allowlist: GitHub /meta categories (api,actions,git,packages) plus dns,ntp; or 'open' for no allowlist")
+	fs.StringVar(&dnsServers, "dns-servers", env("FR_DNS_SERVERS", "1.1.1.1,8.8.8.8"), "comma-separated resolver IPs guests may reach")
+	fs.DurationVar(&metaRefresh, "meta-refresh", envDuration("FR_META_REFRESH", 24*time.Hour), "how often to refresh GitHub /meta ranges (0 disables)")
+
 	fs.StringVar(&c.LogLevel, "log-level", env("FR_LOG_LEVEL", "info"), "log level: debug, info, warn, error")
 	fs.StringVar(&c.LogFormat, "log-format", env("FR_LOG_FORMAT", "text"), "log format: text or json")
 
@@ -99,7 +106,23 @@ func FromFlags(args []string) (*Config, error) {
 	}
 	// The provisioner's per-VM network pool is bounded by the runner capacity.
 	c.Firecracker.MaxVMs = c.MaxRunners
+	c.Firecracker.Egress = provisioner.EgressConfig{
+		Categories:      splitCSV(egress),
+		DNSServers:      splitCSV(dnsServers),
+		RefreshInterval: metaRefresh,
+	}
 	return c, nil
+}
+
+// splitCSV splits a comma-separated list, trimming spaces and dropping empties.
+func splitCSV(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (c *Config) validate() error {
@@ -176,6 +199,15 @@ func envInt(key string, def int) int {
 	if v, ok := os.LookupEnv(key); ok {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if v, ok := os.LookupEnv(key); ok {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
 		}
 	}
 	return def

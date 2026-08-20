@@ -43,6 +43,8 @@ type FirecrackerConfig struct {
 	// ExtIface is the host's external interface used for microVM egress NAT
 	// (e.g. eth0, enp2s0). Required for the guest to reach GitHub.
 	ExtIface string
+	// Egress restricts what microVM guests may reach on the network.
+	Egress EgressConfig
 	// LogDir, when set, receives one <runner>.log file per microVM capturing the
 	// guest serial console. Because the microVM is destroyed after its single
 	// job, this is how runner logs are forwarded off the ephemeral VM.
@@ -65,9 +67,10 @@ type Firecracker struct {
 	cfg     FirecrackerConfig
 	log     *slog.Logger
 	run     commandRunner
+	http    *http.Client
 	ipam    *ipam
-	natOnce sync.Once
-	natErr  error
+	netOnce sync.Once
+	netErr  error
 }
 
 // NewFirecracker returns a Firecracker provisioner, filling in defaults.
@@ -87,7 +90,13 @@ func NewFirecracker(cfg FirecrackerConfig, log *slog.Logger) *Firecracker {
 	if cfg.MaxVMs < 1 {
 		cfg.MaxVMs = 64
 	}
-	return &Firecracker{cfg: cfg, log: log, run: execRun, ipam: newIPAM(cfg.MaxVMs)}
+	return &Firecracker{
+		cfg:  cfg,
+		log:  log,
+		run:  execRun,
+		http: &http.Client{Timeout: 30 * time.Second},
+		ipam: newIPAM(cfg.MaxVMs),
+	}
 }
 
 // Name implements Provisioner.
@@ -98,8 +107,8 @@ func (f *Firecracker) Name() string { return "firecracker" }
 // delivered via MMDS v2, then block until the guest self-destructs (reboot -f)
 // and reap everything.
 func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec core.RunnerSpec) error {
-	if err := f.ensureNAT(ctx); err != nil {
-		return fmt.Errorf("ensure NAT: %w", err)
+	if err := f.SetupNetwork(ctx); err != nil {
+		return fmt.Errorf("setup network: %w", err)
 	}
 
 	slot, ok := f.ipam.acquire()
@@ -158,22 +167,73 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 	return nil
 }
 
-// ensureNAT installs host forwarding + masquerade exactly once per process.
-func (f *Firecracker) ensureNAT(ctx context.Context) error {
-	f.natOnce.Do(func() {
-		if f.cfg.ExtIface == "" {
-			f.natErr = errors.New("external interface is required for microVM egress")
+// SetupNetwork installs host forwarding, the egress allowlist and NAT exactly
+// once per process. It is safe to call from Launch and from main.
+func (f *Firecracker) SetupNetwork(ctx context.Context) error {
+	f.netOnce.Do(func() { f.netErr = f.applyNetwork(ctx) })
+	return f.netErr
+}
+
+// RefreshNetwork periodically re-fetches GitHub's /meta ranges and re-applies
+// the egress allowlist, until ctx is cancelled. It is a no-op when egress is
+// open or refresh is disabled.
+func (f *Firecracker) RefreshNetwork(ctx context.Context) {
+	if f.cfg.Egress.open() || f.cfg.Egress.RefreshInterval <= 0 {
+		return
+	}
+	t := time.NewTicker(f.cfg.Egress.RefreshInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
 			return
-		}
-		for _, c := range natCommands(f.cfg.ExtIface) {
-			if err := f.run(ctx, c[0], c[1:]...); err != nil {
-				f.natErr = fmt.Errorf("%v: %w", c, err)
-				return
+		case <-t.C:
+			if err := f.applyNetwork(ctx); err != nil {
+				f.log.Error("refresh egress allowlist", "err", err)
 			}
 		}
-		f.log.Info("host NAT configured", "extIface", f.cfg.ExtIface, "cidr", vmCIDR)
-	})
-	return f.natErr
+	}
+}
+
+// applyNetwork enables IPv4 forwarding and applies the nftables ruleset (egress
+// allowlist + masquerade) atomically via `nft -f`.
+func (f *Firecracker) applyNetwork(ctx context.Context) error {
+	if f.cfg.ExtIface == "" {
+		return errors.New("external interface is required for microVM egress")
+	}
+
+	rs := egressRuleset{
+		ExtIface:   f.cfg.ExtIface,
+		VMCidr:     vmCIDR,
+		DNSServers: f.cfg.Egress.DNSServers,
+		AllowDNS:   f.cfg.Egress.has("dns"),
+		AllowNTP:   f.cfg.Egress.has("ntp"),
+		Open:       f.cfg.Egress.open(),
+	}
+	if !rs.Open {
+		cidrs, err := fetchMetaCIDRs(ctx, f.http, metaURL, f.cfg.Egress.metaCats())
+		if err != nil {
+			return fmt.Errorf("fetch GitHub meta ranges: %w", err)
+		}
+		rs.Allowed = cidrs
+	}
+
+	if err := f.run(ctx, "sysctl", "-w", "net.ipv4.ip_forward=1"); err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(f.cfg.WorkDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir work dir: %w", err)
+	}
+	path := filepath.Join(f.cfg.WorkDir, "firerunner.nft")
+	if err := os.WriteFile(path, []byte(buildNFTRuleset(rs)), 0o600); err != nil {
+		return fmt.Errorf("write nft ruleset: %w", err)
+	}
+	if err := f.run(ctx, "nft", "-f", path); err != nil {
+		return err
+	}
+	f.log.Info("egress network applied", "extIface", f.cfg.ExtIface, "open", rs.Open, "allowedCIDRs", len(rs.Allowed))
+	return nil
 }
 
 // openConsole returns the writer for the guest serial console. When LogDir is

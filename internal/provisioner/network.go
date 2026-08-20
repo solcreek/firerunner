@@ -10,10 +10,6 @@ import (
 // for the whole range covers every microVM.
 const vmCIDR = "172.16.0.0/16"
 
-// natTable is the dedicated nftables table firerunner manages, isolated from any
-// other host firewall rules.
-const natTable = "firerunner"
-
 // vmNet is the fully-resolved per-microVM network, derived purely from a slot.
 type vmNet struct {
 	slot     int
@@ -42,20 +38,6 @@ func slotNet(slot int, tapPrefix string) vmNet {
 // ip=<client>:<server>:<gw>:<netmask>:<hostname>:<device>:<autoconf>.
 func composeBootArgs(base string, n vmNet) string {
 	return fmt.Sprintf("%s ip=%s::%s:%s::eth0:off", base, n.guestIP, n.hostIP, n.netmask)
-}
-
-// natCommands returns the idempotent host commands that enable IPv4 forwarding
-// and install a masquerade rule for the microVM range out the external
-// interface. Flushing the chain before adding the rule keeps it idempotent
-// across restarts. It is pure so the command sequence can be asserted in tests.
-func natCommands(extIface string) [][]string {
-	return [][]string{
-		{"sysctl", "-w", "net.ipv4.ip_forward=1"},
-		{"nft", "add", "table", "ip", natTable},
-		{"nft", "add", "chain", "ip", natTable, "postrouting", "{", "type", "nat", "hook", "postrouting", "priority", "100", ";", "}"},
-		{"nft", "flush", "chain", "ip", natTable, "postrouting"},
-		{"nft", "add", "rule", "ip", natTable, "postrouting", "ip", "saddr", vmCIDR, "oifname", extIface, "masquerade"},
-	}
 }
 
 // tapUpCommands brings up a per-microVM tap device with its host-side gateway IP.

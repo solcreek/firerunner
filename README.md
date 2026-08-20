@@ -12,8 +12,9 @@ only external dependency is GitHub's official runner scale-set client
 (`github.com/actions/scaleset`), which drives the long-poll control plane.
 
 > Status: early. The GitHub control-plane integration
-> (`github.com/actions/scaleset`) is wired; the provisioner still needs
-> hardening (per-VM NAT/egress, log shipping) before production use.
+> (`github.com/actions/scaleset`) is wired; per-VM networking, an nftables
+> egress allowlist and off-VM log shipping are in place. Real-hardware e2e
+> validation is still pending before production use.
 
 ## Why microVMs
 
@@ -50,11 +51,20 @@ VMM process exit, which the host detects to reap the job.
 Each microVM gets its own tap device on a dedicated `/30` subnet
 (`172.16.<slot>.0/30`; host gateway `.1`, guest `.2`), so many VMs run in
 parallel without collisions. The guest address, gateway and netmask are handed
-to the kernel via the `ip=` boot argument (no DHCP needed). The host enables
-IPv4 forwarding and installs a single nftables masquerade rule (in a dedicated
-`firerunner` table) for `172.16.0.0/16` out the external interface
-(`--ext-iface`), giving every guest egress to GitHub. Slot allocation is bounded
-by `--max-runners`.
+to the kernel via the `ip=` boot argument (no DHCP needed). Slot allocation is
+bounded by `--max-runners`.
+
+Egress is controlled by an **nftables allowlist** (in a dedicated `firerunner`
+table). Instead of a blanket masquerade, the host enables IPv4 forwarding and
+only forwards guest traffic destined for GitHub's own IP ranges — fetched from
+[`api.github.com/meta`](https://docs.github.com/rest/meta/meta#get-github-meta-information)
+and refreshed periodically (`--meta-refresh`, default 24h) — plus optional DNS
+and NTP. Everything else from `172.16.0.0/16` is dropped, then the allowed
+traffic is masqueraded out the external interface (`--ext-iface`). Configure the
+allowlist with `--egress` (default `api,actions,git,dns,packages,ntp`); the
+GitHub categories are `api`, `actions`, `git`, `packages`, and `dns`/`ntp` are
+pseudo-categories. Pass `--egress open` to disable the allowlist and fall back to
+blanket NAT.
 
 ### Logs
 
@@ -72,10 +82,11 @@ ephemeral runners.
   long-poll; GitHub warns webhook-based scaling is less reliable).
 - **Least-privilege auth** — GitHub App preferred over PAT.
 - **Clean environment per job** — reflink-cloned rootfs, destroyed after use.
-- **Per-VM network isolation + egress NAT** — dedicated tap/subnet per microVM.
+- **Per-VM network isolation + egress allowlist** — dedicated tap/subnet per
+  microVM; guests may reach only GitHub's published IP ranges (plus DNS/NTP).
 - **External log forwarding** — serial console shipped off-VM to `--log-dir`.
-- Roadmap: egress allowlist (restrict beyond blanket NAT), golden-image rebuild
-  pipeline (≤30 days, per GitHub's runner-update policy).
+- Roadmap: golden-image rebuild pipeline (≤30 days, per GitHub's runner-update
+  policy).
 
 ## Requirements
 
@@ -112,6 +123,7 @@ firerunner \
   --kernel /var/lib/firerunner/vmlinux \
   --golden /var/lib/firerunner/golden.ext4 \
   --ext-iface enp2s0 --log-dir /var/log/firerunner \
+  --egress api,actions,git,dns,packages,ntp --meta-refresh 24h \
   --app-client-id ... --app-installation-id ... --app-private-key /path/key.pem
 ```
 

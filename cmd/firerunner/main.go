@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -98,6 +99,11 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		sched.Reconcile(ctx, desired)
 		return sched.Running()
 	}
+
+	if err := prov.SetupNetwork(ctx); err != nil {
+		return fmt.Errorf("setup network: %w", err)
+	}
+	go prov.RefreshNetwork(ctx)
 
 	runErr := lis.Run(ctx, onDesired)
 

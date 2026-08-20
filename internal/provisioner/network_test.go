@@ -39,17 +39,6 @@ func TestComposeBootArgs(t *testing.T) {
 	}
 }
 
-func TestNatCommands(t *testing.T) {
-	cmds := natCommands("enp2s0")
-	if cmds[0][0] != "sysctl" || !strings.Contains(strings.Join(cmds[0], " "), "ip_forward=1") {
-		t.Fatalf("first command should enable ip_forward: %v", cmds[0])
-	}
-	last := strings.Join(cmds[len(cmds)-1], " ")
-	if !strings.Contains(last, "masquerade") || !strings.Contains(last, "enp2s0") || !strings.Contains(last, vmCIDR) {
-		t.Fatalf("last command should masquerade %s out enp2s0: %q", vmCIDR, last)
-	}
-}
-
 func TestIPAMAcquireRelease(t *testing.T) {
 	p := newIPAM(2)
 	a, ok := p.acquire()
@@ -72,33 +61,38 @@ func TestIPAMAcquireRelease(t *testing.T) {
 	}
 }
 
-func TestEnsureNATRequiresExtIface(t *testing.T) {
-	f := NewFirecracker(FirecrackerConfig{}, testLogger())
+func TestSetupNetworkRequiresExtIface(t *testing.T) {
+	f := NewFirecracker(FirecrackerConfig{Egress: EgressConfig{Categories: []string{"open"}}}, testLogger())
 	f.run = func(context.Context, string, ...string) error { return nil }
-	if err := f.ensureNAT(context.Background()); err == nil {
+	if err := f.SetupNetwork(context.Background()); err == nil {
 		t.Fatal("expected error when ext-iface is empty")
 	}
 }
 
-func TestEnsureNATRunsOnce(t *testing.T) {
+func TestSetupNetworkRunsOnce(t *testing.T) {
 	var runs int
-	f := NewFirecracker(FirecrackerConfig{ExtIface: "eth0"}, testLogger())
+	f := NewFirecracker(FirecrackerConfig{
+		ExtIface: "eth0",
+		WorkDir:  t.TempDir(),
+		Egress:   EgressConfig{Categories: []string{"open"}},
+	}, testLogger())
 	f.run = func(context.Context, string, ...string) error {
 		runs++
 		return nil
 	}
-	if err := f.ensureNAT(context.Background()); err != nil {
+	if err := f.SetupNetwork(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	first := runs
-	if first != len(natCommands("eth0")) {
-		t.Fatalf("ran %d commands, want %d", first, len(natCommands("eth0")))
+	// applyNetwork runs sysctl (ip_forward) then nft -f.
+	if first != 2 {
+		t.Fatalf("ran %d commands, want 2 (sysctl + nft)", first)
 	}
-	if err := f.ensureNAT(context.Background()); err != nil {
+	if err := f.SetupNetwork(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if runs != first {
-		t.Fatalf("ensureNAT ran again: %d commands total", runs)
+		t.Fatalf("SetupNetwork ran again: %d commands total", runs)
 	}
 }
 
