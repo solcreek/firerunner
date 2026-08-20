@@ -77,6 +77,7 @@ trap cleanup EXIT
 in_chroot() { chroot "$MNT" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive "$@"; }
 
 # 1. Create + format the ext4 image and mount it.
+mkdir -p "$(dirname "$OUT")"
 truncate -s "${SIZE_MB}M" "$OUT"
 mkfs.ext4 -q -F "$OUT"
 mount -o loop "$OUT" "$MNT"
@@ -91,6 +92,14 @@ mount --bind /dev "$MNT/dev"
 mount --bind /dev/pts "$MNT/dev/pts"
 mount -t proc proc "$MNT/proc"
 mount -t sysfs sys "$MNT/sys"
+
+# Bake a static resolv.conf matching the egress allowlist's --dns-servers. Done
+# before any chroot apt/curl so build-time DNS works too (the same file serves
+# the runtime microVM, whose egress allowlist only permits these resolvers).
+rm -f "$MNT/etc/resolv.conf"
+{
+  for ns in $DNS_SERVERS; do echo "nameserver $ns"; done
+} > "$MNT/etc/resolv.conf"
 
 # 3. Install the official actions/runner agent.
 arch="x64"
@@ -107,6 +116,12 @@ install -m 0644 "$ASSETS/firerunner-runner.service" "$MNT/etc/systemd/system/fir
 in_chroot systemctl enable firerunner-runner.service
 # Disable getty/login prompts -- the microVM is headless and single-purpose.
 in_chroot systemctl mask serial-getty@ttyS0.service || true
+
+# 5. Bake a static resolv.conf matching the egress allowlist's --dns-servers.
+rm -f "$MNT/etc/resolv.conf"
+{
+  for ns in $DNS_SERVERS; do echo "nameserver $ns"; done
+} > "$MNT/etc/resolv.conf"
 
 # 5. Bake a static resolv.conf matching the egress allowlist's --dns-servers.
 rm -f "$MNT/etc/resolv.conf"
