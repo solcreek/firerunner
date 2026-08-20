@@ -10,6 +10,14 @@ ExecStart=/usr/local/bin/firerunner
 Restart=on-failure
 RestartSec=5
 
+# Graceful shutdown: firerunner cancels its context on SIGTERM, stops accepting
+# work, and drains in-flight microVMs before exiting. Give it long enough to let
+# a running job finish; otherwise systemd's default stop timeout SIGKILLs the
+# listener mid-job and orphans firecracker children (which leak tap devices).
+# Tune to your longest expected job.
+KillSignal=SIGTERM
+TimeoutStopSec=1h
+
 # The process needs KVM and network/tap management. Run as a dedicated,
 # non-login user with only the capabilities it requires.
 User=firerunner

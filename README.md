@@ -162,6 +162,26 @@ Warm runners are still single-use and ephemeral: a pre-booted VM that has not
 run a job is discarded like any other once it does. Size the pool to your peak
 concurrency — `--max-runners` still caps the total.
 
+### Running as a service (systemd)
+
+`deploy/firerunner.service` is a hardened unit template (dedicated `firerunner`
+user, least-privilege capabilities). To install:
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin firerunner
+sudo usermod -aG kvm firerunner
+sudo install -m0755 firerunner /usr/local/bin/firerunner
+sudo mkdir -p /etc/firerunner
+sudo cp config.example.env /etc/firerunner/firerunner.env   # then edit
+sudo install -m0644 deploy/firerunner.service /etc/systemd/system/
+sudo systemctl enable --now firerunner
+```
+
+Stopping the service sends `SIGTERM`; firerunner stops taking new work and
+drains in-flight microVMs before exiting (`TimeoutStopSec` bounds the wait).
+Restarts are safe: registration is idempotent and a session left behind by an
+unclean exit is retried until GitHub expires it.
+
 ## License
 
 [MIT](./LICENSE)
