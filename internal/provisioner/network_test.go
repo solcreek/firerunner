@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -80,6 +81,11 @@ func TestSetupNetworkRunsOnce(t *testing.T) {
 		runs++
 		return nil
 	}
+	// No ip/filter FORWARD chain on the (fake) host: host-forward accept is a
+	// no-op, so only sysctl + nft run.
+	f.runOut = func(context.Context, string, ...string) (string, error) {
+		return "", errors.New("no such chain")
+	}
 	if err := f.SetupNetwork(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -93,6 +99,58 @@ func TestSetupNetworkRunsOnce(t *testing.T) {
 	}
 	if runs != first {
 		t.Fatalf("SetupNetwork ran again: %d commands total", runs)
+	}
+}
+
+func TestHostForwardScript(t *testing.T) {
+	got := hostForwardScript("enp2s0", "fr")
+	for _, want := range []string{
+		`iifname "enp2s0" oifname "fr*" ct state established,related counter accept comment "firerunner-egress"`,
+		`iifname "fr*" oifname "enp2s0" counter accept comment "firerunner-egress"`,
+		"insert rule ip filter FORWARD",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("hostForwardScript missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+func TestEnsureHostForward(t *testing.T) {
+	const dropChain = "chain FORWARD {\n\ttype filter hook forward priority filter; policy drop;\n}"
+	cases := []struct {
+		name    string
+		out     string
+		outErr  error
+		wantRun bool
+	}{
+		{name: "no forward chain", outErr: errors.New("no such chain"), wantRun: false},
+		{name: "permissive policy", out: "chain FORWARD { policy accept; }", wantRun: false},
+		{name: "drop policy applies rules", out: dropChain, wantRun: true},
+		{name: "already present is idempotent", out: dropChain + " firerunner-egress", wantRun: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ranNFT bool
+			f := NewFirecracker(FirecrackerConfig{
+				ExtIface: "enp2s0",
+				WorkDir:  t.TempDir(),
+			}, testLogger())
+			f.runOut = func(context.Context, string, ...string) (string, error) {
+				return tc.out, tc.outErr
+			}
+			f.run = func(_ context.Context, name string, _ ...string) error {
+				if name == "nft" {
+					ranNFT = true
+				}
+				return nil
+			}
+			if err := f.ensureHostForward(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if ranNFT != tc.wantRun {
+				t.Fatalf("ran nft = %v, want %v", ranNFT, tc.wantRun)
+			}
+		})
 	}
 }
 

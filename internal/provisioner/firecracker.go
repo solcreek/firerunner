@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -61,12 +62,18 @@ const DefaultBootArgs = "console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i804
 // a fake for cp / ip / firecracker without touching the host.
 type commandRunner func(ctx context.Context, name string, args ...string) error
 
+// commandOutputRunner runs an external command and captures its combined
+// output. It is a seam (like commandRunner) so host-state probes such as
+// `nft list chain` can be faked in tests.
+type commandOutputRunner func(ctx context.Context, name string, args ...string) (string, error)
+
 // Firecracker is a Provisioner that talks to the Firecracker REST API directly
 // over its unix socket using only the standard library.
 type Firecracker struct {
 	cfg     FirecrackerConfig
 	log     *slog.Logger
 	run     commandRunner
+	runOut  commandOutputRunner
 	http    *http.Client
 	ipam    *ipam
 	netOnce sync.Once
@@ -91,11 +98,12 @@ func NewFirecracker(cfg FirecrackerConfig, log *slog.Logger) *Firecracker {
 		cfg.MaxVMs = 64
 	}
 	return &Firecracker{
-		cfg:  cfg,
-		log:  log,
-		run:  execRun,
-		http: &http.Client{Timeout: 30 * time.Second},
-		ipam: newIPAM(cfg.MaxVMs),
+		cfg:    cfg,
+		log:    log,
+		run:    execRun,
+		runOut: execRunOut,
+		http:   &http.Client{Timeout: 30 * time.Second},
+		ipam:   newIPAM(cfg.MaxVMs),
 	}
 }
 
@@ -232,7 +240,64 @@ func (f *Firecracker) applyNetwork(ctx context.Context) error {
 	if err := f.run(ctx, "nft", "-f", path); err != nil {
 		return err
 	}
+	if err := f.ensureHostForward(ctx); err != nil {
+		return err
+	}
 	f.log.Info("egress network applied", "extIface", f.cfg.ExtIface, "open", rs.Open, "allowedCIDRs", len(rs.Allowed))
+	return nil
+}
+
+// forwardComment tags the FORWARD accept rules firerunner adds to a foreign
+// (ufw/docker/hardened) filter chain, so refreshes stay idempotent.
+const forwardComment = "firerunner-egress"
+
+// hostForwardScript returns an nft script that inserts accept rules for
+// firerunner's tap interfaces into the host's ip/filter FORWARD chain.
+//
+// It is needed on hosts whose forward policy defaults to drop (ufw, docker,
+// hardened hosts). firerunner's own table only masquerades in postrouting; a
+// separate base chain's `accept` cannot override another base chain's `drop`
+// verdict at the same hook, so the accept must live in the dropping chain
+// itself. The allowlist `drop` in firerunner's own table still applies (drop is
+// terminal across chains), so this does not widen egress beyond the policy.
+func hostForwardScript(extIface, tapPrefix string) string {
+	tap := tapPrefix + "*"
+	return fmt.Sprintf(
+		"insert rule ip filter FORWARD iifname %q oifname %q ct state established,related counter accept comment %q\n"+
+			"insert rule ip filter FORWARD iifname %q oifname %q counter accept comment %q\n",
+		extIface, tap, forwardComment,
+		tap, extIface, forwardComment,
+	)
+}
+
+// ensureHostForward keeps a foreign default-drop forward policy from silently
+// blocking masqueraded microVM egress. It is best-effort and idempotent: it is
+// a no-op when there is no ip/filter FORWARD chain (default-accept host), when
+// the forward policy is not drop, or when firerunner's accept rules are already
+// present.
+func (f *Firecracker) ensureHostForward(ctx context.Context) error {
+	out, err := f.runOut(ctx, "nft", "list", "chain", "ip", "filter", "FORWARD")
+	if err != nil {
+		// No ip/filter FORWARD chain (host without ufw/iptables-nft). A
+		// default-accept forward policy needs nothing beyond our masquerade.
+		f.log.Debug("no ip/filter FORWARD chain; skipping host forward accept", "err", err)
+		return nil
+	}
+	if strings.Contains(out, forwardComment) {
+		return nil // our accept rules are already present
+	}
+	if !strings.Contains(out, "policy drop") {
+		return nil // permissive forward policy; masquerade is sufficient
+	}
+	path := filepath.Join(f.cfg.WorkDir, "firerunner-forward.nft")
+	if err := os.WriteFile(path, []byte(hostForwardScript(f.cfg.ExtIface, f.cfg.TapPrefix)), 0o600); err != nil {
+		return fmt.Errorf("write host forward ruleset: %w", err)
+	}
+	if err := f.run(ctx, "nft", "-f", path); err != nil {
+		return fmt.Errorf("apply host forward accept: %w", err)
+	}
+	f.log.Info("added host forward accept for microVM egress",
+		"extIface", f.cfg.ExtIface, "tapPrefix", f.cfg.TapPrefix)
 	return nil
 }
 
@@ -332,6 +397,15 @@ func execRun(ctx context.Context, name string, args ...string) error {
 		return fmt.Errorf("%s %v: %w: %s", name, args, err, bytes.TrimSpace(out))
 	}
 	return nil
+}
+
+func execRunOut(ctx context.Context, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("%s %v: %w: %s", name, args, err, bytes.TrimSpace(out))
+	}
+	return string(out), nil
 }
 
 func newUnixClient(sock string) *http.Client {
