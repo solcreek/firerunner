@@ -95,7 +95,12 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		"memMiB", cfg.MemMiB,
 	)
 
-	onDesired := func(ctx context.Context, desired int) int {
+	// microVMs must live and die with the process, not with the per-message
+	// context the scale-set listener passes in. That context is detached from
+	// cancellation (listener uses context.WithoutCancel so in-flight job
+	// handling survives shutdown), so binding a microVM to it would leak idle
+	// warm runners on shutdown and hang Drain. Bind to the shutdown ctx instead.
+	onDesired := func(_ context.Context, desired int) int {
 		sched.Reconcile(ctx, desired)
 		return sched.Running()
 	}
