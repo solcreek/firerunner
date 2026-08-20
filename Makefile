@@ -1,8 +1,11 @@
 BINARY := firerunner
 PKG := ./...
-# Coverage is measured over the library packages; cmd/ is thin wiring exercised
-# by the e2e suite, not unit tests.
-COVERPKG := ./internal/...
+# Coverage is gated on the functional-core packages (pure logic + seam-injected
+# I/O). cmd/ wiring and the actions/scaleset integration in internal/listener
+# are the imperative shell / GitHub integration boundary, exercised by the e2e
+# suite and `make test`, not the unit coverage gate.
+COVERPKG := ./internal/config/...,./internal/core/...,./internal/provisioner/...,./internal/scheduler/...
+COVERPKGDIRS := ./internal/config/... ./internal/core/... ./internal/provisioner/... ./internal/scheduler/...
 COVERPROFILE := cover.out
 COVER_MIN ?= 70
 
@@ -21,7 +24,7 @@ test:
 # Unit coverage across all packages (cross-package attribution via -coverpkg).
 .PHONY: cover
 cover:
-	go test -race -covermode=atomic -coverpkg=$(COVERPKG) -coverprofile=$(COVERPROFILE) $(COVERPKG)
+	go test -race -covermode=atomic -coverpkg=$(COVERPKG) -coverprofile=$(COVERPROFILE) $(COVERPKGDIRS)
 	go tool cover -func=$(COVERPROFILE) | tail -n 1
 
 .PHONY: cover-html

@@ -118,6 +118,22 @@ func (c *Config) validate() error {
 	return nil
 }
 
+// ResolvePrivateKey returns the GitHub App private key in PEM form. The
+// configured value may be either the PEM contents or a path to a PEM file.
+func (c *Config) ResolvePrivateKey() (string, error) {
+	if c.AppPrivateKey == "" {
+		return "", nil
+	}
+	if strings.Contains(c.AppPrivateKey, "PRIVATE KEY") {
+		return c.AppPrivateKey, nil
+	}
+	b, err := os.ReadFile(c.AppPrivateKey)
+	if err != nil {
+		return "", fmt.Errorf("read app private key: %w", err)
+	}
+	return string(b), nil
+}
+
 // NewLogger builds a slog.Logger from the level and format strings.
 func NewLogger(level, format string) *slog.Logger {
 	opts := &slog.HandlerOptions{Level: parseLevel(level)}

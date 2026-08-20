@@ -13,11 +13,16 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/actions/scaleset"
+
 	"github.com/solcreek/firerunner/internal/config"
 	"github.com/solcreek/firerunner/internal/listener"
 	"github.com/solcreek/firerunner/internal/provisioner"
 	"github.com/solcreek/firerunner/internal/scheduler"
 )
+
+// version is overridable at build time via -ldflags.
+var version = "dev"
 
 func main() {
 	cfg, err := config.FromFlags(os.Args[1:])
@@ -32,17 +37,53 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if err := run(ctx, cfg, log); err != nil {
+		log.Error("firerunner failed", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
+	privateKey, err := cfg.ResolvePrivateKey()
+	if err != nil {
+		return err
+	}
+
+	owner, err := os.Hostname()
+	if err != nil || owner == "" {
+		owner = "firerunner"
+	}
+
+	lis, err := listener.New(ctx, listener.Config{
+		URL:         cfg.URL,
+		Name:        cfg.ScaleSetName,
+		RunnerGroup: cfg.RunnerGroup,
+		Labels:      cfg.Labels,
+		MaxRunners:  cfg.MaxRunners,
+		MinRunners:  cfg.MinRunners,
+		Token:       cfg.Token,
+		App: scaleset.GitHubAppAuth{
+			ClientID:       cfg.AppClientID,
+			InstallationID: cfg.AppInstallID,
+			PrivateKey:     privateKey,
+		},
+		Version: version,
+		Logger:  log,
+	}, owner)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lis.Close(context.WithoutCancel(ctx)) }()
+
 	prov := provisioner.NewFirecracker(cfg.Firecracker, log)
 
 	sched := scheduler.New(scheduler.Options{
 		Max:         cfg.MaxRunners,
 		Spec:        cfg.RunnerSpec(),
 		Provisioner: prov,
-		JIT:         listener.StubJIT{}, // TODO(fr-listener): actions/scaleset JIT source
+		JIT:         lis.JIT(),
 		Logger:      log,
 	})
-
-	lis := listener.NewStub(log) // TODO(fr-listener): actions/scaleset listener
 
 	log.Info("firerunner starting",
 		"provisioner", prov.Name(),
@@ -53,12 +94,19 @@ func main() {
 		"memMiB", cfg.MemMiB,
 	)
 
-	if err := lis.Run(ctx, sched.Reconcile); err != nil && ctx.Err() == nil {
-		log.Error("listener stopped unexpectedly", "err", err)
-		os.Exit(1)
+	onDesired := func(ctx context.Context, desired int) int {
+		sched.Reconcile(ctx, desired)
+		return sched.Running()
 	}
+
+	runErr := lis.Run(ctx, onDesired)
 
 	log.Info("shutdown signalled, draining in-flight microVMs")
 	sched.Drain()
 	log.Info("firerunner stopped")
+
+	if runErr != nil && ctx.Err() == nil {
+		return runErr
+	}
+	return nil
 }

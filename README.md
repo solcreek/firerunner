@@ -7,10 +7,13 @@ destructs.
 
 Built for **maximum control and a minimal dependency surface**: firerunner talks
 to the Firecracker REST API directly over its unix socket using only the Go
-standard library — no containerd, no CNI, no LVM, no VM-management daemon.
+standard library — no containerd, no CNI, no LVM, no VM-management daemon. Its
+only external dependency is GitHub's official runner scale-set client
+(`github.com/actions/scaleset`), which drives the long-poll control plane.
 
-> Status: early scaffold. The GitHub control-plane integration
-> (`github.com/actions/scaleset`) is stubbed and wired in a subsequent step.
+> Status: early. The GitHub control-plane integration
+> (`github.com/actions/scaleset`) is wired; the provisioner still needs
+> hardening (per-VM NAT/egress, log shipping) before production use.
 
 ## Why microVMs
 
