@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/solcreek/firerunner/internal/core"
@@ -18,7 +21,7 @@ import (
 
 // FirecrackerConfig configures the direct-Firecracker provisioner. It
 // deliberately depends on nothing beyond the firecracker binary and the Linux
-// host tools (cp with reflink, ip) — no containerd, CNI or LVM.
+// host tools (cp with reflink, ip, nft, sysctl) — no containerd, CNI or LVM.
 type FirecrackerConfig struct {
 	// Binary is the path to the firecracker executable.
 	Binary string
@@ -27,8 +30,9 @@ type FirecrackerConfig struct {
 	// GoldenRootFS is the immutable base rootfs for the default tier. Each job
 	// gets a reflink (copy-on-write) clone of it.
 	GoldenRootFS string
-	// BootArgs is the kernel command line. `reboot=k` is required so the guest
-	// `reboot -f` triggers an i8042 reset that makes the VMM exit.
+	// BootArgs is the base kernel command line. A per-VM `ip=` clause is appended
+	// at launch. `reboot=k` is required so the guest `reboot -f` triggers an
+	// i8042 reset that makes the VMM exit.
 	BootArgs string
 	// WorkDir is where per-job rootfs clones and API sockets are created. It
 	// should live on a reflink-capable filesystem (btrfs/XFS) for near-zero
@@ -36,8 +40,15 @@ type FirecrackerConfig struct {
 	WorkDir string
 	// TapPrefix is the prefix for per-job tap device names.
 	TapPrefix string
-	// GuestMAC is the MAC address assigned to the guest eth0.
-	GuestMAC string
+	// ExtIface is the host's external interface used for microVM egress NAT
+	// (e.g. eth0, enp2s0). Required for the guest to reach GitHub.
+	ExtIface string
+	// LogDir, when set, receives one <runner>.log file per microVM capturing the
+	// guest serial console. Because the microVM is destroyed after its single
+	// job, this is how runner logs are forwarded off the ephemeral VM.
+	LogDir string
+	// MaxVMs bounds concurrent microVMs and sizes the per-VM network pool.
+	MaxVMs int
 }
 
 // DefaultBootArgs is a minimal, quiet serial console command line. reboot=k is
@@ -51,9 +62,12 @@ type commandRunner func(ctx context.Context, name string, args ...string) error
 // Firecracker is a Provisioner that talks to the Firecracker REST API directly
 // over its unix socket using only the standard library.
 type Firecracker struct {
-	cfg FirecrackerConfig
-	log *slog.Logger
-	run commandRunner
+	cfg     FirecrackerConfig
+	log     *slog.Logger
+	run     commandRunner
+	ipam    *ipam
+	natOnce sync.Once
+	natErr  error
 }
 
 // NewFirecracker returns a Firecracker provisioner, filling in defaults.
@@ -70,19 +84,31 @@ func NewFirecracker(cfg FirecrackerConfig, log *slog.Logger) *Firecracker {
 	if cfg.TapPrefix == "" {
 		cfg.TapPrefix = "fr"
 	}
-	if cfg.GuestMAC == "" {
-		cfg.GuestMAC = "06:00:AC:10:00:02"
+	if cfg.MaxVMs < 1 {
+		cfg.MaxVMs = 64
 	}
-	return &Firecracker{cfg: cfg, log: log, run: execRun}
+	return &Firecracker{cfg: cfg, log: log, run: execRun, ipam: newIPAM(cfg.MaxVMs)}
 }
 
 // Name implements Provisioner.
 func (f *Firecracker) Name() string { return "firecracker" }
 
-// Launch implements Provisioner: reflink-clone the golden rootfs, create a tap,
-// boot the microVM with the JIT config delivered via MMDS v2, then block until
-// the guest self-destructs (reboot -f) and reap everything.
+// Launch implements Provisioner: reflink-clone the golden rootfs, allocate a
+// per-VM network slot, create a tap, boot the microVM with the JIT config
+// delivered via MMDS v2, then block until the guest self-destructs (reboot -f)
+// and reap everything.
 func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec core.RunnerSpec) error {
+	if err := f.ensureNAT(ctx); err != nil {
+		return fmt.Errorf("ensure NAT: %w", err)
+	}
+
+	slot, ok := f.ipam.acquire()
+	if !ok {
+		return fmt.Errorf("no free network slot (max %d microVMs)", f.cfg.MaxVMs)
+	}
+	defer f.ipam.release(slot)
+	vnet := slotNet(slot, f.cfg.TapPrefix)
+
 	jobDir := filepath.Join(f.cfg.WorkDir, name)
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir job dir: %w", err)
@@ -94,16 +120,21 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 		return fmt.Errorf("reflink golden rootfs: %w", err)
 	}
 
-	tap := f.tapName(name)
-	if err := f.setupTap(ctx, tap); err != nil {
-		return fmt.Errorf("setup tap %s: %w", tap, err)
+	if err := f.setupTap(ctx, vnet); err != nil {
+		return fmt.Errorf("setup tap %s: %w", vnet.tap, err)
 	}
-	defer func() { _ = f.teardownTap(context.WithoutCancel(ctx), tap) }()
+	defer func() { _ = f.teardownTap(context.WithoutCancel(ctx), vnet.tap) }()
+
+	console, closeConsole, err := f.openConsole(name)
+	if err != nil {
+		return fmt.Errorf("open console log: %w", err)
+	}
+	defer closeConsole()
 
 	sock := filepath.Join(jobDir, "fc.sock")
 	cmd := exec.CommandContext(ctx, f.cfg.Binary, "--api-sock", sock, "--id", name)
-	cmd.Stdout = &logWriter{log: f.log, runner: name, stream: "stdout"}
-	cmd.Stderr = &logWriter{log: f.log, runner: name, stream: "stderr"}
+	cmd.Stdout = console
+	cmd.Stderr = console
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start firecracker: %w", err)
 	}
@@ -113,17 +144,53 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 		return fmt.Errorf("wait for api socket: %w", err)
 	}
 
-	if err := f.configure(ctx, sock, rootfs, tap, jitConfig, spec); err != nil {
+	bootArgs := composeBootArgs(f.cfg.BootArgs, vnet)
+	if err := f.configure(ctx, sock, rootfs, vnet, bootArgs, jitConfig, spec); err != nil {
 		_ = cmd.Process.Kill()
 		return fmt.Errorf("configure microVM: %w", err)
 	}
 
-	f.log.Info("microVM started", "runner", name, "vcpu", spec.VCPU, "memMiB", spec.MemMiB)
-	err := cmd.Wait() // returns when the guest reboots (self-destruct)
+	f.log.Info("microVM started", "runner", name, "slot", slot, "guestIP", vnet.guestIP, "vcpu", spec.VCPU, "memMiB", spec.MemMiB)
+	err = cmd.Wait() // returns when the guest reboots (self-destruct)
 	f.log.Info("microVM exited", "runner", name, "err", err)
 	// A clean self-destruct makes the VMM exit non-zero on some kernels; that
 	// is expected and not treated as a launch failure.
 	return nil
+}
+
+// ensureNAT installs host forwarding + masquerade exactly once per process.
+func (f *Firecracker) ensureNAT(ctx context.Context) error {
+	f.natOnce.Do(func() {
+		if f.cfg.ExtIface == "" {
+			f.natErr = errors.New("external interface is required for microVM egress")
+			return
+		}
+		for _, c := range natCommands(f.cfg.ExtIface) {
+			if err := f.run(ctx, c[0], c[1:]...); err != nil {
+				f.natErr = fmt.Errorf("%v: %w", c, err)
+				return
+			}
+		}
+		f.log.Info("host NAT configured", "extIface", f.cfg.ExtIface, "cidr", vmCIDR)
+	})
+	return f.natErr
+}
+
+// openConsole returns the writer for the guest serial console. When LogDir is
+// set the console is teed to a per-runner file so logs survive the microVM.
+func (f *Firecracker) openConsole(name string) (io.Writer, func(), error) {
+	slogWriter := &logWriter{log: f.log, runner: name, stream: "console"}
+	if f.cfg.LogDir == "" {
+		return slogWriter, func() {}, nil
+	}
+	if err := os.MkdirAll(f.cfg.LogDir, 0o755); err != nil {
+		return nil, nil, err
+	}
+	file, err := os.Create(filepath.Join(f.cfg.LogDir, name+".log"))
+	if err != nil {
+		return nil, nil, err
+	}
+	return io.MultiWriter(file, slogWriter), func() { _ = file.Close() }, nil
 }
 
 // apiStep is a single Firecracker configuration API call.
@@ -136,11 +203,11 @@ type apiStep struct {
 // It is a pure function so tests can assert the exact order and payloads —
 // notably that /mmds (the JIT secret) is set before InstanceStart, and that
 // InstanceStart is always last.
-func buildAPISteps(cfg FirecrackerConfig, rootfs, tap, jit string, spec core.RunnerSpec) []apiStep {
+func buildAPISteps(kernelImage, bootArgs, rootfs, tap, guestMAC, jit string, spec core.RunnerSpec) []apiStep {
 	return []apiStep{
 		{"/boot-source", map[string]any{
-			"kernel_image_path": cfg.KernelImage,
-			"boot_args":         cfg.BootArgs,
+			"kernel_image_path": kernelImage,
+			"boot_args":         bootArgs,
 		}},
 		{"/drives/rootfs", map[string]any{
 			"drive_id":       "rootfs",
@@ -155,7 +222,7 @@ func buildAPISteps(cfg FirecrackerConfig, rootfs, tap, jit string, spec core.Run
 		{"/network-interfaces/eth0", map[string]any{
 			"iface_id":      "eth0",
 			"host_dev_name": tap,
-			"guest_mac":     cfg.GuestMAC,
+			"guest_mac":     guestMAC,
 		}},
 		{"/mmds/config", map[string]any{
 			"version":            "V2",
@@ -169,9 +236,9 @@ func buildAPISteps(cfg FirecrackerConfig, rootfs, tap, jit string, spec core.Run
 
 // configure runs the Firecracker API sequence. MMDS config and data MUST be set
 // before InstanceStart so the JIT secret is available to the guest at boot.
-func (f *Firecracker) configure(ctx context.Context, sock, rootfs, tap, jit string, spec core.RunnerSpec) error {
+func (f *Firecracker) configure(ctx context.Context, sock, rootfs string, n vmNet, bootArgs, jit string, spec core.RunnerSpec) error {
 	cl := newUnixClient(sock)
-	for _, s := range buildAPISteps(f.cfg, rootfs, tap, jit, spec) {
+	for _, s := range buildAPISteps(f.cfg.KernelImage, bootArgs, rootfs, n.tap, n.guestMAC, jit, spec) {
 		if err := putJSON(ctx, cl, s.path, s.body); err != nil {
 			return fmt.Errorf("PUT %s: %w", s.path, err)
 		}
@@ -179,27 +246,22 @@ func (f *Firecracker) configure(ctx context.Context, sock, rootfs, tap, jit stri
 	return nil
 }
 
-func (f *Firecracker) tapName(runner string) string {
-	// tap names are limited to 15 chars; keep the prefix + a short suffix.
-	suffix := runner
-	if len(suffix) > 12 {
-		suffix = suffix[len(suffix)-12:]
+func (f *Firecracker) setupTap(ctx context.Context, n vmNet) error {
+	for _, c := range tapUpCommands(n) {
+		if err := f.run(ctx, c[0], c[1:]...); err != nil {
+			return err
+		}
 	}
-	return f.cfg.TapPrefix + suffix
-}
-
-func (f *Firecracker) setupTap(ctx context.Context, tap string) error {
-	if err := f.run(ctx, "ip", "tuntap", "add", "dev", tap, "mode", "tap"); err != nil {
-		return err
-	}
-	if err := f.run(ctx, "ip", "addr", "add", "172.16.0.1/30", "dev", tap); err != nil {
-		return err
-	}
-	return f.run(ctx, "ip", "link", "set", tap, "up")
+	return nil
 }
 
 func (f *Firecracker) teardownTap(ctx context.Context, tap string) error {
-	return f.run(ctx, "ip", "link", "del", tap)
+	for _, c := range tapDownCommands(tap) {
+		if err := f.run(ctx, c[0], c[1:]...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // --- small stdlib helpers ---

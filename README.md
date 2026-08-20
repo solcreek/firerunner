@@ -30,7 +30,7 @@ bare metal. See GitHub's guidance on
                  ┌──────────────────── firerunner (single Go binary) ─────────────────┐
 GitHub  ◀──────▶ │  listener        long-poll GitHub → desired runner count           │
 (scaleset API)   │  scheduler       reconcile running microVMs to desired, ≤ maxRunners│
-                 │  provisioner     per job: reflink golden.ext4 → tap → MMDS(JIT)      │
+                 │  provisioner     per job: reflink golden.ext4 → tap/NAT → MMDS(JIT) │
                  │                  → firecracker InstanceStart → wait exit → reap      │
                  └────────────────────────────────────────────────────────────────────┘
                                               │  one microVM per job
@@ -45,6 +45,24 @@ The guest self-destructs with `reboot -f` (not `poweroff`): with `reboot=k` on
 the kernel command line this triggers an i8042 reset that makes the Firecracker
 VMM process exit, which the host detects to reap the job.
 
+### Networking
+
+Each microVM gets its own tap device on a dedicated `/30` subnet
+(`172.16.<slot>.0/30`; host gateway `.1`, guest `.2`), so many VMs run in
+parallel without collisions. The guest address, gateway and netmask are handed
+to the kernel via the `ip=` boot argument (no DHCP needed). The host enables
+IPv4 forwarding and installs a single nftables masquerade rule (in a dedicated
+`firerunner` table) for `172.16.0.0/16` out the external interface
+(`--ext-iface`), giving every guest egress to GitHub. Slot allocation is bounded
+by `--max-runners`.
+
+### Logs
+
+Because the microVM is destroyed after its one job, its serial console (which
+carries the runner/job output) is streamed to a per-runner file under
+`--log-dir` on the host — off-VM log forwarding, as GitHub recommends for
+ephemeral runners.
+
 ## Alignment with GitHub's official recommendations
 
 - **Ephemeral / JIT runners** — one job per runner, auto-deregistered (GitHub's
@@ -54,7 +72,9 @@ VMM process exit, which the host detects to reap the job.
   long-poll; GitHub warns webhook-based scaling is less reliable).
 - **Least-privilege auth** — GitHub App preferred over PAT.
 - **Clean environment per job** — reflink-cloned rootfs, destroyed after use.
-- Roadmap: egress allowlist, external log forwarding, golden-image rebuild
+- **Per-VM network isolation + egress NAT** — dedicated tap/subnet per microVM.
+- **External log forwarding** — serial console shipped off-VM to `--log-dir`.
+- Roadmap: egress allowlist (restrict beyond blanket NAT), golden-image rebuild
   pipeline (≤30 days, per GitHub's runner-update policy).
 
 ## Requirements
@@ -63,6 +83,8 @@ VMM process exit, which the host detects to reap the job.
 - `firecracker` binary, a guest kernel (vmlinux), and a golden rootfs image
   with `actions/runner` + a JIT-reading boot service pre-installed.
 - A reflink-capable filesystem (btrfs or XFS) for the work directory.
+- `iproute2` (`ip`) and `nftables` (`nft`) on the host; `CAP_NET_ADMIN` and the
+  ability to set `net.ipv4.ip_forward`.
 
 ## Build & test
 
@@ -89,6 +111,7 @@ firerunner \
   --max-runners 4 --vcpu 4 --mem-mib 8192 \
   --kernel /var/lib/firerunner/vmlinux \
   --golden /var/lib/firerunner/golden.ext4 \
+  --ext-iface enp2s0 --log-dir /var/log/firerunner \
   --app-client-id ... --app-installation-id ... --app-private-key /path/key.pem
 ```
 

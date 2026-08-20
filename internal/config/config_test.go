@@ -11,6 +11,7 @@ func baseArgs() []string {
 		"--url", "https://github.com/org/repo",
 		"--kernel", "/vmlinux",
 		"--golden", "/golden.ext4",
+		"--ext-iface", "eth0",
 		"--token", "ghp_x",
 	}
 }
@@ -35,10 +36,11 @@ func TestFromFlags_Valid(t *testing.T) {
 
 func TestFromFlags_MissingRequired(t *testing.T) {
 	cases := map[string][]string{
-		"no url":    {"--kernel", "/k", "--golden", "/g", "--token", "t"},
-		"no kernel": {"--url", "u", "--golden", "/g", "--token", "t"},
-		"no golden": {"--url", "u", "--kernel", "/k", "--token", "t"},
-		"no auth":   {"--url", "u", "--kernel", "/k", "--golden", "/g"},
+		"no url":    {"--kernel", "/k", "--golden", "/g", "--ext-iface", "eth0", "--token", "t"},
+		"no kernel": {"--url", "u", "--golden", "/g", "--ext-iface", "eth0", "--token", "t"},
+		"no golden": {"--url", "u", "--kernel", "/k", "--ext-iface", "eth0", "--token", "t"},
+		"no iface":  {"--url", "u", "--kernel", "/k", "--golden", "/g", "--token", "t"},
+		"no auth":   {"--url", "u", "--kernel", "/k", "--golden", "/g", "--ext-iface", "eth0"},
 	}
 	for name, args := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -68,6 +70,7 @@ func TestFromFlags_EnvFallback(t *testing.T) {
 	t.Setenv("FR_URL", "https://github.com/org/repo")
 	t.Setenv("FR_KERNEL", "/env-kernel")
 	t.Setenv("FR_GOLDEN", "/env-golden")
+	t.Setenv("FR_EXT_IFACE", "eth0")
 	t.Setenv("FR_TOKEN", "ghp_env")
 	t.Setenv("FR_VCPU", "2")
 
@@ -82,7 +85,7 @@ func TestFromFlags_EnvFallback(t *testing.T) {
 
 func TestFromFlags_AppCredsSatisfyAuth(t *testing.T) {
 	args := []string{
-		"--url", "u", "--kernel", "/k", "--golden", "/g",
+		"--url", "u", "--kernel", "/k", "--golden", "/g", "--ext-iface", "eth0",
 		"--app-client-id", "Iv1.abc",
 	}
 	if _, err := FromFlags(args); err != nil {

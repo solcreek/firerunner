@@ -78,6 +78,8 @@ func FromFlags(args []string) (*Config, error) {
 	fs.StringVar(&c.Firecracker.GoldenRootFS, "golden", env("FR_GOLDEN", ""), "path to immutable golden rootfs (required)")
 	fs.StringVar(&c.Firecracker.WorkDir, "workdir", env("FR_WORKDIR", "/var/tmp/firerunner"), "reflink-capable work dir for per-job rootfs")
 	fs.StringVar(&c.Firecracker.BootArgs, "boot-args", env("FR_BOOT_ARGS", ""), "kernel command line (default keeps reboot=k)")
+	fs.StringVar(&c.Firecracker.ExtIface, "ext-iface", env("FR_EXT_IFACE", ""), "host external interface for microVM egress NAT (required)")
+	fs.StringVar(&c.Firecracker.LogDir, "log-dir", env("FR_LOG_DIR", ""), "directory for per-runner console logs (off-VM log forwarding)")
 
 	fs.StringVar(&c.LogLevel, "log-level", env("FR_LOG_LEVEL", "info"), "log level: debug, info, warn, error")
 	fs.StringVar(&c.LogFormat, "log-format", env("FR_LOG_FORMAT", "text"), "log format: text or json")
@@ -95,6 +97,8 @@ func FromFlags(args []string) (*Config, error) {
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
+	// The provisioner's per-VM network pool is bounded by the runner capacity.
+	c.Firecracker.MaxVMs = c.MaxRunners
 	return c, nil
 }
 
@@ -106,6 +110,8 @@ func (c *Config) validate() error {
 		return fmt.Errorf("--kernel is required")
 	case c.Firecracker.GoldenRootFS == "":
 		return fmt.Errorf("--golden is required")
+	case c.Firecracker.ExtIface == "":
+		return fmt.Errorf("--ext-iface is required for microVM egress")
 	case c.MaxRunners < 1:
 		return fmt.Errorf("--max-runners must be >= 1")
 	case c.VCPU < 1:

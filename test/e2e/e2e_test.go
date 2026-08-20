@@ -40,10 +40,16 @@ func TestLaunchBootsAndSelfDestructs(t *testing.T) {
 	kernel, golden := requireKVM(t)
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	extIface := os.Getenv("FR_EXT_IFACE")
+	if extIface == "" {
+		t.Skip("skipping: set FR_EXT_IFACE to the host egress interface")
+	}
 	f := provisioner.NewFirecracker(provisioner.FirecrackerConfig{
 		KernelImage:  kernel,
 		GoldenRootFS: golden,
 		WorkDir:      t.TempDir(),
+		ExtIface:     extIface,
+		LogDir:       t.TempDir(),
 	}, log)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

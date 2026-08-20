@@ -33,13 +33,9 @@ func shortSock(t *testing.T) string {
 }
 
 func TestBuildAPISteps_OrderAndPayloads(t *testing.T) {
-	cfg := FirecrackerConfig{
-		KernelImage: "/vmlinux",
-		BootArgs:    "console=ttyS0 reboot=k",
-		GuestMAC:    "06:00:AC:10:00:02",
-	}
 	spec := core.RunnerSpec{VCPU: 4, MemMiB: 8192}
-	steps := buildAPISteps(cfg, "/job/rootfs.ext4", "frtap0", "JIT-SECRET", spec)
+	steps := buildAPISteps("/vmlinux", "console=ttyS0 reboot=k ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off",
+		"/job/rootfs.ext4", "fr0", "06:00:AC:10:00:02", "JIT-SECRET", spec)
 
 	wantOrder := []string{
 		"/boot-source", "/drives/rootfs", "/machine-config",
@@ -103,7 +99,7 @@ func TestConfigure_SendsSequenceOverUnixSocket(t *testing.T) {
 	defer srv.Close()
 
 	f := NewFirecracker(FirecrackerConfig{KernelImage: "/k", GoldenRootFS: "/g"}, testLogger())
-	err = f.configure(context.Background(), sock, "/rootfs", "frtap0", "JIT", core.RunnerSpec{VCPU: 2, MemMiB: 512})
+	err = f.configure(context.Background(), sock, "/rootfs", slotNet(0, "fr"), "console=ttyS0", "JIT", core.RunnerSpec{VCPU: 2, MemMiB: 512})
 	if err != nil {
 		t.Fatalf("configure: %v", err)
 	}
@@ -141,7 +137,7 @@ func TestConfigure_PropagatesAPIError(t *testing.T) {
 	defer srv.Close()
 
 	f := NewFirecracker(FirecrackerConfig{KernelImage: "/k"}, testLogger())
-	if err := f.configure(context.Background(), sock, "/rootfs", "tap", "JIT", core.RunnerSpec{VCPU: 1, MemMiB: 128}); err == nil {
+	if err := f.configure(context.Background(), sock, "/rootfs", slotNet(0, "fr"), "console=ttyS0", "JIT", core.RunnerSpec{VCPU: 1, MemMiB: 128}); err == nil {
 		t.Fatal("expected error from 400 response")
 	}
 }
@@ -172,17 +168,6 @@ func TestWaitForSocket_ContextCancel(t *testing.T) {
 	}
 }
 
-func TestTapName_Truncates(t *testing.T) {
-	f := NewFirecracker(FirecrackerConfig{TapPrefix: "fr"}, testLogger())
-	tap := f.tapName("firerunner-0123456789abcdef")
-	if len(tap) > 15 {
-		t.Fatalf("tap name %q exceeds 15 chars", tap)
-	}
-	if tap[:2] != "fr" {
-		t.Fatalf("tap name %q missing prefix", tap)
-	}
-}
-
 func TestSetupTap_RunsExpectedCommands(t *testing.T) {
 	var calls [][]string
 	f := NewFirecracker(FirecrackerConfig{}, testLogger())
@@ -190,7 +175,7 @@ func TestSetupTap_RunsExpectedCommands(t *testing.T) {
 		calls = append(calls, append([]string{name}, args...))
 		return nil
 	}
-	if err := f.setupTap(context.Background(), "frtap0"); err != nil {
+	if err := f.setupTap(context.Background(), slotNet(0, "fr")); err != nil {
 		t.Fatalf("setupTap: %v", err)
 	}
 	if len(calls) != 3 {
