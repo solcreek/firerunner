@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"strings"
+	"time"
 
 	"github.com/actions/scaleset"
 	sslistener "github.com/actions/scaleset/listener"
@@ -94,7 +96,7 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 	}
 	client.SetSystemInfo(systemInfo(cfg, scaleSet.ID))
 
-	session, err := client.MessageSessionClient(ctx, scaleSet.ID, owner)
+	session, err := openSessionWithRetry(ctx, client, scaleSet.ID, owner, cfg.Logger)
 	if err != nil {
 		if !reused {
 			// Best-effort cleanup of the scale set we just created.
@@ -107,6 +109,43 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 		"name", cfg.Name, "scaleSetID", scaleSet.ID, "group", cfg.RunnerGroup, "reused", reused)
 
 	return &ScaleSet{cfg: cfg, log: cfg.Logger, client: client, session: session, scaleSetID: scaleSet.ID}, nil
+}
+
+// openSessionWithRetry opens a message session, retrying while GitHub reports a
+// session conflict. After an unclean shutdown (SIGKILL, OOM, power loss) the
+// previous session stays active server-side until it times out (~1 min), so a
+// restarting service would otherwise crash-loop. Retrying lets it self-heal.
+// Any non-conflict error (e.g. bad auth) fails fast.
+func openSessionWithRetry(ctx context.Context, client *scaleset.Client, scaleSetID int, owner string, log *slog.Logger) (*scaleset.MessageSessionClient, error) {
+	const attempts = 12
+	const delay = 10 * time.Second
+
+	var err error
+	for i := 0; i < attempts; i++ {
+		var session *scaleset.MessageSessionClient
+		session, err = client.MessageSessionClient(ctx, scaleSetID, owner)
+		if err == nil {
+			return session, nil
+		}
+		if !isSessionConflict(err) {
+			return nil, err
+		}
+		log.Warn("scale set session still held by a previous run; waiting for it to expire",
+			"attempt", i+1, "maxAttempts", attempts)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return nil, err
+}
+
+// isSessionConflict reports whether err is GitHub's "scale set already has an
+// active session" (HTTP 409) response. The library surfaces it only as a
+// wrapped string, so we match on the conflict marker.
+func isSessionConflict(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "conflict")
 }
 
 // JIT returns a JIT source bound to this scale set, satisfying

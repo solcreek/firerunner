@@ -2,6 +2,7 @@ package listener
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -78,3 +79,23 @@ func TestRandSuffixUnique(t *testing.T) {
 var _ interface {
 	Generate(context.Context, core.RunnerSpec) (string, string, error)
 } = (*JITSource)(nil)
+
+func TestIsSessionConflict(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"conflict 409", errors.New(`unexpected status code 409 Conflict: RunnerScaleSetSessionConflictException`), true},
+		{"conflict mixed case", errors.New("The scaleset already has an active session (CONFLICT)"), true},
+		{"unrelated", errors.New("401 Unauthorized: bad credentials"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isSessionConflict(tc.err); got != tc.want {
+				t.Fatalf("isSessionConflict(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
