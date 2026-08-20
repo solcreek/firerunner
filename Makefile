@@ -1,5 +1,8 @@
 BINARY := firerunner
 PKG := ./...
+# Coverage is measured over the library packages; cmd/ is thin wiring exercised
+# by the e2e suite, not unit tests.
+COVERPKG := ./internal/...
 COVERPROFILE := cover.out
 COVER_MIN ?= 70
 
@@ -18,7 +21,7 @@ test:
 # Unit coverage across all packages (cross-package attribution via -coverpkg).
 .PHONY: cover
 cover:
-	go test -race -covermode=atomic -coverpkg=$(PKG) -coverprofile=$(COVERPROFILE) $(PKG)
+	go test -race -covermode=atomic -coverpkg=$(COVERPKG) -coverprofile=$(COVERPROFILE) $(COVERPKG)
 	go tool cover -func=$(COVERPROFILE) | tail -n 1
 
 .PHONY: cover-html

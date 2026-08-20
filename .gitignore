@@ -9,3 +9,5 @@
 
 # editor / OS
 .DS_Store
+cover.out
+*.out

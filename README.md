@@ -70,6 +70,13 @@ make cover-check   # unit coverage with a minimum threshold (COVER_MIN)
 make e2e           # end-to-end tests (requires a real KVM host; -tags e2e)
 ```
 
+Tests follow a functional-core / imperative-shell split: pure logic (the
+Firecracker API sequence, the scale-up plan, config parsing) is unit-tested to
+near-100%, host I/O is exercised through injected seams (a `commandRunner` fake
+and an `httptest` server over a unix socket), and real microVM boots live in
+`test/e2e` behind the `e2e` build tag. CI (`.github/workflows/ci.yml`) runs
+build, vet and the coverage gate on every push and PR.
+
 ## Usage
 
 ```bash
