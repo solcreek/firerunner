@@ -1,5 +1,11 @@
 # firerunner
 
+[![CI](https://github.com/solcreek/firerunner/actions/workflows/ci.yml/badge.svg)](https://github.com/solcreek/firerunner/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/solcreek/firerunner.svg)](https://pkg.go.dev/github.com/solcreek/firerunner)
+[![Go Report Card](https://goreportcard.com/badge/github.com/solcreek/firerunner)](https://goreportcard.com/report/github.com/solcreek/firerunner)
+[![Go version](https://img.shields.io/github/go-mod/go-version/solcreek/firerunner)](go.mod)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+
 Ephemeral [Firecracker](https://firecracker-microvm.github.io/) microVM runners
 for GitHub Actions. Every job runs in a fresh, single-use microVM that registers
 a just-in-time (JIT) ephemeral runner, executes exactly one job, and then self-
@@ -11,10 +17,12 @@ standard library — no containerd, no CNI, no LVM, no VM-management daemon. Its
 only external dependency is GitHub's official runner scale-set client
 (`github.com/actions/scaleset`), which drives the long-poll control plane.
 
-> Status: early. The GitHub control-plane integration
-> (`github.com/actions/scaleset`) is wired; per-VM networking, an nftables
-> egress allowlist and off-VM log shipping are in place. Real-hardware e2e
-> validation is still pending before production use.
+> Status: early, but validated end-to-end on real hardware. The full path —
+> GitHub scale-set long-poll, per-VM networking, the nftables egress allowlist,
+> off-VM log shipping, golden-image build, and microVM boot → MMDS-JIT →
+> self-destruct — has been exercised on a KVM host (Firecracker v1.10.1).
+> Running a live production fleet additionally needs a golden image and a GitHub
+> App (see below).
 
 ## Why microVMs
 
@@ -31,7 +39,7 @@ bare metal. See GitHub's guidance on
                  ┌──────────────────── firerunner (single Go binary) ─────────────────┐
 GitHub  ◀──────▶ │  listener        long-poll GitHub → desired runner count           │
 (scaleset API)   │  scheduler       reconcile running microVMs to desired, ≤ maxRunners│
-                 │  provisioner     per job: reflink golden.ext4 → tap/NAT → MMDS(JIT) │
+                 │  provisioner     per job: reflink golden.ext4 → tap+nft → MMDS(JIT) │
                  │                  → firecracker InstanceStart → wait exit → reap      │
                  └────────────────────────────────────────────────────────────────────┘
                                               │  one microVM per job
@@ -85,8 +93,9 @@ ephemeral runners.
 - **Per-VM network isolation + egress allowlist** — dedicated tap/subnet per
   microVM; guests may reach only GitHub's published IP ranges (plus DNS/NTP).
 - **External log forwarding** — serial console shipped off-VM to `--log-dir`.
-- Roadmap: golden-image rebuild pipeline (≤30 days, per GitHub's runner-update
-  policy).
+- **Golden-image rebuild pipeline** — images rebuilt on a schedule so the
+  bundled `actions/runner` stays within GitHub's ≤30-day support window (see
+  [`images/`](images/README.md)).
 
 ## Requirements
 
