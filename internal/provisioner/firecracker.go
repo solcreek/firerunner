@@ -239,28 +239,55 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 	}
 
 	f.log.Info("microVM started", "runner", name, "slot", slot, "guestIP", vnet.guestIP, "vcpu", spec.VCPU, "memMiB", spec.MemMiB)
-	err = cmd.Wait() // returns when the guest reboots (self-destruct)
-	if err == nil {
+	bootedAt := time.Now()
+	err = cmd.Wait() // returns when the guest reboots (self-destruct) or dies
+	ranFor := time.Since(bootedAt)
+	if failErr := classifyLaunchExit(err, ctx.Err(), ranFor, minBootRuntime); failErr != nil {
+		f.log.Error("microVM wait failed", "runner", name, "err", failErr, "ranFor", ranFor.Round(time.Millisecond))
+		return fmt.Errorf("wait for microVM %s: %w", name, failErr)
+	}
+	switch {
+	case err == nil:
 		f.log.Info("microVM exited", "runner", name)
-		return nil
-	}
-	// We cancelled this VM ourselves (idle-drain / shutdown SIGKILLs the VMM via
-	// exec.CommandContext); that death is expected, not a failure.
-	if ctx.Err() != nil {
+	case ctx.Err() != nil:
+		// We cancelled this VM ourselves (idle-drain / shutdown SIGKILLs the VMM
+		// via exec.CommandContext); that death is expected, not a failure.
 		f.log.Info("microVM cancelled", "runner", name)
+	default:
+		// Non-zero exit after a healthy runtime: the guest's reboot=k
+		// self-destruct, which makes the VMM exit non-zero on some kernels.
+		f.log.Info("microVM exited", "runner", name, "ranFor", ranFor.Round(time.Second))
+	}
+	return nil
+}
+
+// minBootRuntime is the shortest a microVM can plausibly run and still have
+// booted, registered and done any work before its reboot=k self-destruct. A
+// non-zero VMM exit sooner than this means the guest never came up, so Launch
+// reports it as a failure instead of a normal self-destruct.
+const minBootRuntime = 3 * time.Second
+
+// classifyLaunchExit decides whether a VMM's exit is normal end-of-life or a
+// real failure. A nil wait error, or any exit after we cancelled the VM
+// (ctxErr != nil), is normal. The guest's reboot=k self-destruct makes the VMM
+// exit non-zero, so a non-zero exit AFTER at least minRuntime is also normal;
+// but a non-zero exit within minRuntime means the guest never booted (a broken
+// golden, OOM before boot, ...) and is returned as an error so the caller can
+// back off instead of hot-looping a relaunch. Any non-ExitError (I/O error,
+// lost process) is always a failure.
+func classifyLaunchExit(waitErr, ctxErr error, ranFor, minRuntime time.Duration) error {
+	if waitErr == nil || ctxErr != nil {
 		return nil
 	}
-	// The guest's reboot=k self-destruct makes the VMM exit non-zero on some
-	// kernels, so a normal non-zero process exit after a successful boot is
-	// expected. Anything else (I/O error, lost process, OOM before boot) is a
-	// real failure and must be surfaced rather than swallowed.
 	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		f.log.Info("microVM exited", "runner", name, "code", exitErr.ExitCode())
-		return nil
+	if errors.As(waitErr, &exitErr) {
+		if ranFor >= minRuntime {
+			return nil
+		}
+		return fmt.Errorf("exited after %s (code %d): likely failed to boot: %w",
+			ranFor.Round(time.Millisecond), exitErr.ExitCode(), waitErr)
 	}
-	f.log.Error("microVM wait failed", "runner", name, "err", err)
-	return fmt.Errorf("wait for microVM %s: %w", name, err)
+	return waitErr
 }
 
 // SetupNetwork installs host forwarding, the egress allowlist and NAT exactly

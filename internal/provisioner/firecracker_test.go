@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -805,5 +806,30 @@ func TestSanitizedEnv_ExcludesSecrets(t *testing.T) {
 	}
 	if !hasHome {
 		t.Error("sanitizedEnv should forward HOME")
+	}
+}
+
+func TestClassifyLaunchExit(t *testing.T) {
+	const minRuntime = 3 * time.Second
+	fastCrash := &exec.ExitError{ProcessState: &os.ProcessState{}}
+	// nil wait error is always healthy.
+	if err := classifyLaunchExit(nil, nil, 0, minRuntime); err != nil {
+		t.Errorf("nil wait err should be healthy, got %v", err)
+	}
+	// We cancelled it (ctxErr set): any exit is expected, even a fast one.
+	if err := classifyLaunchExit(fastCrash, context.Canceled, time.Millisecond, minRuntime); err != nil {
+		t.Errorf("cancelled VM should be healthy, got %v", err)
+	}
+	// Non-zero exit after a healthy runtime is the reboot=k self-destruct.
+	if err := classifyLaunchExit(fastCrash, nil, 10*time.Second, minRuntime); err != nil {
+		t.Errorf("self-destruct after healthy runtime should be healthy, got %v", err)
+	}
+	// Non-zero exit within minRuntime is a boot failure.
+	if err := classifyLaunchExit(fastCrash, nil, 200*time.Millisecond, minRuntime); err == nil {
+		t.Error("fast non-zero exit should be a failure")
+	}
+	// A non-ExitError (I/O error, lost process) is always a failure.
+	if err := classifyLaunchExit(io.ErrUnexpectedEOF, nil, time.Hour, minRuntime); err == nil {
+		t.Error("non-ExitError should always be a failure")
 	}
 }
