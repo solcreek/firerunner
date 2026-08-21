@@ -189,6 +189,14 @@ and the runner-images installer subset baked in (built by
 Use it for jobs that need the closest parity with GitHub-hosted `ubuntu-latest`;
 the lean Debian `firerunner` tier stays the default for everything else.
 
+For Ubuntu glibc parity **without** the full image's bulk, build
+[`--toolset minimal`](images/build-ubuntu-rootfs.sh): a thin Ubuntu 24.04 base
+(runner + git + build-essential + system python3 + Node.js runtime, **no Docker
+or baked language toolchains**, ~1.6 GiB) meant to be paired with a
+[`--toolcache` drive](#pre-seeded-tool-cache---toolcache-opt-in) so `setup-*`
+actions resolve languages on demand — ideal for the common build/test/lint/SAST
+jobs that never touch Docker.
+
 ### Inspecting a deployment (`status`, `doctor`)
 
 Two read-only subcommands help operators inspect and diagnose a runner host.

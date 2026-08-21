@@ -30,12 +30,23 @@ scale set) from a single [tier catalog](../examples/tiers.json).
 | `firerunner-4c8g`         | 4 / 8 GiB              | actions/runner, git, curl, jq, build-essential base   | generic jobs; toolchains fetched by `setup-*` per workflow  |
 | `firerunner-node`         | 2 / 4 GiB              | everything above **+ Node.js LTS + npm** (baked)      | JS/TS builds where `setup-node` should hit a local toolchain |
 | `firerunner-8c16g-docker` | 8 / 16 GiB            | everything above **+ Docker Engine (dind-capable)**  | jobs using `container:`, service containers, `docker build` |
+| `firerunner-ubuntu-min`   | 4 / 8 GiB              | Ubuntu 24.04 (glibc 2.39) thin base: runner, git, build-essential, system python3, Node.js runtime — **no Docker, no baked language toolchains** | ubuntu-latest glibc parity for the ~90% of jobs that don't need Docker; pair with a `--toolcache` drive |
 | `firerunner-ubuntu`       | 4 / 8 GiB              | Ubuntu 24.04 (glibc 2.39) **+ hosted tool cache + runner-images installers** (kitchen-sink) | closest parity with GitHub-hosted `ubuntu-latest` |
 
 The first three tiers are lean Debian goldens built by
-[`build-rootfs.sh`](build-rootfs.sh); the `firerunner-ubuntu` tier is the
-faithful `ubuntu-latest` full image built by
-[`build-ubuntu-rootfs.sh --toolset full`](build-ubuntu-rootfs.sh).
+[`build-rootfs.sh`](build-rootfs.sh); the two `firerunner-ubuntu*` tiers are
+built by [`build-ubuntu-rootfs.sh`](build-ubuntu-rootfs.sh), which offers three
+Ubuntu toolsets on the same glibc-2.39 parity base:
+
+- `--toolset minimal` — thin base (runner + git + build-essential + system
+  python3 + Node.js runtime). **No Docker, no baked jdk/ruby/go.** Languages come
+  from an attached [`--toolcache` drive](#building-the-tool-cache-drive) via
+  `setup-*` actions, so this is the smallest Ubuntu-parity golden (~1.6 GiB) for
+  the common case of build/test/lint/SAST jobs that never touch Docker.
+- `--toolset base` — `minimal` + `docker.io` + the curated apt kitchen-sink
+  (`default-jdk`, `ruby-full`, `golang-go`, …); self-contained, `ubuntu-latest`-ish.
+- `--toolset full` — `base` + the actions/runner-images tool cache and curated
+  docker-safe installer subset (Azure/GUI/snap/services excluded); maximum parity.
 
 The base tier deliberately ships no language toolchain — a workflow's `setup-go`
 / `setup-node` fetches one per run. Baking a toolchain (the `firerunner-node`

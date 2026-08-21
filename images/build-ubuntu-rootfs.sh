@@ -10,7 +10,12 @@
 #
 # Usage:
 #   sudo ./build-ubuntu-rootfs.sh --out /var/tmp/fr-golden/ubuntu-rootfs.ext4 \
-#     --toolset base            # base = curated kitchen-sink (Stage 1)
+#     --toolset base            # minimal = thin ubuntu-parity base: no docker,
+#                               #        no baked language toolchains -- pair it
+#                               #        with a --toolcache drive (build-toolcache.sh)
+#                               #        for node/go/python/etc via setup-* actions
+#                               # base = minimal + docker.io + curated kitchen-sink
+#                               #        language toolchains (ubuntu-latest-ish)
 #                               # full = base + actions/runner-images toolcache
 #                               #        + curated docker-safe installer subset
 #                               #        (Azure/GUI/snap/services excluded)
@@ -50,7 +55,7 @@ done
 [[ "$(uname -s)" == "Linux" ]] || die "must run on Linux (KVM host)"
 [[ $EUID -eq 0 ]] || die "must run as root"
 [[ -n "$OUT" ]] || die "--out is required"
-case "$TOOLSET" in base|full) ;; *) die "--toolset must be base or full" ;; esac
+case "$TOOLSET" in minimal|base|full) ;; *) die "--toolset must be minimal, base or full" ;; esac
 for t in docker mkfs.ext4 e2label; do command -v "$t" >/dev/null || die "missing tool: $t"; done
 docker info >/dev/null 2>&1 || die "docker daemon not available"
 
@@ -159,6 +164,15 @@ RIRUN
 fi
 
 # ---- Dockerfile ------------------------------------------------------------
+# Language toolchains baked into the rootfs. `minimal` externalizes languages to
+# a --toolcache drive (build-toolcache.sh) and drops docker; base/full bake the
+# ubuntu-latest-ish kitchen sink (incl. docker.io). build-essential + system
+# python3 stay in every toolset (node-gyp/native modules + ubuntu-latest parity).
+TOOLCHAIN_PKGS="build-essential pkg-config make cmake python3 python3-pip python3-venv python-is-python3 libssl-dev libffi-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev"
+if [[ "$TOOLSET" != "minimal" ]]; then
+  TOOLCHAIN_PKGS="$TOOLCHAIN_PKGS default-jdk ruby-full golang-go docker.io"
+fi
+
 cat > "$CTX/Dockerfile" <<DOCKERFILE
 FROM ubuntu:${UBUNTU_TAG}
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
@@ -170,13 +184,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
       software-properties-common locales tzdata \\
     && rm -rf /var/lib/apt/lists/*
 
-# curated kitchen-sink toolset (Stage 1: ubuntu-latest-ish, reliable + bootable).
+# Language toolchains (see TOOLCHAIN_PKGS above): kitchen sink + docker for
+# base/full, thin build-essential + system python3 only for minimal.
 RUN apt-get update && apt-get install -y --no-install-recommends \\
-      build-essential pkg-config make cmake \\
-      python3 python3-pip python3-venv python-is-python3 \\
-      default-jdk ruby-full golang-go \\
-      docker.io \\
-      libssl-dev libffi-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \\
+      ${TOOLCHAIN_PKGS} \\
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js LTS from the official static tarball (no nodesource) into /usr/local.
