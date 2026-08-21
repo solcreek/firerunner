@@ -2,9 +2,9 @@ name: ubuntu-rootfs-selftest
 
 # Smoke test for the "full" ubuntu-rootfs golden (build-ubuntu-rootfs.sh
 # --toolset full): confirms the baked-in actions/runner-images tool cache is
-# present and consumed by the setup-* actions (versions resolve locally instead
-# of downloading). Dispatch against a firerunner listener booting the full
-# golden. Versions below match toolset-2404.json; adjust if the ref changes.
+# present and wired up (RUNNER_TOOL_CACHE), and that the cached Go/Node/Python
+# toolchains actually run. Dispatch against a firerunner listener booting the
+# full golden.
 on:
   workflow_dispatch:
 
@@ -12,25 +12,21 @@ jobs:
   toolcache:
     runs-on: firerunner
     steps:
-      - uses: actions/checkout@v4
-      - name: setup-go (from go.mod)
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-          cache: false
-      - name: setup-node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-      - name: setup-python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-      - name: report
+      - name: baked tool cache present + consumed
         run: |
+          set -e
+          TC="${RUNNER_TOOL_CACHE:-/opt/hostedtoolcache}"
           echo "RUNNER_TOOL_CACHE=${RUNNER_TOOL_CACHE:-unset}"
           echo "AGENT_TOOLSDIRECTORY=${AGENT_TOOLSDIRECTORY:-unset}"
-          echo "go:     $(go version)"
-          echo "node:   $(node --version)"
-          echo "python: $(python --version)"
-          echo "cache tools: $(ls "${RUNNER_TOOL_CACHE:-/opt/hostedtoolcache}" 2>/dev/null | tr '\n' ' ')"
+          echo "cache tools: $(ls "$TC" 2>/dev/null | tr '\n' ' ')"
+          for t in Python node go; do
+            test -d "$TC/$t" || { echo "MISSING: $t not in tool cache"; exit 1; }
+            echo "$t: $(ls "$TC/$t" | tr '\n' ' ')"
+          done
+          # run the newest cached toolchain of each to prove they work
+          GO=$(ls -d "$TC"/go/*/x64/bin/go | sort -V | tail -1)
+          NODE=$(ls -d "$TC"/node/*/x64/bin/node | sort -V | tail -1)
+          PY=$(ls -d "$TC"/Python/*/x64/bin/python3 | sort -V | tail -1)
+          echo "go:     $("$GO" version)"
+          echo "node:   $("$NODE" --version)"
+          echo "python: $("$PY" --version)"
