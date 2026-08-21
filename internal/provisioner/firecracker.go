@@ -531,12 +531,18 @@ func (f *Firecracker) ensureHostCacheInput(ctx context.Context) error {
 
 // removeStaleCacheInput deletes this instance's cache-input rules whose port no
 // longer matches the configured one, using the rule handles in an `nft -a`
-// listing. Rules for the current port are kept.
+// listing. Rules for the current port are kept. It also removes the pre-port
+// legacy comment ("firerunner-cache-<prefix>", written before the port was part
+// of the tag) so upgrading from an older firerunner leaves no orphan rule.
 func (f *Firecracker) removeStaleCacheInput(ctx context.Context, listing string) error {
 	prefix := cacheInputCommentPrefix(f.cfg.TapPrefix)
 	current := cacheInputComment(f.cfg.TapPrefix, f.cfg.CachePort)
+	// The legacy tag has no "-<port>" suffix; match it as a whole quoted token so
+	// it cannot also match a current "...-<port>" comment as a substring.
+	legacy := `"firerunner-cache-` + f.cfg.TapPrefix + `"`
 	for _, line := range strings.Split(listing, "\n") {
-		if !strings.Contains(line, prefix) || strings.Contains(line, current) {
+		stale := (strings.Contains(line, prefix) && !strings.Contains(line, current)) || strings.Contains(line, legacy)
+		if !stale {
 			continue
 		}
 		handle := parseNFTHandle(line)

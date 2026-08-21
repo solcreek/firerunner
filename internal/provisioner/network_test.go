@@ -130,6 +130,7 @@ func TestEnsureHostCacheInputPortChange(t *testing.T) {
 	chain INPUT {
 		type filter hook input priority filter; policy drop;
 		iifname "fr*" tcp dport 8099 ct state new,established,related counter accept comment "firerunner-cache-fr-8099" # handle 42
+		iifname "fr*" tcp dport 8099 ct state new,established,related counter accept comment "firerunner-cache-fr" # handle 43
 	}
 }`
 	var cmds [][]string
@@ -143,10 +144,14 @@ func TestEnsureHostCacheInputPortChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	var deletedStale, appliedNew bool
+	var deletedLegacy bool
 	for _, c := range cmds {
 		joined := strings.Join(c, " ")
 		if strings.Contains(joined, "delete rule ip filter INPUT handle 42") {
 			deletedStale = true
+		}
+		if strings.Contains(joined, "delete rule ip filter INPUT handle 43") {
+			deletedLegacy = true
 		}
 		if strings.HasPrefix(joined, "nft -f ") {
 			appliedNew = true
@@ -154,6 +159,9 @@ func TestEnsureHostCacheInputPortChange(t *testing.T) {
 	}
 	if !deletedStale {
 		t.Errorf("stale port-8099 rule (handle 42) not deleted; cmds=%v", cmds)
+	}
+	if !deletedLegacy {
+		t.Errorf("legacy port-less rule (handle 43) not deleted; cmds=%v", cmds)
 	}
 	if !appliedNew {
 		t.Errorf("new port-9000 rule not applied; cmds=%v", cmds)
