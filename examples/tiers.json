@@ -23,5 +23,13 @@
     "golden": "/var/lib/firerunner/golden-node.ext4",
     "min": 0,
     "max": 4
+  },
+  {
+    "name": "firerunner-ubuntu",
+    "vcpu": 4,
+    "mem_mib": 8192,
+    "golden": "/var/lib/firerunner/ubuntu-rootfs-full.ext4",
+    "min": 0,
+    "max": 2
   }
 ]

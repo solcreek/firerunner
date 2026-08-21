@@ -151,15 +151,17 @@ jobs:
   build:   { runs-on: firerunner }          # default tier
   heavy:   { runs-on: firerunner-8c16g }    # 8 vCPU / 16 GiB
   web:     { runs-on: firerunner-node }     # Node-baked golden image
+  compat:  { runs-on: firerunner-ubuntu }   # faithful ubuntu-latest full image
 ```
 
 Point `--tiers` (or `FR_TIERS`) at a JSON catalog:
 
 ```json
 [
-  { "name": "firerunner",       "vcpu": 2, "mem_mib": 4096,  "golden": "/var/lib/firerunner/golden.ext4",      "min": 1, "max": 8 },
-  { "name": "firerunner-8c16g", "vcpu": 8, "mem_mib": 16384, "golden": "/var/lib/firerunner/golden.ext4",      "min": 0, "max": 2 },
-  { "name": "firerunner-node",  "vcpu": 2, "mem_mib": 4096,  "golden": "/var/lib/firerunner/golden-node.ext4", "min": 0, "max": 4 }
+  { "name": "firerunner",       "vcpu": 2, "mem_mib": 4096,  "golden": "/var/lib/firerunner/golden.ext4",           "min": 1, "max": 8 },
+  { "name": "firerunner-8c16g", "vcpu": 8, "mem_mib": 16384, "golden": "/var/lib/firerunner/golden.ext4",           "min": 0, "max": 2 },
+  { "name": "firerunner-node",  "vcpu": 2, "mem_mib": 4096,  "golden": "/var/lib/firerunner/golden-node.ext4",      "min": 0, "max": 4 },
+  { "name": "firerunner-ubuntu","vcpu": 4, "mem_mib": 8192,  "golden": "/var/lib/firerunner/ubuntu-rootfs-full.ext4","min": 0, "max": 2 }
 ]
 ```
 
@@ -179,6 +181,13 @@ Each tier is reachable with `runs-on: <name>`. An optional `"labels"` array
 adds **extra** `runs-on` aliases for a tier (the tier name is always advertised
 too), e.g. `"labels": ["node"]` lets a job target the tier with either
 `runs-on: firerunner-node` or `runs-on: node`.
+
+The `firerunner-ubuntu` tier above points at the **faithful `ubuntu-latest`
+full image** — an Ubuntu 24.04 (glibc 2.39) rootfs with the hosted tool cache
+and the runner-images installer subset baked in (built by
+[`images/build-ubuntu-rootfs.sh --toolset full`](images/build-ubuntu-rootfs.sh)).
+Use it for jobs that need the closest parity with GitHub-hosted `ubuntu-latest`;
+the lean Debian `firerunner` tier stays the default for everything else.
 
 ### Inspecting a deployment (`status`, `doctor`)
 

@@ -3,10 +3,10 @@ name: tier-routing
 # Proves multi-tier routing from one firerunner process: GitHub routes each job
 # to the scale set whose name matches its runs-on label, so a job lands on that
 # tier's microVM shape (vcpu/mem) and golden image. nproc fingerprints the vcpu
-# knob; node presence fingerprints the golden-image knob.
+# knob; node presence and the Ubuntu 24.04/glibc version fingerprint the
+# golden-image knob (lean Debian vs Node-baked vs faithful ubuntu-latest full).
 on:
   workflow_dispatch:
-
 jobs:
   base:
     runs-on: firerunner
@@ -40,4 +40,19 @@ jobs:
             echo "FAIL: node missing on node tier"; exit 1
           fi
           echo "OK: node tier has baked node: $(node --version), npm $(npm --version)"
+
+  ubuntu:
+    runs-on: firerunner-ubuntu
+    steps:
+      - run: |
+          . /etc/os-release
+          echo "tier=ubuntu runner=firerunner-ubuntu nproc=$(nproc) $PRETTY_NAME"
+          if [ "$(nproc)" != "4" ]; then
+            echo "FAIL: ubuntu tier expected 4 vCPU, got $(nproc)"; exit 1
+          fi
+          if [ "$VERSION_ID" != "24.04" ]; then
+            echo "FAIL: ubuntu tier expected Ubuntu 24.04, got $VERSION_ID"; exit 1
+          fi
+          glibc=$(ldd --version | head -1 | grep -oE '[0-9]+\.[0-9]+$')
+          echo "OK: ubuntu tier = 4 vCPU, $PRETTY_NAME, glibc $glibc (faithful full image routed)"
 

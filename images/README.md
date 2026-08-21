@@ -29,6 +29,12 @@ label, so each tier runs as its own firerunner instance/scale set.
 | `firerunner-4c8g`         | 4 / 8 GiB              | actions/runner, git, curl, jq, build-essential base   | generic jobs; toolchains fetched by `setup-*` per workflow  |
 | `firerunner-node`         | 2 / 4 GiB              | everything above **+ Node.js LTS + npm** (baked)      | JS/TS builds where `setup-node` should hit a local toolchain |
 | `firerunner-8c16g-docker` | 8 / 16 GiB            | everything above **+ Docker Engine (dind-capable)**  | jobs using `container:`, service containers, `docker build` |
+| `firerunner-ubuntu`       | 4 / 8 GiB              | Ubuntu 24.04 (glibc 2.39) **+ hosted tool cache + runner-images installers** (kitchen-sink) | closest parity with GitHub-hosted `ubuntu-latest` |
+
+The first three tiers are lean Debian goldens built by
+[`build-rootfs.sh`](build-rootfs.sh); the `firerunner-ubuntu` tier is the
+faithful `ubuntu-latest` full image built by
+[`build-ubuntu-rootfs.sh --toolset full`](build-ubuntu-rootfs.sh).
 
 The base tier deliberately ships no language toolchain — a workflow's `setup-go`
 / `setup-node` fetches one per run. Baking a toolchain (the `firerunner-node`
