@@ -907,11 +907,16 @@ func fsKind(dir string) string {
 }
 
 // reflinkProbe reports whether dir's filesystem can actually make reflink
-// (copy-on-write) clones, by running the very cp --reflink the provisioner uses.
-// cp --reflink=always fails when the filesystem cannot reflink, so this is
-// ground truth rather than a guess from the fs type — XFS without reflink=1 or
-// ZFS without block cloning would otherwise be mis-reported as capable. Returns
-// false if dir is not writable or cp is unavailable.
+// (copy-on-write) clones, by cloning a probe file within dir with
+// cp --reflink=always. It uses =always -- not the =auto the provisioner uses
+// for the golden->workdir clone -- precisely so an unsupported filesystem fails
+// loudly here instead of silently falling back to a full copy: this is ground
+// truth about the filesystem's capability rather than a guess from the fs type;
+// XFS without reflink=1 or ZFS without block cloning would otherwise be
+// mis-reported as capable. Cloning inside dir keeps the probe on the workdir's
+// own filesystem; whether the golden shares that filesystem is a separate
+// question (see reflinkLocalityCheck). Returns false if dir is not writable or
+// cp is unavailable.
 func reflinkProbe(dir string) bool {
 	src, err := os.CreateTemp(dir, ".firerunner-reflink-*")
 	if err != nil {
