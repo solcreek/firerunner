@@ -382,18 +382,27 @@ func TestBuildAPISteps_ToolCacheDrive(t *testing.T) {
 
 func TestFcToolCachePath(t *testing.T) {
 	// Unset -> no drive.
-	if got := NewFirecracker(FirecrackerConfig{}, testLogger()).fcToolCachePath(); got != "" {
+	if got := NewFirecracker(FirecrackerConfig{}, testLogger()).fcToolCachePath(core.RunnerSpec{}); got != "" {
 		t.Fatalf("unset = %q, want empty", got)
 	}
 	// Direct launch -> the host path is opened directly.
 	direct := NewFirecracker(FirecrackerConfig{ToolCacheImage: "/var/lib/tc.ext4"}, testLogger())
-	if got := direct.fcToolCachePath(); got != "/var/lib/tc.ext4" {
+	if got := direct.fcToolCachePath(core.RunnerSpec{}); got != "/var/lib/tc.ext4" {
 		t.Fatalf("direct = %q, want host path", got)
 	}
 	// Jailer -> the in-jail staged path.
 	jailed := NewFirecracker(FirecrackerConfig{ToolCacheImage: "/var/lib/tc.ext4", Jailer: true}, testLogger())
-	if got := jailed.fcToolCachePath(); got != "/toolcache.ext4" {
+	if got := jailed.fcToolCachePath(core.RunnerSpec{}); got != "/toolcache.ext4" {
 		t.Fatalf("jailer = %q, want /toolcache.ext4", got)
+	}
+	// A tier's own image overrides the global default (direct mode).
+	if got := direct.fcToolCachePath(core.RunnerSpec{ToolCache: "/var/lib/tier.ext4"}); got != "/var/lib/tier.ext4" {
+		t.Fatalf("tier override = %q, want tier host path", got)
+	}
+	// A per-tier image with no global default still resolves.
+	none := NewFirecracker(FirecrackerConfig{}, testLogger())
+	if got := none.fcToolCachePath(core.RunnerSpec{ToolCache: "/var/lib/tier.ext4"}); got != "/var/lib/tier.ext4" {
+		t.Fatalf("tier-only = %q, want tier host path", got)
 	}
 }
 

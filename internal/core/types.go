@@ -15,4 +15,9 @@ type RunnerSpec struct {
 	// RootFS is the path to the immutable golden ext4 image for this tier. It
 	// is never mutated; each job gets a reflink (copy-on-write) clone.
 	RootFS string
+	// ToolCache, when set, is the host path to a read-only "hostedtoolcache"
+	// ext4 image attached to this tier's microVMs. It overrides the
+	// process-global --toolcache for this tier; empty means fall back to the
+	// global default (or no tool cache when neither is set).
+	ToolCache string
 }

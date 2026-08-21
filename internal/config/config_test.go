@@ -216,6 +216,37 @@ func TestFromFlags_TierCatalog(t *testing.T) {
 	}
 }
 
+func TestFromFlags_TierToolCache(t *testing.T) {
+	// A per-tier toolcache is parsed, validated (must exist) and flows into the
+	// tier's RunnerSpec, overriding the global default.
+	img := filepath.Join(t.TempDir(), "tier-tc.ext4")
+	if err := os.WriteFile(img, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := writeTiers(t, `[
+	  {"name":"lean","vcpu":2,"mem_mib":4096,"golden":"/g/base.ext4","toolcache":"`+img+`","min":0,"max":4},
+	  {"name":"fat","vcpu":2,"mem_mib":4096,"golden":"/g/base.ext4","min":0,"max":4}
+	]`)
+	c, err := FromFlags(append(baseArgs(), "--tiers", p, "--max-runners", "8"))
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	tiers := c.EffectiveTiers()
+	if tiers[0].ToolCache != img || tiers[0].Spec().ToolCache != img {
+		t.Fatalf("lean tier toolcache = %q / spec %q, want %q", tiers[0].ToolCache, tiers[0].Spec().ToolCache, img)
+	}
+	if tiers[1].ToolCache != "" || tiers[1].Spec().ToolCache != "" {
+		t.Fatalf("fat tier toolcache = %q, want empty (global fallback)", tiers[1].ToolCache)
+	}
+}
+
+func TestFromFlags_TierToolCacheMissing(t *testing.T) {
+	p := writeTiers(t, `[{"name":"t","vcpu":2,"mem_mib":4096,"golden":"/g","toolcache":"/no/such/tc.ext4","min":0,"max":4}]`)
+	if _, err := FromFlags(append(baseArgs(), "--tiers", p, "--max-runners", "8")); err == nil {
+		t.Fatal("expected error for a missing per-tier toolcache image")
+	}
+}
+
 func TestFromFlags_TierCatalogSatisfiesGolden(t *testing.T) {
 	// A tier catalog replaces the top-level --golden requirement.
 	p := writeTiers(t, `[{"name":"firerunner","vcpu":2,"mem_mib":4096,"golden":"/g/base.ext4","min":0,"max":4}]`)

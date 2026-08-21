@@ -47,13 +47,14 @@ type StatusReport struct {
 
 // TierInfo is one configured runner tier as seen by status.
 type TierInfo struct {
-	Name   string   `json:"name"`
-	Labels []string `json:"labels,omitempty"`
-	VCPU   int      `json:"vcpu"`
-	MemMiB int      `json:"mem_mib"`
-	Golden FileStat `json:"golden"`
-	Min    int      `json:"min"`
-	Max    int      `json:"max"`
+	Name      string    `json:"name"`
+	Labels    []string  `json:"labels,omitempty"`
+	VCPU      int       `json:"vcpu"`
+	MemMiB    int       `json:"mem_mib"`
+	Golden    FileStat  `json:"golden"`
+	ToolCache *FileStat `json:"toolcache,omitempty"`
+	Min       int       `json:"min"`
+	Max       int       `json:"max"`
 }
 
 // FileStat describes an image file on disk.
@@ -191,7 +192,7 @@ func collectStatus(cfg *config.Config, version string) StatusReport {
 	// Tier catalog, when one is configured. Each tier is its own scale set with
 	// its own microVM shape and golden image, all sharing this host.
 	for _, t := range cfg.Tiers {
-		r.Tiers = append(r.Tiers, TierInfo{
+		ti := TierInfo{
 			Name:   t.Name,
 			Labels: t.Labels,
 			VCPU:   t.VCPU,
@@ -199,7 +200,12 @@ func collectStatus(cfg *config.Config, version string) StatusReport {
 			Golden: statFile(t.Golden),
 			Min:    t.Min,
 			Max:    t.Max,
-		})
+		}
+		if t.ToolCache != "" {
+			f := statFile(t.ToolCache)
+			ti.ToolCache = &f
+		}
+		r.Tiers = append(r.Tiers, ti)
 	}
 
 	// Live microVMs, cross-checked three ways: work dirs (per-job rootfs clone +
@@ -245,10 +251,14 @@ func renderStatusText(r StatusReport, w io.Writer) {
 	if len(r.Tiers) > 0 {
 		fmt.Fprintf(w, "\ntiers: %d  (developers select one via runs-on: <name>; shared slot budget max=%d)\n", len(r.Tiers), r.Max)
 		ttw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
-		fmt.Fprintln(ttw, "  RUNS-ON\tVCPU\tMEM\tWARM\tMAX\tGOLDEN")
+		fmt.Fprintln(ttw, "  RUNS-ON\tVCPU\tMEM\tWARM\tMAX\tGOLDEN\tTOOLCACHE")
 		for _, t := range r.Tiers {
-			fmt.Fprintf(ttw, "  %s\t%d\t%dMiB\t%d\t%d\t%s\n",
-				t.Name, t.VCPU, t.MemMiB, t.Min, t.Max, t.Golden.describe())
+			tc := "(global default)"
+			if t.ToolCache != nil {
+				tc = t.ToolCache.describe()
+			}
+			fmt.Fprintf(ttw, "  %s\t%d\t%dMiB\t%d\t%d\t%s\t%s\n",
+				t.Name, t.VCPU, t.MemMiB, t.Min, t.Max, t.Golden.describe(), tc)
 		}
 		ttw.Flush()
 	}

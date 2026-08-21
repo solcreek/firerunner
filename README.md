@@ -201,13 +201,13 @@ Point `--tiers` (or `FR_TIERS`) at a JSON catalog:
   { "name": "firerunner-8c16g", "vcpu": 8, "mem_mib": 16384, "golden": "/var/lib/firerunner/golden.ext4",           "min": 0, "max": 2 },
   { "name": "firerunner-node",  "vcpu": 2, "mem_mib": 4096,  "golden": "/var/lib/firerunner/golden-node.ext4",      "min": 0, "max": 4 },
   { "name": "firerunner-ubuntu","vcpu": 4, "mem_mib": 8192,  "golden": "/var/lib/firerunner/ubuntu-rootfs-full.ext4","min": 0, "max": 2 },
-  { "name": "firerunner-ubuntu-min","vcpu": 4, "mem_mib": 8192, "golden": "/var/lib/firerunner/ubuntu-rootfs-minimal.ext4","min": 0, "max": 2 }
+  { "name": "firerunner-ubuntu-min","vcpu": 4, "mem_mib": 8192, "golden": "/var/lib/firerunner/ubuntu-rootfs-minimal.ext4","toolcache": "/var/lib/firerunner/toolcache.ext4","min": 0, "max": 2 }
 ]
 ```
 
 See [`examples/tiers.json`](examples/tiers.json). All tiers share the host
-kernel, tool cache, network and — importantly — the `--max-runners` **slot
-budget**: `vcpu`/`mem_mib`/`golden` vary per tier, but the total number of
+kernel, network and — importantly — the `--max-runners` **slot budget**:
+`vcpu`/`mem_mib`/`golden` vary per tier, but the total number of
 concurrent microVMs across every tier is capped at `--max-runners` (the tiers'
 warm pools, `min`, must fit within it). When `--tiers` is unset, firerunner
 runs the single tier derived from `--name`/`--vcpu`/`--mem-mib`/`--golden`, so
@@ -235,13 +235,14 @@ For Ubuntu glibc parity **without** the full image's bulk, the
 base (runner + git + build-essential + system python3 + Node.js runtime, **no
 Docker or baked language toolchains**, ~1.6 GiB on disk) meant to be paired with
 a [`--toolcache` drive](#pre-seeded-tool-cache---toolcache-opt-in) so `setup-*`
-actions resolve languages on demand. Because `--toolcache` is a process-wide
-flag, set `FR_TOOLCACHE` (or `--toolcache`) once and every tier — including this
-one — gets the drive. It is ideal for the common build/test/lint/SAST jobs that
-never touch Docker; Docker jobs stay on `firerunner-8c16g-docker` or the full
-`firerunner-ubuntu` tier. Measured on a real CodeQL run it matches the full
-image's speed at a fraction of the size (CodeQL bundle served from the drive, no
-per-run download).
+actions resolve languages on demand. Give it a drive with the tier's own
+`"toolcache"` field (as above) — a per-tier binding that overrides the
+process-wide `--toolcache`/`FR_TOOLCACHE` default, so a lean tier can attach a
+drive while a full tier keeps its baked-in cache. It is ideal for the common
+build/test/lint/SAST jobs that never touch Docker; Docker jobs stay on
+`firerunner-8c16g-docker` or the full `firerunner-ubuntu` tier. Measured on a
+real CodeQL run it matches the full image's speed at a fraction of the size
+(CodeQL bundle served from the drive, no per-run download).
 
 ### Inspecting a deployment (`status`, `doctor`)
 
@@ -323,6 +324,12 @@ cache:
 ```bash
 firerunner ... --toolcache /var/lib/firerunner/toolcache-go.ext4
 ```
+
+`--toolcache`/`FR_TOOLCACHE` is the **process-wide default**, applied to every
+tier. A tier can override it with its own `"toolcache"` field in the
+[tier catalog](#runner-tiers-developer-selectable-via-runs-on) — so a lean tier
+attaches a drive while a full tier keeps its baked-in cache (empty falls back to
+the global default, or no cache when neither is set).
 
 Design properties:
 

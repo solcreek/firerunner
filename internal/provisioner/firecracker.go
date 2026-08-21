@@ -217,7 +217,7 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 	}
 
 	bootArgs := composeBootArgs(f.cfg.BootArgs, vnet)
-	if err := f.configure(ctx, sock, kernelPath, rootfsPath, f.fcToolCachePath(), vnet, bootArgs, jitConfig, spec); err != nil {
+	if err := f.configure(ctx, sock, kernelPath, rootfsPath, f.fcToolCachePath(spec), vnet, bootArgs, jitConfig, spec); err != nil {
 		_ = cmd.Process.Kill()
 		return fmt.Errorf("configure microVM: %w", err)
 	}
@@ -447,18 +447,29 @@ func (f *Firecracker) configure(ctx context.Context, sock, kernelPath, rootfs, t
 	return nil
 }
 
-// fcToolCachePath returns the tool-cache image path as Firecracker will see it,
-// or "" when no tool cache is configured. Under the jailer the image is staged
-// inside the chroot, so the VMM sees the in-jail path; otherwise it opens the
-// host path directly.
-func (f *Firecracker) fcToolCachePath() string {
-	if f.cfg.ToolCacheImage == "" {
+// toolCacheImage returns the host path to the tool-cache image for a tier: the
+// tier's own image (spec.ToolCache) when set, otherwise the process-global
+// default (--toolcache / FR_TOOLCACHE), or "" when neither is configured.
+func (f *Firecracker) toolCacheImage(spec core.RunnerSpec) string {
+	if spec.ToolCache != "" {
+		return spec.ToolCache
+	}
+	return f.cfg.ToolCacheImage
+}
+
+// fcToolCachePath returns the tool-cache image path as Firecracker will see it
+// for a given tier, or "" when no tool cache applies. Under the jailer the
+// image is staged inside the chroot, so the VMM sees the in-jail path;
+// otherwise it opens the host path directly.
+func (f *Firecracker) fcToolCachePath(spec core.RunnerSpec) string {
+	img := f.toolCacheImage(spec)
+	if img == "" {
 		return ""
 	}
 	if f.cfg.Jailer {
 		return "/toolcache.ext4"
 	}
-	return f.cfg.ToolCacheImage
+	return img
 }
 
 // jailChrootRoot returns the host path to a microVM's jail root, where its
@@ -548,12 +559,12 @@ func (f *Firecracker) prepare(ctx context.Context, name string, vnet vmNet, cons
 				return nil, "", "", "", nil, fmt.Errorf("chown %s to jail user: %w", p, err)
 			}
 		}
-		// Stage the shared read-only tool cache into the jail so the chrooted VMM
+		// Stage the tier's read-only tool cache into the jail so the chrooted VMM
 		// can open it at /toolcache.ext4. reflink keeps this near-free on a
 		// reflink-capable filesystem; the jail user needs read access.
-		if f.cfg.ToolCacheImage != "" {
+		if img := f.toolCacheImage(spec); img != "" {
 			tc := filepath.Join(root, "toolcache.ext4")
-			if err := f.run(ctx, "cp", "--reflink=auto", f.cfg.ToolCacheImage, tc); err != nil {
+			if err := f.run(ctx, "cp", "--reflink=auto", img, tc); err != nil {
 				cleanup()
 				return nil, "", "", "", nil, fmt.Errorf("stage tool cache into jail: %w", err)
 			}

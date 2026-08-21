@@ -54,21 +54,27 @@ type Config struct {
 
 // Tier is one runner tier: a named scale set with its own microVM shape and
 // warm/max bounds. Developers pick a tier by its name via runs-on; the operator
-// defines the catalog. vcpu/mem and the golden image vary per tier; the kernel,
-// tool cache and network are shared by all tiers in the process.
+// defines the catalog. vcpu/mem, the golden image and (optionally) the tool
+// cache vary per tier; the kernel and network are shared by all tiers in the
+// process.
 type Tier struct {
 	Name   string   `json:"name"`
 	Labels []string `json:"labels,omitempty"`
 	VCPU   int      `json:"vcpu"`
 	MemMiB int      `json:"mem_mib"`
 	Golden string   `json:"golden"`
-	Min    int      `json:"min"`
-	Max    int      `json:"max"`
+	// ToolCache optionally binds a read-only "hostedtoolcache" ext4 image to
+	// this tier, overriding the process-global --toolcache/FR_TOOLCACHE. Empty
+	// falls back to the global default. This lets a lean tier attach a drive
+	// while a fat tier keeps its baked-in cache.
+	ToolCache string `json:"toolcache,omitempty"`
+	Min       int    `json:"min"`
+	Max       int    `json:"max"`
 }
 
 // Spec returns the microVM spec for the tier.
 func (t Tier) Spec() core.RunnerSpec {
-	return core.RunnerSpec{Labels: t.Labels, VCPU: t.VCPU, MemMiB: t.MemMiB, RootFS: t.Golden}
+	return core.RunnerSpec{Labels: t.Labels, VCPU: t.VCPU, MemMiB: t.MemMiB, RootFS: t.Golden, ToolCache: t.ToolCache}
 }
 
 // EffectiveTiers returns the configured tier catalog, or a single tier
@@ -136,7 +142,7 @@ func Parse(args []string) (*Config, error) {
 	fs.IntVar(&c.VCPU, "vcpu", envInt("FR_VCPU", 4), "vCPUs per microVM")
 	fs.IntVar(&c.MemMiB, "mem-mib", envInt("FR_MEM_MIB", 8192), "guest memory (MiB) per microVM")
 
-	fs.StringVar(&c.TiersPath, "tiers", env("FR_TIERS", ""), "path to a JSON tier catalog (array of {name,vcpu,mem_mib,golden,min,max,labels}). When set, firerunner serves every tier from this one process and developers pick one with runs-on: <name>; --max-runners is the shared slot budget. When unset, a single tier is derived from --name/--vcpu/--mem-mib/--golden.")
+	fs.StringVar(&c.TiersPath, "tiers", env("FR_TIERS", ""), "path to a JSON tier catalog (array of {name,vcpu,mem_mib,golden,toolcache,min,max,labels}). When set, firerunner serves every tier from this one process and developers pick one with runs-on: <name>; --max-runners is the shared slot budget. When unset, a single tier is derived from --name/--vcpu/--mem-mib/--golden.")
 
 	fs.StringVar(&c.Firecracker.Binary, "firecracker-bin", env("FR_FIRECRACKER_BIN", "firecracker"), "path to firecracker binary")
 	fs.StringVar(&c.Firecracker.KernelImage, "kernel", env("FR_KERNEL", ""), "path to guest kernel (vmlinux) (required)")
@@ -304,6 +310,11 @@ func (c *Config) validateTiers() error {
 			return fmt.Errorf("tier %q: min must be >= 0", t.Name)
 		case t.Min > t.Max:
 			return fmt.Errorf("tier %q: min (%d) must not exceed max (%d)", t.Name, t.Min, t.Max)
+		}
+		if t.ToolCache != "" {
+			if _, err := os.Stat(t.ToolCache); err != nil {
+				return fmt.Errorf("tier %q: toolcache image %q not accessible: %w", t.Name, t.ToolCache, err)
+			}
 		}
 		seen[t.Name] = true
 		totalMin += t.Min
