@@ -286,6 +286,24 @@ Under `--jailer` the image is staged read-only into each jail (reflink keeps
 this near-free on a reflink-capable filesystem); otherwise the host path is
 opened directly.
 
+**Building the drive.** [`images/build-toolcache.sh`](images/build-toolcache.sh)
+cuts a `hostedtoolcache`-labelled ext4 with exactly the tools and versions you
+name — no OS rebuild, decoupled from the golden, so you can re-cut the cache
+(new versions, more tools) and share one drive across every tier:
+
+```bash
+# Node + Go need only curl/tar/mkfs.ext4 (no Docker); many versions per tool:
+sudo images/build-toolcache.sh --out /var/lib/firerunner/toolcache.ext4 \
+  --node 20.18.0,22.22.2 --go 1.27.0
+# Python is fetched from actions/python-versions and relocated in an
+# ubuntu:24.04 container (so its layout matches the guest) -> needs Docker:
+sudo images/build-toolcache.sh --out toolcache.ext4 --python 3.12
+```
+
+Tailor it to a team: scan the repos you serve for their `setup-*` steps
+(`go-version-file: go.mod`, `.nvmrc`, `.python-version`) and bake only those
+versions.
+
 ### Running as a service (systemd)
 
 `deploy/firerunner.service` is a hardened unit template (dedicated `firerunner`

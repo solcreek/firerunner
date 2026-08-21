@@ -96,6 +96,37 @@ enables the service, and (per tier) installs Docker or bakes Node.js. The result
 is an immutable file firerunner reflink-clones per job. Requires `debootstrap`,
 `mkfs.ext4`, `curl` and `tar` on the host.
 
+## Building the tool-cache drive
+
+`firerunner --toolcache` / `FR_TOOLCACHE` attaches a **separate**, read-only
+`hostedtoolcache`-labelled ext4 to every microVM (mounted at
+`/opt/hostedtoolcache`), so `setup-go` / `setup-node` / `setup-python` find their
+toolchain on disk instead of downloading it per job. Unlike the baked-in cache
+of the `firerunner-ubuntu` full golden, this drive is **decoupled from the OS
+image**: an operator can re-cut it with new versions or more tools without
+rebuilding a rootfs, and one drive is shared by every tier.
+
+[`build-toolcache.sh`](build-toolcache.sh) is the builder. Pick exactly the
+tools + versions your team uses:
+
+```bash
+# Node + Go: official tarballs, no Docker needed; multiple versions per tool.
+sudo ./build-toolcache.sh --out /var/lib/firerunner/toolcache.ext4 \
+  --node 20.18.0,22.22.2 --go 1.27.0
+
+# Python: fetched from actions/python-versions and relocated inside an
+# ubuntu:24.04 container (its interpreter bakes an absolute RUNPATH under
+# /opt/hostedtoolcache, matching where the guest mounts the drive) => needs Docker.
+sudo ./build-toolcache.sh --out toolcache.ext4 --python 3.12
+```
+
+It lays out the exact hosted-tool-cache structure the stock actions look for
+(`<tool>/<version>/x64/` + a `<version>/x64.complete` marker), sizes and formats
+the ext4, and labels it `hostedtoolcache`. The drive is a **pure accelerator**:
+a missing tool/version just means `setup-*` downloads it and the job still
+passes. Tailor the version list to the repos you serve by reading their
+`go.mod` / `.nvmrc` / `.python-version`.
+
 ## Rebuild policy
 
 GitHub only supports self-hosted runner agents released within the **last 30
