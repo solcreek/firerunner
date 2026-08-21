@@ -1,11 +1,15 @@
 BINARY := firerunner
 PKG := ./...
-# Coverage is gated on the functional-core packages (pure logic + seam-injected
-# I/O). cmd/ wiring and the actions/scaleset integration in internal/listener
-# are the imperative shell / GitHub integration boundary, exercised by the e2e
-# suite and `make test`, not the unit coverage gate.
-COVERPKG := ./internal/config/...,./internal/core/...,./internal/provisioner/...,./internal/scheduler/...
-COVERPKGDIRS := ./internal/config/... ./internal/core/... ./internal/provisioner/... ./internal/scheduler/...
+# Coverage is gated on every package that can be meaningfully unit-tested: the
+# functional core (pure logic + seam-injected I/O), the diag health checks, and
+# the cache server's HTTP handlers. Only cmd/ (flag wiring + signal handling)
+# and internal/listener (the actions/scaleset GitHub control-plane client) sit
+# outside the gate — they are the imperative shell, needing a live GitHub + KVM
+# host, and are exercised by `make test` and the e2e suite instead. The
+# multi-tier orchestration logic they invoke (tier catalog parsing, warm-pool
+# vs. slot-budget validation) lives in internal/config, which IS gated.
+COVERPKG := ./internal/config/...,./internal/core/...,./internal/provisioner/...,./internal/scheduler/...,./internal/diag/...,./internal/cacheserver/...
+COVERPKGDIRS := ./internal/config/... ./internal/core/... ./internal/provisioner/... ./internal/scheduler/... ./internal/diag/... ./internal/cacheserver/...
 COVERPROFILE := cover.out
 COVER_MIN ?= 70
 
