@@ -80,6 +80,14 @@ type FirecrackerConfig struct {
 	// to. Required (>0) when Jailer is set.
 	JailUID int
 	JailGID int
+	// CgroupLimits are cgroup v2 <file>=<value> settings the jailer applies to
+	// each microVM's own cgroup (e.g. "memory.max=2147483648", "cpu.max=200000",
+	// "pids.max=512"), bounding one VM's blast radius on the shared host. Only
+	// used in jailer mode: each becomes a `--cgroup` flag and the jailer places
+	// the VMM in <cgroupV2Mount>/<firecracker>/<id>, enabling the controllers it
+	// needs. The jailer never reclaims that dir, so firerunner rmdirs the empty
+	// cgroup on teardown.
+	CgroupLimits []string
 }
 
 // DefaultBootArgs is a minimal, quiet serial console command line. reboot=k is
@@ -417,16 +425,30 @@ func jailChrootRoot(base, id string) string {
 	return filepath.Join(base, "firecracker", id, "root")
 }
 
+// cgroupV2Mount is the standard unified cgroup v2 hierarchy mount point. When
+// CgroupLimits are set the jailer places each microVM's cgroup under
+// <mount>/<exec-file-basename>/<id>. It is a var so tests can redirect it.
+var cgroupV2Mount = "/sys/fs/cgroup"
+
+// jailCgroupDir returns the host path to a jailed microVM's cgroup, created by
+// the jailer when CgroupLimits are set: <cgroupV2Mount>/<firecracker>/<id>. The
+// jailer leaves the (empty) dir behind on exit, so firerunner reclaims it.
+func jailCgroupDir(binary, id string) string {
+	return filepath.Join(cgroupV2Mount, filepath.Base(binary), id)
+}
+
 // buildJailerArgs returns the jailer argv that launches one jailed Firecracker.
 // The jailer chroots into <ChrootBase>/firecracker/<id>/root, drops to
 // JailUID:JailGID and execs Firecracker (passing --id itself). Firecracker's API
 // socket defaults to /run/firecracker.socket inside the jail. No --netns is
 // passed: the jailed VMM stays in the host network namespace so the per-slot
-// host tap devices attach unchanged. cgroup-version 2 with no --cgroup means the
-// jailer creates no cgroup (systemd already scopes the service). It is a pure
-// function so the argv can be asserted in tests.
+// host tap devices attach unchanged. With cgroup-version 2 and no CgroupLimits
+// the jailer creates no cgroup (systemd already scopes the service); each
+// CgroupLimit adds a --cgroup flag so the jailer places the VMM in its own
+// cgroup and applies the limit. It is a pure function so the argv can be
+// asserted in tests.
 func buildJailerArgs(cfg FirecrackerConfig, id string) []string {
-	return []string{
+	args := []string{
 		"--id", id,
 		"--exec-file", cfg.Binary,
 		"--uid", strconv.Itoa(cfg.JailUID),
@@ -434,6 +456,10 @@ func buildJailerArgs(cfg FirecrackerConfig, id string) []string {
 		"--cgroup-version", "2",
 		"--chroot-base-dir", cfg.ChrootBase,
 	}
+	for _, c := range cfg.CgroupLimits {
+		args = append(args, "--cgroup", c)
+	}
+	return args
 }
 
 // prepare stages a microVM's rootfs and returns the command to launch it, the
@@ -449,7 +475,13 @@ func (f *Firecracker) prepare(ctx context.Context, name string, console io.Write
 		if err := os.MkdirAll(root, 0o755); err != nil {
 			return nil, "", "", "", nil, fmt.Errorf("mkdir jail root: %w", err)
 		}
-		cleanup = func() { _ = os.RemoveAll(idDir) }
+		cleanup = func() {
+			_ = os.RemoveAll(idDir)
+			// The jailer leaves the microVM's (now empty) cgroup dir behind.
+			if len(f.cfg.CgroupLimits) > 0 {
+				_ = os.Remove(jailCgroupDir(f.cfg.Binary, name))
+			}
+		}
 		kernel := filepath.Join(root, "vmlinux")
 		rootfs := filepath.Join(root, "rootfs.ext4")
 		if err := f.run(ctx, "cp", "--reflink=auto", f.cfg.KernelImage, kernel); err != nil {
@@ -534,6 +566,25 @@ func (f *Firecracker) CleanupStale(ctx context.Context) {
 				continue
 			}
 			f.log.Info("removed stale jail dir", "dir", dir)
+		}
+	}
+
+	// With cgroup limits each microVM also leaves an (empty) cgroup at
+	// <cgroupV2Mount>/<firecracker>/<id> the jailer never reclaims; rmdir any
+	// that survive startup. The parent cgroup dir also holds controller pseudo-
+	// files (memory.max, pids.max, ...), so only per-microVM subdirectories are
+	// swept.
+	if f.cfg.Jailer && len(f.cfg.CgroupLimits) > 0 {
+		cgs, _ := filepath.Glob(filepath.Join(cgroupV2Mount, filepath.Base(f.cfg.Binary), "*"))
+		for _, dir := range cgs {
+			if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+				continue
+			}
+			if err := os.Remove(dir); err != nil {
+				f.log.Warn("remove stale cgroup dir", "dir", dir, "err", err)
+				continue
+			}
+			f.log.Info("removed stale cgroup dir", "dir", dir)
 		}
 	}
 }

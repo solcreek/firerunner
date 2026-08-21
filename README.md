@@ -210,6 +210,22 @@ Notes:
   the same release tarball) and Firecracker must be the static musl build.
 - No network namespace is used (`--netns` is not passed), so the per-slot
   host-namespace tap devices and the egress allowlist work unchanged.
+- **Per-VM cgroup limits** (opt-in, jailer only): `--jailer-cgroup` takes a
+  semicolon-separated list of cgroup v2 `<file>=<value>` settings the jailer
+  applies to each microVM's own cgroup, bounding one VM's blast radius on the
+  shared host (a noisy-neighbour guard for multi-tenant use):
+
+  ```bash
+  firerunner ... --jailer ... \
+    --jailer-cgroup "memory.max=2147483648;cpu.max=200000;pids.max=512"
+  ```
+
+  Semicolons (not commas) separate entries because values such as
+  `cpuset.cpus=0-3,5` legitimately contain commas. The jailer places the VMM in
+  `/sys/fs/cgroup/firecracker/<id>` and enables the needed controllers; the
+  (empty) cgroup dir is reclaimed on teardown and on startup. Set `memory.max`
+  **above** the guest RAM (`--mem-mib`) plus VMM overhead — a cap below the
+  guest's memory will let the kernel OOM-kill the VMM under load.
 - Per-launch overhead is ~single-digit milliseconds (chroot + staging the VMM),
   negligible against the microVM boot.
 - The systemd unit must run as `root` when the jailer is enabled (the default

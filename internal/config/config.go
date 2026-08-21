@@ -90,6 +90,8 @@ func FromFlags(args []string) (*Config, error) {
 	fs.StringVar(&c.Firecracker.ChrootBase, "chroot-base", env("FR_CHROOT_BASE", "/srv/jailer"), "jailer chroot base dir")
 	fs.IntVar(&c.Firecracker.JailUID, "jail-uid", envInt("FR_JAIL_UID", 0), "uid the jailer drops Firecracker to (required with --jailer)")
 	fs.IntVar(&c.Firecracker.JailGID, "jail-gid", envInt("FR_JAIL_GID", 0), "gid the jailer drops Firecracker to (required with --jailer)")
+	var jailerCgroup string
+	fs.StringVar(&jailerCgroup, "jailer-cgroup", env("FR_JAILER_CGROUP", ""), "semicolon-separated cgroup v2 limits applied to each microVM via the jailer, each <file>=<value> (e.g. \"memory.max=2147483648;cpu.max=200000;pids.max=512\"); requires --jailer")
 
 	var egress, dnsServers string
 	var metaRefresh time.Duration
@@ -110,6 +112,7 @@ func FromFlags(args []string) (*Config, error) {
 			}
 		}
 	}
+	c.Firecracker.CgroupLimits = splitSemi(jailerCgroup)
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
@@ -127,6 +130,19 @@ func FromFlags(args []string) (*Config, error) {
 func splitCSV(s string) []string {
 	var out []string
 	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// splitSemi splits a semicolon-separated list, trimming spaces and dropping
+// empties. Semicolons (not commas) separate cgroup limits because cgroup values
+// such as cpuset.cpus=0-3,5 legitimately contain commas.
+func splitSemi(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ";") {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
 		}
@@ -154,6 +170,13 @@ func (c *Config) validate() error {
 		return fmt.Errorf("provide --token or GitHub App credentials")
 	case c.Firecracker.Jailer && (c.Firecracker.JailUID < 1 || c.Firecracker.JailGID < 1):
 		return fmt.Errorf("--jail-uid and --jail-gid (>0) are required when --jailer is set")
+	case len(c.Firecracker.CgroupLimits) > 0 && !c.Firecracker.Jailer:
+		return fmt.Errorf("--jailer-cgroup requires --jailer")
+	}
+	for _, l := range c.Firecracker.CgroupLimits {
+		if !strings.Contains(l, "=") {
+			return fmt.Errorf("--jailer-cgroup entry %q must be <file>=<value>", l)
+		}
 	}
 	return nil
 }

@@ -285,6 +285,48 @@ func TestBuildJailerArgs(t *testing.T) {
 	}
 }
 
+func TestBuildJailerArgs_CgroupLimits(t *testing.T) {
+	cfg := FirecrackerConfig{
+		Binary: "/usr/local/bin/firecracker", ChrootBase: "/srv/jailer", JailUID: 955, JailGID: 954,
+		CgroupLimits: []string{"memory.max=2147483648", "cpu.max=200000", "pids.max=512"},
+	}
+	got := buildJailerArgs(cfg, "firerunner-abc123")
+	// Each limit must appear as a separate --cgroup <file>=<value> pair.
+	for _, want := range cfg.CgroupLimits {
+		found := false
+		for i := 0; i+1 < len(got); i++ {
+			if got[i] == "--cgroup" && got[i+1] == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("missing --cgroup %q in %v", want, got)
+		}
+	}
+	// cgroup-version 2 must still be present.
+	if !containsPair(got, "--cgroup-version", "2") {
+		t.Errorf("expected --cgroup-version 2 in %v", got)
+	}
+}
+
+func containsPair(args []string, k, v string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == k && args[i+1] == v {
+			return true
+		}
+	}
+	return false
+}
+
+func TestJailCgroupDir(t *testing.T) {
+	got := jailCgroupDir("/usr/local/bin/firecracker", "firerunner-abc123")
+	want := "/sys/fs/cgroup/firecracker/firerunner-abc123"
+	if got != want {
+		t.Errorf("jailCgroupDir = %q, want %q", got, want)
+	}
+}
+
 func TestBuildAPISteps_InJailPaths(t *testing.T) {
 	// Under the jailer, Firecracker sees the kernel and rootfs at chroot-relative
 	// paths, not the host paths.
@@ -326,6 +368,42 @@ func TestCleanupStale_JailDirs(t *testing.T) {
 	for _, id := range []string{"firerunner-jail1", "firerunner-jail2"} {
 		if _, err := os.Stat(filepath.Join(base, "firecracker", id)); !os.IsNotExist(err) {
 			t.Errorf("jail dir %s not removed (err=%v)", id, err)
+		}
+	}
+}
+
+func TestCleanupStale_CgroupDirs(t *testing.T) {
+	// Redirect the cgroup mount to a temp dir so the sweep is testable off a real
+	// cgroupfs.
+	mount := t.TempDir()
+	orig := cgroupV2Mount
+	cgroupV2Mount = mount
+	defer func() { cgroupV2Mount = orig }()
+
+	parent := filepath.Join(mount, "firecracker")
+	// A stale per-microVM cgroup dir (should be removed)...
+	stale := filepath.Join(parent, "firerunner-node-abc")
+	if err := os.MkdirAll(stale, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// ...and controller pseudo-files in the parent (must be left untouched).
+	for _, name := range []string{"memory.max", "pids.max", "cgroup.procs"} {
+		if err := os.WriteFile(filepath.Join(parent, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f := NewFirecracker(FirecrackerConfig{
+		Binary: "/usr/local/bin/firecracker", WorkDir: t.TempDir(), ChrootBase: t.TempDir(),
+		Jailer: true, CgroupLimits: []string{"memory.max=1"}, TapPrefix: "frunittest", MaxVMs: 1,
+	}, testLogger())
+	f.CleanupStale(context.Background())
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale cgroup dir not removed (err=%v)", err)
+	}
+	for _, name := range []string{"memory.max", "pids.max", "cgroup.procs"} {
+		if _, err := os.Stat(filepath.Join(parent, name)); err != nil {
+			t.Errorf("controller file %s wrongly removed: %v", name, err)
 		}
 	}
 }

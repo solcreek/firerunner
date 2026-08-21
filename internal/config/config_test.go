@@ -93,6 +93,42 @@ func TestFromFlags_AppCredsSatisfyAuth(t *testing.T) {
 	}
 }
 
+func TestFromFlags_JailerCgroup(t *testing.T) {
+	c, err := FromFlags(append(baseArgs(),
+		"--jailer", "--jail-uid", "955", "--jail-gid", "954",
+		"--jailer-cgroup", "memory.max=2147483648;cpu.max=200000 ; ;pids.max=512"))
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	got := c.Firecracker.CgroupLimits
+	want := []string{"memory.max=2147483648", "cpu.max=200000", "pids.max=512"}
+	if len(got) != len(want) {
+		t.Fatalf("cgroup limits = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("limit %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestFromFlags_JailerCgroupErrors(t *testing.T) {
+	cases := map[string][]string{
+		"without jailer": {"--jailer-cgroup", "memory.max=1"},
+		"bad format": {
+			"--jailer", "--jail-uid", "955", "--jail-gid", "954",
+			"--jailer-cgroup", "memory.max=1;bogus",
+		},
+	}
+	for name, extra := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := FromFlags(append(baseArgs(), extra...)); err == nil {
+				t.Fatalf("expected error for %q", name)
+			}
+		})
+	}
+}
+
 func TestParseLevel(t *testing.T) {
 	if parseLevel("debug").String() != "DEBUG" {
 		t.Fatal("debug")
