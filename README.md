@@ -140,6 +140,45 @@ firerunner \
 All flags can also be set via `FR_*` environment variables (see
 `config.example.env`).
 
+### Onboarding: creating and installing the GitHub App
+
+firerunner registers runners through the Actions runner scale-set API. A GitHub
+App is the preferred credential (short-lived installation tokens, no personal
+account tied to the runners). Set one up once per org (or repo):
+
+1. **Create the App** — *Settings → Developer settings → GitHub Apps → New GitHub
+   App*. A homepage URL and a name are all that's required; you can disable the
+   webhook. Grant the least-privilege permission for the scope you register at:
+
+   | `FR_URL` scope | Required permission |
+   | --- | --- |
+   | `https://github.com/ORG` (org-wide) | **Organization → Self-hosted runners: Read & write** |
+   | `https://github.com/ORG/REPO` (single repo) | **Repository → Administration: Read & write** |
+
+2. **Generate a private key** — on the App page, *Generate a private key*. This
+   downloads a `.pem`; store it where firerunner can read it (e.g.
+   `/etc/firerunner/app-key.pem`, mode `0600`, owned by the `firerunner` user).
+
+3. **Install the App** — *Install App* → choose the org/account and grant it
+   access to the repositories that will use the runners (or *All repositories*
+   for org-wide use).
+
+4. **Collect the three identifiers** and map them to config:
+
+   | Where to find it | Flag | Env |
+   | --- | --- | --- |
+   | App page → *Client ID* | `--app-client-id` | `FR_APP_CLIENT_ID` |
+   | Installed App URL `.../installations/<id>` (or *Install App* → gear) | `--app-installation-id` | `FR_APP_INSTALLATION_ID` |
+   | The downloaded `.pem` path | `--app-private-key` | `FR_APP_PRIVATE_KEY` |
+
+5. **Create a runner group** (optional but recommended) under the org's
+   *Actions → Runner groups*, restrict it to the intended repositories, and pass
+   its name via `--runner-group` / `FR_RUNNER_GROUP` (defaults to `default`).
+
+With the App configured, point `FR_URL` at the org or repo and start firerunner
+(see [Running as a service](#running-as-a-service-systemd)). A PAT
+(`FR_TOKEN=ghp_...`) works too but is discouraged for production.
+
 ### Runner tiers (developer-selectable via `runs-on`)
 
 A single firerunner process can serve several **tiers** — each its own GitHub
