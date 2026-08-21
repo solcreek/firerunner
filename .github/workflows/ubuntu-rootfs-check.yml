@@ -53,8 +53,9 @@ jobs:
       - name: docker on demand + egress survives docker networking
         run: |
           set -e
+          gh_code() { curl -sS -o /dev/null -w '%{http_code}' https://api.github.com/zen; }
           echo "--- egress BEFORE docker starts ---"
-          before=$(curl -fsS -o /dev/null -w '%{http_code}' https://api.github.com/zen && echo OK || echo FAIL)
+          before=$(gh_code || true)
           echo "api.github.com before docker: $before"
           echo "--- start docker (socket activation) ---"
           time docker version
@@ -62,6 +63,6 @@ jobs:
           sudo docker run --rm hello-world | grep -i "hello from docker" && echo "docker run: OK"
           echo "--- egress AFTER docker brought up iptables/docker0 ---"
           ip -br addr show docker0 2>/dev/null || echo "(no docker0 yet)"
-          after=$(curl -fsS -o /dev/null -w '%{http_code}' https://api.github.com/zen && echo OK || echo FAIL)
+          after=$(gh_code || true)
           echo "api.github.com after docker:  $after"
-          test "$after" = "OK" || { echo "REGRESSION: runner egress broke after docker networking"; exit 1; }
+          test "$after" = "200" || { echo "REGRESSION: runner egress broke after docker networking (HTTP $after)"; exit 1; }
