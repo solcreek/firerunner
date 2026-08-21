@@ -36,7 +36,7 @@ func shortSock(t *testing.T) string {
 func TestBuildAPISteps_OrderAndPayloads(t *testing.T) {
 	spec := core.RunnerSpec{VCPU: 4, MemMiB: 8192}
 	steps := buildAPISteps("/vmlinux", "console=ttyS0 reboot=k ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off",
-		"/job/rootfs.ext4", "", "fr0", "06:00:AC:10:00:02", "JIT-SECRET", spec)
+		"/job/rootfs.ext4", "", "fr0", "06:00:AC:10:00:02", "JIT-SECRET", nil, spec)
 
 	wantOrder := []string{
 		"/boot-source", "/drives/rootfs", "/machine-config",
@@ -346,7 +346,7 @@ func TestJailCgroupDir(t *testing.T) {
 func TestBuildAPISteps_ToolCacheDrive(t *testing.T) {
 	spec := core.RunnerSpec{VCPU: 2, MemMiB: 1024}
 	// Without a tool cache the step list and order are unchanged.
-	none := buildAPISteps("/vmlinux", "console=ttyS0", "/rootfs.ext4", "", "fr0", "06:00:AC:10:00:02", "JIT", spec)
+	none := buildAPISteps("/vmlinux", "console=ttyS0", "/rootfs.ext4", "", "fr0", "06:00:AC:10:00:02", "JIT", nil, spec)
 	for _, s := range none {
 		if s.path == "/drives/toolcache" {
 			t.Fatal("no toolcache drive expected when path is empty")
@@ -355,7 +355,7 @@ func TestBuildAPISteps_ToolCacheDrive(t *testing.T) {
 
 	// With one, a read-only non-root drive appears right after the rootfs, and
 	// InstanceStart stays last.
-	steps := buildAPISteps("/vmlinux", "console=ttyS0", "/rootfs.ext4", "/toolcache.ext4", "fr0", "06:00:AC:10:00:02", "JIT", spec)
+	steps := buildAPISteps("/vmlinux", "console=ttyS0", "/rootfs.ext4", "/toolcache.ext4", "fr0", "06:00:AC:10:00:02", "JIT", nil, spec)
 	if steps[len(steps)-1].path != "/actions" {
 		t.Fatal("InstanceStart must remain last")
 	}
@@ -377,6 +377,54 @@ func TestBuildAPISteps_ToolCacheDrive(t *testing.T) {
 	tc := steps[tcIdx].body.(map[string]any)
 	if tc["path_on_host"] != "/toolcache.ext4" || tc["is_read_only"] != true || tc["is_root_device"] != false {
 		t.Fatalf("toolcache drive body = %v, want ro non-root /toolcache.ext4", tc)
+	}
+}
+
+func TestBuildAPISteps_CacheMMDS(t *testing.T) {
+	spec := core.RunnerSpec{VCPU: 2, MemMiB: 1024}
+	// No cache config -> the /mmds body carries only the JIT secret.
+	none := buildAPISteps("/vmlinux", "console=ttyS0", "/rootfs.ext4", "", "fr0", "06:00:AC:10:00:02", "JIT", nil, spec)
+	for _, s := range none {
+		if s.path == "/mmds" {
+			if _, ok := s.body.(map[string]any)["cache"]; ok {
+				t.Fatal("no cache key expected when cache config is nil")
+			}
+		}
+	}
+	// With a cache config it is published under /mmds cache alongside jitconfig.
+	steps := buildAPISteps("/vmlinux", "console=ttyS0", "/rootfs.ext4", "", "fr0", "06:00:AC:10:00:02", "JIT",
+		map[string]any{"port": "8099"}, spec)
+	for _, s := range steps {
+		if s.path == "/mmds" {
+			body := s.body.(map[string]any)
+			if body["jitconfig"] != "JIT" {
+				t.Fatalf("jitconfig lost: %v", body)
+			}
+			cache, ok := body["cache"].(map[string]any)
+			if !ok || cache["port"] != "8099" {
+				t.Fatalf("cache body = %v, want port 8099", body["cache"])
+			}
+		}
+	}
+}
+
+func TestCacheMMDS(t *testing.T) {
+	// Off by default.
+	if got := NewFirecracker(FirecrackerConfig{}, testLogger()).cacheMMDS(); got != nil {
+		t.Fatalf("unset = %v, want nil", got)
+	}
+	// Port -> guest builds the URL from its gateway.
+	port := NewFirecracker(FirecrackerConfig{CachePort: 8099}, testLogger()).cacheMMDS()
+	if port["port"] != "8099" {
+		t.Fatalf("port = %v, want 8099", port)
+	}
+	// Explicit URL wins over port.
+	both := NewFirecracker(FirecrackerConfig{CachePort: 8099, CacheURL: "http://cache:9000"}, testLogger()).cacheMMDS()
+	if both["url"] != "http://cache:9000" {
+		t.Fatalf("url = %v, want explicit URL to win", both)
+	}
+	if _, ok := both["port"]; ok {
+		t.Fatalf("port should be omitted when url is set: %v", both)
 	}
 }
 
@@ -409,7 +457,7 @@ func TestFcToolCachePath(t *testing.T) {
 func TestBuildAPISteps_InJailPaths(t *testing.T) {
 	// Under the jailer, Firecracker sees the kernel and rootfs at chroot-relative
 	// paths, not the host paths.
-	steps := buildAPISteps("/vmlinux", "console=ttyS0", "/rootfs.ext4", "", "fr0", "06:00:AC:10:00:02", "JIT", core.RunnerSpec{VCPU: 2, MemMiB: 1024})
+	steps := buildAPISteps("/vmlinux", "console=ttyS0", "/rootfs.ext4", "", "fr0", "06:00:AC:10:00:02", "JIT", nil, core.RunnerSpec{VCPU: 2, MemMiB: 1024})
 	var boot, drive map[string]any
 	for _, s := range steps {
 		switch s.path {

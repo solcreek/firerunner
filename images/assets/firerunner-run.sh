@@ -70,5 +70,28 @@ elif [ -d /opt/hostedtoolcache ] && [ -n "$(ls -A /opt/hostedtoolcache 2>/dev/nu
 	export AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
 	echo "firerunner: using baked-in tool cache at /opt/hostedtoolcache"
 fi
+# Optional self-hosted dependency cache (progressive enhancement). firerunner
+# publishes a cache config under /cache in MMDS when --cache-port/--cache-url is
+# set. Point actions/cache (and the pnpm/go/setup-* caches built on it) at the
+# host's cache-server instead of GitHub's hosted cache. Absent -> the runner
+# uses GitHub's cache exactly as normal, so the same golden works either way.
+#
+# NOTE: this only takes effect on a "cache-redirected" golden, whose runner
+# binary has ACTIONS_RESULTS_URL renamed so GitHub's job message cannot override
+# the value we export here. On an unpatched golden the export is harmless (the
+# runner overwrites it with GitHub's URL and caching stays on GitHub).
+cache_url="$(curl -sf "http://$MMDS/cache/url" -H "X-metadata-token: $tok" 2>/dev/null || true)"
+cache_port="$(curl -sf "http://$MMDS/cache/port" -H "X-metadata-token: $tok" 2>/dev/null || true)"
+if [ -z "$cache_url" ] && [ -n "$cache_port" ]; then
+	gw="$(ip route | awk '/^default/{print $3; exit}')"
+	if [ -n "$gw" ]; then
+		cache_url="http://$gw:$cache_port/"
+	fi
+fi
+if [ -n "$cache_url" ]; then
+	export ACTIONS_RESULTS_URL="$cache_url"
+	export ACTIONS_CACHE_SERVICE_V2=true
+	echo "firerunner: using self-hosted dependency cache at $cache_url"
+fi
 # Ephemeral JIT runner: registers, runs one job, then auto-deregisters.
 ./run.sh --jitconfig "$jit" || echo "firerunner: runner exited non-zero" >&2

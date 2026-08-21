@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -164,6 +165,8 @@ func Parse(args []string) (*Config, error) {
 	fs.StringVar(&jailerCgroup, "jailer-cgroup", env("FR_JAILER_CGROUP", ""), "semicolon-separated cgroup v2 limits applied to each microVM via the jailer, each <file>=<value> (e.g. \"memory.max=2147483648;cpu.max=200000;pids.max=512\"); requires --jailer")
 	fs.BoolVar(&c.Firecracker.NetNS, "netns", envBool("FR_NETNS", false), "run each microVM in its own network namespace (tap lives in the netns, veth uplink to the host); strongest network isolation, requires --jailer")
 	fs.StringVar(&c.Firecracker.ToolCacheImage, "toolcache", env("FR_TOOLCACHE", ""), "path to a read-only ext4 image (labelled \"hostedtoolcache\", mirroring GitHub's tool-cache layout) attached to every microVM so setup-* actions hit a pre-seeded cache instead of downloading; opt-in accelerator, jobs fall back to downloading when unset")
+	fs.IntVar(&c.Firecracker.CachePort, "cache-port", envInt("FR_CACHE_PORT", 0), "TCP port of a firerunner cache-server reachable on each microVM's host gateway; when set, microVMs use it for actions/cache (dependency caching) instead of GitHub's hosted cache. Opt-in and off by default; the guest builds the URL from its default gateway and this port")
+	fs.StringVar(&c.Firecracker.CacheURL, "cache-url", env("FR_CACHE_URL", ""), "explicit base URL of a firerunner cache-server (e.g. http://cache.internal:8099); overrides --cache-port for deployments where the cache-server is not on the microVM's host gateway. Opt-in and off by default")
 
 	var egress, dnsServers string
 	var metaRefresh time.Duration
@@ -276,6 +279,15 @@ func (c *Config) validate() error {
 	if c.Firecracker.ToolCacheImage != "" {
 		if _, err := os.Stat(c.Firecracker.ToolCacheImage); err != nil {
 			return fmt.Errorf("--toolcache image %q not accessible: %w", c.Firecracker.ToolCacheImage, err)
+		}
+	}
+	if c.Firecracker.CachePort != 0 && (c.Firecracker.CachePort < 1 || c.Firecracker.CachePort > 65535) {
+		return fmt.Errorf("--cache-port %d out of range (1-65535)", c.Firecracker.CachePort)
+	}
+	if c.Firecracker.CacheURL != "" {
+		u, err := url.Parse(c.Firecracker.CacheURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("--cache-url %q must be an absolute http(s) URL", c.Firecracker.CacheURL)
 		}
 	}
 	for _, l := range c.Firecracker.CgroupLimits {

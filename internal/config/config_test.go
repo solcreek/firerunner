@@ -35,6 +35,47 @@ func TestFromFlags_Valid(t *testing.T) {
 	}
 }
 
+func TestFromFlags_CacheConfig(t *testing.T) {
+	c, err := FromFlags(append(baseArgs(), "--cache-port", "8099"))
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	if c.Firecracker.CachePort != 8099 {
+		t.Fatalf("cache-port = %d, want 8099", c.Firecracker.CachePort)
+	}
+
+	c, err = FromFlags(append(baseArgs(), "--cache-url", "http://cache.internal:8099"))
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	if c.Firecracker.CacheURL != "http://cache.internal:8099" {
+		t.Fatalf("cache-url = %q", c.Firecracker.CacheURL)
+	}
+
+	// Off by default.
+	c, err = FromFlags(baseArgs())
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	if c.Firecracker.CachePort != 0 || c.Firecracker.CacheURL != "" {
+		t.Fatalf("cache config should be off by default: port=%d url=%q", c.Firecracker.CachePort, c.Firecracker.CacheURL)
+	}
+}
+
+func TestFromFlags_CacheConfigInvalid(t *testing.T) {
+	cases := map[string][]string{
+		"bad port": {"--cache-port", "70000"},
+		"bad url":  {"--cache-url", "not-a-url"},
+	}
+	for name, extra := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := FromFlags(append(baseArgs(), extra...)); err == nil {
+				t.Fatalf("expected error for %q", name)
+			}
+		})
+	}
+}
+
 func TestFromFlags_MissingRequired(t *testing.T) {
 	cases := map[string][]string{
 		"no url":    {"--kernel", "/k", "--golden", "/g", "--ext-iface", "eth0", "--token", "t"},

@@ -104,6 +104,20 @@ type FirecrackerConfig struct {
 	// accelerator: when unset (or when a requested toolchain is not in the image)
 	// setup-* falls back to downloading, so jobs still pass either way.
 	ToolCacheImage string
+
+	// CachePort, when non-zero, is the TCP port of a `firerunner cache-server`
+	// reachable on each microVM's host gateway IP. firerunner publishes it into
+	// the guest via MMDS; the guest builds ACTIONS_RESULTS_URL from its default
+	// gateway and this port so actions/cache (and the pnpm/go/setup-* caches
+	// built on it) hit the self-hosted cache instead of GitHub's hosted cache.
+	// Opt-in and off by default; jobs still pass without it (cache simply falls
+	// back to a miss / GitHub's cache when the golden is not cache-redirected).
+	CachePort int
+	// CacheURL, when set, is an explicit base URL of a cache-server (e.g.
+	// http://cache.internal:8099) used verbatim by the guest. It overrides
+	// CachePort for deployments where the cache-server is not on the microVM's
+	// host gateway. Opt-in and off by default.
+	CacheURL string
 }
 
 // DefaultBootArgs is a minimal, quiet serial console command line. reboot=k is
@@ -390,7 +404,7 @@ type apiStep struct {
 // It is a pure function so tests can assert the exact order and payloads —
 // notably that /mmds (the JIT secret) is set before InstanceStart, and that
 // InstanceStart is always last.
-func buildAPISteps(kernelImage, bootArgs, rootfs, toolcache, tap, guestMAC, jit string, spec core.RunnerSpec) []apiStep {
+func buildAPISteps(kernelImage, bootArgs, rootfs, toolcache, tap, guestMAC, jit string, cache map[string]any, spec core.RunnerSpec) []apiStep {
 	steps := []apiStep{
 		{"/boot-source", map[string]any{
 			"kernel_image_path": kernelImage,
@@ -413,6 +427,10 @@ func buildAPISteps(kernelImage, bootArgs, rootfs, toolcache, tap, guestMAC, jit 
 			"is_read_only":   true,
 		}})
 	}
+	mmds := map[string]any{"jitconfig": jit}
+	if len(cache) > 0 {
+		mmds["cache"] = cache
+	}
 	return append(steps,
 		apiStep{"/machine-config", map[string]any{
 			"vcpu_count":   spec.VCPU,
@@ -428,7 +446,7 @@ func buildAPISteps(kernelImage, bootArgs, rootfs, toolcache, tap, guestMAC, jit 
 			"network_interfaces": []string{"eth0"},
 			"ipv4_address":       "169.254.169.254",
 		}},
-		apiStep{"/mmds", map[string]any{"jitconfig": jit}},
+		apiStep{"/mmds", mmds},
 		apiStep{"/actions", map[string]any{"action_type": "InstanceStart"}},
 	)
 }
@@ -439,12 +457,27 @@ func buildAPISteps(kernelImage, bootArgs, rootfs, toolcache, tap, guestMAC, jit 
 // a direct launch, in-jail paths such as /vmlinux under the jailer).
 func (f *Firecracker) configure(ctx context.Context, sock, kernelPath, rootfs, toolcache string, n vmNet, bootArgs, jit string, spec core.RunnerSpec) error {
 	cl := newUnixClient(sock)
-	for _, s := range buildAPISteps(kernelPath, bootArgs, rootfs, toolcache, n.tap, n.guestMAC, jit, spec) {
+	for _, s := range buildAPISteps(kernelPath, bootArgs, rootfs, toolcache, n.tap, n.guestMAC, jit, f.cacheMMDS(), spec) {
 		if err := putJSON(ctx, cl, s.path, s.body); err != nil {
 			return fmt.Errorf("PUT %s: %w", s.path, err)
 		}
 	}
 	return nil
+}
+
+// cacheMMDS returns the cache configuration firerunner publishes to the guest
+// via MMDS, or nil when self-hosted dependency caching is not enabled. When a
+// full URL is configured the guest uses it verbatim; otherwise the guest builds
+// the URL from its default gateway and the given port.
+func (f *Firecracker) cacheMMDS() map[string]any {
+	switch {
+	case f.cfg.CacheURL != "":
+		return map[string]any{"url": f.cfg.CacheURL}
+	case f.cfg.CachePort != 0:
+		return map[string]any{"port": strconv.Itoa(f.cfg.CachePort)}
+	default:
+		return nil
+	}
 }
 
 // toolCacheImage returns the host path to the tool-cache image for a tier: the
