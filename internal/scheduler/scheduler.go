@@ -290,16 +290,17 @@ func (s *Scheduler) MarkBusy(name string) {
 // assigned to it, so shutdown reaps idle warm-pool VMs at once while leaving
 // busy VMs to finish their job.
 func (s *Scheduler) cancelIfIdle(name string) {
+	// Cancel under the lock (the CancelFunc only closes a channel, so it never
+	// blocks) so a MarkBusy cannot slip between the busy check and the cancel
+	// and get an in-flight job SIGKILLed — the same invariant scaleDown holds.
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	h := s.active[name]
-	var cancel context.CancelFunc
-	if h != nil && !h.busy {
-		cancel = h.cancel
+	if h == nil || h.busy || h.cancelled {
+		return
 	}
-	s.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
+	h.cancelled = true
+	h.cancel()
 }
 
 // maintainMinimum tops the warm pool back up to Min after a microVM exits. GitHub
