@@ -511,3 +511,39 @@ func TestMaxEntrySizeRejectsBlockList(t *testing.T) {
 		t.Fatal("blob created despite over-cap upload")
 	}
 }
+
+// TestFinalizedEntryIsImmutable verifies a completed entry cannot be overwritten
+// or truncated via its blob token, which is also handed out for downloads.
+func TestFinalizedEntryIsImmutable(t *testing.T) {
+	ts, base := newTestServer(t)
+
+	create := twirp(t, base, "CreateCacheEntry", createReq{Key: "k", Version: "v"})
+	uploadURL := create["signed_upload_url"].(string)
+	putBlob(t, uploadURL, []byte("original"))
+	twirp(t, base, "FinalizeCacheEntryUpload", finalizeReq{Key: "k", Version: "v", SizeBytes: "8"})
+
+	// Re-PUT to the same signed upload URL (same id+sig) must be refused now.
+	req, _ := http.NewRequest(http.MethodPut, uploadURL, bytes.NewReader([]byte("EVIL")))
+	req.Header.Set("x-ms-blob-type", "BlockBlob")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PUT: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("overwrite status = %d, want 409", resp.StatusCode)
+	}
+
+	// The original content must still be intact on restore.
+	get := twirp(t, base, "GetCacheEntryDownloadURL", getReq{Key: "k", Version: "v"})
+	dresp, err := http.Get(get["signed_download_url"].(string))
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer dresp.Body.Close()
+	got, _ := io.ReadAll(dresp.Body)
+	if string(got) != "original" {
+		t.Fatalf("blob = %q, want %q", got, "original")
+	}
+	_ = ts
+}

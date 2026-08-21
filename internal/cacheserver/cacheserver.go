@@ -405,6 +405,17 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Entries are immutable once finalized: the blob token is handed out for both
+	// download and upload, so without this check any client that can read a
+	// completed entry could also overwrite or truncate it. Writes are only
+	// accepted while the entry is still reserved.
+	s.mu.Lock()
+	complete := e.Complete
+	s.mu.Unlock()
+	if complete {
+		http.Error(w, "cache entry already finalized", http.StatusConflict)
+		return
+	}
 	switch r.URL.Query().Get("comp") {
 	case "block":
 		s.uploadBlock(w, r, e)
