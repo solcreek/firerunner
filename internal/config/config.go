@@ -294,6 +294,20 @@ func (c *Config) validate() error {
 	if c.Firecracker.CachePort != 0 && (c.Firecracker.CachePort < 1 || c.Firecracker.CachePort > 65535) {
 		return fmt.Errorf("--cache-port %d out of range (1-65535)", c.Firecracker.CachePort)
 	}
+	if p := c.Firecracker.TapPrefix; p != "" {
+		// Interface names cap at 15 chars and firerunner appends up to 4
+		// ("v<slot>h" for the veth), so bound the prefix at 11. Letters only:
+		// a digit-free prefix plus the always-numeric slot means two instances
+		// with different prefixes can never derive the same tap/veth name.
+		if len(p) > 11 {
+			return fmt.Errorf("--tap-prefix %q too long (max 11 chars)", p)
+		}
+		for _, r := range p {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+				return fmt.Errorf("--tap-prefix %q must be letters only ([a-zA-Z]); digits or symbols risk interface-name collisions between instances sharing a host", p)
+			}
+		}
+	}
 	if c.Firecracker.MaxVMLifetime != 0 && c.Firecracker.MaxVMLifetime < time.Minute {
 		return fmt.Errorf("--max-vm-lifetime %s is too small; use 0 to disable or a value >= 1m so real jobs are never truncated", c.Firecracker.MaxVMLifetime)
 	}

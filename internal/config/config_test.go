@@ -248,6 +248,25 @@ func TestFromFlags_NetNSCachePortRejected(t *testing.T) {
 	}
 }
 
+func TestFromFlags_TapPrefix(t *testing.T) {
+	if _, err := FromFlags(append(baseArgs(), "--tap-prefix", "frk")); err != nil {
+		t.Fatalf("letters-only tap-prefix should be valid: %v", err)
+	}
+	bad := map[string][]string{
+		"digit":      {"--tap-prefix", "fr2"},
+		"symbol":     {"--tap-prefix", "fr-"},
+		"too long":   {"--tap-prefix", "abcdefghijkl"},
+		"underscore": {"--tap-prefix", "fr_"},
+	}
+	for name, extra := range bad {
+		t.Run(name, func(t *testing.T) {
+			if _, err := FromFlags(append(baseArgs(), extra...)); err == nil {
+				t.Fatalf("expected error for %q tap-prefix", name)
+			}
+		})
+	}
+}
+
 func TestFromFlags_ToolCache(t *testing.T) {
 	img := filepath.Join(t.TempDir(), "toolcache-go.ext4")
 	if err := os.WriteFile(img, []byte("x"), 0o644); err != nil {
