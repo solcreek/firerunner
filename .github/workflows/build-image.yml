@@ -1,8 +1,19 @@
 name: build-image
 
-# Rebuilds the firerunner golden rootfs images. GitHub only supports self-hosted
-# runner agents released in the last 30 days, so we rebuild monthly (well within
-# the window) and on demand. Rebuilding also folds in base-OS security updates.
+# Rebuilds every shipped firerunner image. GitHub only accepts self-hosted
+# runner agents released in the last 30 days, so the rootfs tiers (which bake
+# actions/runner) are rebuilt monthly — well within the window — and on demand.
+# Rebuilding also folds in base-OS security updates. The tool-cache drive bakes
+# no runner agent (it is a pure accelerator), but is rebuilt on the same cadence
+# to refresh its toolchains and picked-up CVEs.
+#
+# Every tier in the shipped catalog (examples/tiers.json) is covered:
+#   golden.ext4            firerunner / firerunner-8c16g   (build-rootfs.sh)
+#   golden-docker.ext4     firerunner-8c16g-docker         (build-rootfs.sh)
+#   golden-node.ext4       firerunner-node                 (build-rootfs.sh)
+#   ubuntu-rootfs-full     firerunner-ubuntu               (build-ubuntu-rootfs.sh)
+#   ubuntu-rootfs-minimal  firerunner-ubuntu-min           (build-ubuntu-rootfs.sh)
+#   toolcache.ext4         attached via --toolcache        (build-toolcache.sh)
 
 on:
   schedule:
@@ -14,9 +25,18 @@ on:
         description: "actions/runner version to pin (blank = latest)"
         required: false
         default: ""
+      image_dir:
+        description: "Directory to publish the images into"
+        required: false
+        default: "/var/lib/firerunner"
 
 permissions:
   contents: read
+
+env:
+  # workflow_dispatch supplies image_dir; the scheduled run has no inputs, so
+  # fall back to the documented default from examples/tiers.json.
+  IMAGE_DIR: ${{ inputs.image_dir || '/var/lib/firerunner' }}
 
 jobs:
   build:
@@ -25,21 +45,50 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        tier:
-          - firerunner-4c8g
-          - firerunner-8c16g-docker
+        include:
+          - name: golden
+            out: golden.ext4
+            runner_pinned: true
+            build: images/build-rootfs.sh --tier firerunner-4c8g
+          - name: golden-docker
+            out: golden-docker.ext4
+            runner_pinned: true
+            build: images/build-rootfs.sh --tier firerunner-8c16g-docker
+          - name: golden-node
+            out: golden-node.ext4
+            runner_pinned: true
+            build: images/build-rootfs.sh --tier firerunner-node
+          - name: ubuntu-full
+            out: ubuntu-rootfs-full.ext4
+            runner_pinned: true
+            build: images/build-ubuntu-rootfs.sh --toolset full
+          - name: ubuntu-minimal
+            out: ubuntu-rootfs-minimal.ext4
+            runner_pinned: true
+            build: images/build-ubuntu-rootfs.sh --toolset minimal
+          - name: toolcache
+            out: toolcache.ext4
+            runner_pinned: false
+            build: images/build-toolcache.sh
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Build golden rootfs (${{ matrix.tier }})
+      - name: Build ${{ matrix.name }}
+        env:
+          RUNNER_VERSION: ${{ inputs.runner_version }}
         run: |
-          sudo images/build-rootfs.sh \
-            --tier "${{ matrix.tier }}" \
-            --runner-version "${{ inputs.runner_version }}" \
-            --out "/var/lib/firerunner/${{ matrix.tier }}.ext4"
+          set -euo pipefail
+          out="${IMAGE_DIR%/}/${{ matrix.out }}"
+          # Only the runner-baking rootfs scripts accept --runner-version; the
+          # tool-cache drive bakes no runner agent, so never pass it there.
+          extra=()
+          if [ "${{ matrix.runner_pinned }}" = "true" ] && [ -n "${RUNNER_VERSION}" ]; then
+            extra+=(--runner-version "${RUNNER_VERSION}")
+          fi
+          sudo ${{ matrix.build }} "${extra[@]}" --out "$out"
 
-      # The image is published in place on the host; firerunner reflink-clones it
+      # Images are published in place on the host; firerunner reflink-clones them
       # per job. No artifact upload — these files are large and host-local.
       - name: Report
-        run: ls -lh "/var/lib/firerunner/${{ matrix.tier }}.ext4"
+        run: ls -lh "${IMAGE_DIR%/}/${{ matrix.out }}"
