@@ -1,9 +1,9 @@
 name: tier-routing
 
-# Proves multi-tier label routing: GitHub routes each job to the scale set whose
-# name matches its runs-on label, so a job lands on that tier's golden image.
-# The base tier has no Node; the firerunner-node tier bakes Node LTS. Each job
-# reports whether node is present, which is a clean image-identity fingerprint.
+# Proves multi-tier routing from one firerunner process: GitHub routes each job
+# to the scale set whose name matches its runs-on label, so a job lands on that
+# tier's microVM shape (vcpu/mem) and golden image. nproc fingerprints the vcpu
+# knob; node presence fingerprints the golden-image knob.
 on:
   workflow_dispatch:
 
@@ -13,10 +13,23 @@ jobs:
     steps:
       - run: |
           echo "tier=base runner=firerunner nproc=$(nproc)"
+          if [ "$(nproc)" != "2" ]; then
+            echo "FAIL: base tier expected 2 vCPU, got $(nproc)"; exit 1
+          fi
           if command -v node >/dev/null; then
             echo "UNEXPECTED: node present on base tier: $(node --version)"; exit 1
           fi
-          echo "OK: base tier has no baked node (as expected)"
+          echo "OK: base tier = 2 vCPU, no baked node (as expected)"
+
+  big:
+    runs-on: firerunner-8c16g
+    steps:
+      - run: |
+          echo "tier=big runner=firerunner-8c16g nproc=$(nproc)"
+          if [ "$(nproc)" != "8" ]; then
+            echo "FAIL: big tier expected 8 vCPU, got $(nproc)"; exit 1
+          fi
+          echo "OK: big tier = 8 vCPU (vcpu/mem knob routed per tier)"
 
   node:
     runs-on: firerunner-node
@@ -27,3 +40,4 @@ jobs:
             echo "FAIL: node missing on node tier"; exit 1
           fi
           echo "OK: node tier has baked node: $(node --version), npm $(npm --version)"
+
