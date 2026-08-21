@@ -161,7 +161,8 @@ Point `--tiers` (or `FR_TIERS`) at a JSON catalog:
   { "name": "firerunner",       "vcpu": 2, "mem_mib": 4096,  "golden": "/var/lib/firerunner/golden.ext4",           "min": 1, "max": 8 },
   { "name": "firerunner-8c16g", "vcpu": 8, "mem_mib": 16384, "golden": "/var/lib/firerunner/golden.ext4",           "min": 0, "max": 2 },
   { "name": "firerunner-node",  "vcpu": 2, "mem_mib": 4096,  "golden": "/var/lib/firerunner/golden-node.ext4",      "min": 0, "max": 4 },
-  { "name": "firerunner-ubuntu","vcpu": 4, "mem_mib": 8192,  "golden": "/var/lib/firerunner/ubuntu-rootfs-full.ext4","min": 0, "max": 2 }
+  { "name": "firerunner-ubuntu","vcpu": 4, "mem_mib": 8192,  "golden": "/var/lib/firerunner/ubuntu-rootfs-full.ext4","min": 0, "max": 2 },
+  { "name": "firerunner-ubuntu-min","vcpu": 4, "mem_mib": 8192, "golden": "/var/lib/firerunner/ubuntu-rootfs-minimal.ext4","min": 0, "max": 2 }
 ]
 ```
 
@@ -189,13 +190,19 @@ and the runner-images installer subset baked in (built by
 Use it for jobs that need the closest parity with GitHub-hosted `ubuntu-latest`;
 the lean Debian `firerunner` tier stays the default for everything else.
 
-For Ubuntu glibc parity **without** the full image's bulk, build
-[`--toolset minimal`](images/build-ubuntu-rootfs.sh): a thin Ubuntu 24.04 base
-(runner + git + build-essential + system python3 + Node.js runtime, **no Docker
-or baked language toolchains**, ~1.6 GiB) meant to be paired with a
-[`--toolcache` drive](#pre-seeded-tool-cache---toolcache-opt-in) so `setup-*`
-actions resolve languages on demand — ideal for the common build/test/lint/SAST
-jobs that never touch Docker.
+For Ubuntu glibc parity **without** the full image's bulk, the
+`firerunner-ubuntu-min` tier above points at a
+[`--toolset minimal`](images/build-ubuntu-rootfs.sh) golden: a thin Ubuntu 24.04
+base (runner + git + build-essential + system python3 + Node.js runtime, **no
+Docker or baked language toolchains**, ~1.6 GiB on disk) meant to be paired with
+a [`--toolcache` drive](#pre-seeded-tool-cache---toolcache-opt-in) so `setup-*`
+actions resolve languages on demand. Because `--toolcache` is a process-wide
+flag, set `FR_TOOLCACHE` (or `--toolcache`) once and every tier — including this
+one — gets the drive. It is ideal for the common build/test/lint/SAST jobs that
+never touch Docker; Docker jobs stay on `firerunner-8c16g-docker` or the full
+`firerunner-ubuntu` tier. Measured on a real CodeQL run it matches the full
+image's speed at a fraction of the size (CodeQL bundle served from the drive, no
+per-run download).
 
 ### Inspecting a deployment (`status`, `doctor`)
 

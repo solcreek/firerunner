@@ -31,5 +31,13 @@
     "golden": "/var/lib/firerunner/ubuntu-rootfs-full.ext4",
     "min": 0,
     "max": 2
+  },
+  {
+    "name": "firerunner-ubuntu-min",
+    "vcpu": 4,
+    "mem_mib": 8192,
+    "golden": "/var/lib/firerunner/ubuntu-rootfs-minimal.ext4",
+    "min": 0,
+    "max": 2
   }
 ]

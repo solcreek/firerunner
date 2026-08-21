@@ -4,7 +4,8 @@ name: tier-routing
 # to the scale set whose name matches its runs-on label, so a job lands on that
 # tier's microVM shape (vcpu/mem) and golden image. nproc fingerprints the vcpu
 # knob; node presence and the Ubuntu 24.04/glibc version fingerprint the
-# golden-image knob (lean Debian vs Node-baked vs faithful ubuntu-latest full).
+# golden-image knob (lean Debian vs Node-baked vs faithful ubuntu-latest full vs
+# lean ubuntu-parity minimal, told apart by Docker being absent on the latter).
 on:
   workflow_dispatch:
 jobs:
@@ -55,4 +56,25 @@ jobs:
           fi
           glibc=$(ldd --version | head -1 | grep -oE '[0-9]+\.[0-9]+$')
           echo "OK: ubuntu tier = 4 vCPU, $PRETTY_NAME, glibc $glibc (faithful full image routed)"
+
+  ubuntu-min:
+    runs-on: firerunner-ubuntu-min
+    steps:
+      - run: |
+          . /etc/os-release
+          echo "tier=ubuntu-min runner=firerunner-ubuntu-min nproc=$(nproc) $PRETTY_NAME"
+          if [ "$(nproc)" != "4" ]; then
+            echo "FAIL: ubuntu-min tier expected 4 vCPU, got $(nproc)"; exit 1
+          fi
+          if [ "$VERSION_ID" != "24.04" ]; then
+            echo "FAIL: ubuntu-min tier expected Ubuntu 24.04, got $VERSION_ID"; exit 1
+          fi
+          if command -v docker >/dev/null; then
+            echo "UNEXPECTED: docker present on lean ubuntu-min tier: $(docker --version)"; exit 1
+          fi
+          if ! command -v node >/dev/null; then
+            echo "FAIL: node runtime missing on ubuntu-min tier"; exit 1
+          fi
+          glibc=$(ldd --version | head -1 | grep -oE '[0-9]+\.[0-9]+$')
+          echo "OK: ubuntu-min tier = 4 vCPU, $PRETTY_NAME, glibc $glibc, no Docker (lean ubuntu-parity image routed)"
 
