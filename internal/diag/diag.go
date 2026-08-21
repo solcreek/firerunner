@@ -6,6 +6,7 @@ package diag
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -23,27 +24,119 @@ import (
 	"github.com/solcreek/firerunner/internal/provisioner"
 )
 
-// Status writes a human-readable snapshot of the deployment: resolved config,
-// golden/kernel images, network wiring and the microVMs currently on the host.
-func Status(cfg *config.Config, version string, w io.Writer) error {
-	fc := cfg.Firecracker
-	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+// StatusReport is the structured snapshot rendered by "status" (as text or JSON).
+type StatusReport struct {
+	Version   string      `json:"version"`
+	ScaleSet  string      `json:"scale_set"`
+	Group     string      `json:"group"`
+	URL       string      `json:"url"`
+	Labels    []string    `json:"labels"`
+	Warm      int         `json:"warm"`
+	Max       int         `json:"max"`
+	VCPU      int         `json:"vcpu"`
+	MemMiB    int         `json:"mem_mib"`
+	Kernel    FileStat    `json:"kernel"`
+	Golden    FileStat    `json:"golden"`
+	ToolCache *FileStat   `json:"toolcache,omitempty"`
+	Isolation string      `json:"isolation"`
+	Network   NetInfo     `json:"network"`
+	Workdir   WorkdirInfo `json:"workdir"`
+	MicroVMs  VMSummary   `json:"microvms"`
+}
 
-	fmt.Fprintf(tw, "firerunner\t%s\n", version)
-	fmt.Fprintf(tw, "scale set\t%s  (group %s)\n", or(cfg.ScaleSetName, "-"), or(cfg.RunnerGroup, "-"))
-	fmt.Fprintf(tw, "url\t%s\n", or(cfg.URL, "(unset)"))
-	labels := append([]string{cfg.ScaleSetName}, cfg.Labels...)
-	fmt.Fprintf(tw, "runs-on labels\t%s\n", strings.Join(nonEmpty(labels), ", "))
-	fmt.Fprintf(tw, "capacity\twarm=%d  max=%d  vcpu=%d  mem=%dMiB\n", cfg.MinRunners, cfg.MaxRunners, cfg.VCPU, cfg.MemMiB)
+// FileStat describes an image file on disk.
+type FileStat struct {
+	Path    string `json:"path"`
+	Exists  bool   `json:"exists"`
+	Bytes   int64  `json:"bytes,omitempty"`
+	Human   string `json:"human,omitempty"`
+	ModTime string `json:"mtime,omitempty"`
+}
 
-	fmt.Fprintf(tw, "kernel\t%s\n", describeFile(fc.KernelImage))
-	fmt.Fprintf(tw, "golden\t%s\n", describeFile(fc.GoldenRootFS))
-	if fc.ToolCacheImage != "" {
-		fmt.Fprintf(tw, "toolcache\t%s\n", describeFile(fc.ToolCacheImage))
-	} else {
-		fmt.Fprintf(tw, "toolcache\t(none; jobs download tools on demand)\n")
+// describe renders a FileStat the way the text status expects.
+func (f FileStat) describe() string {
+	if f.Path == "" {
+		return "(unset)"
 	}
+	if !f.Exists {
+		return fmt.Sprintf("%s  MISSING", f.Path)
+	}
+	return fmt.Sprintf("%s  (%s, %s)", f.Path, f.Human, f.ModTime)
+}
 
+// NetInfo captures the host network wiring for guest egress.
+type NetInfo struct {
+	ExtIface   string `json:"ext_iface"`
+	ExtIfaceUp bool   `json:"ext_iface_up"`
+	Egress     string `json:"egress"`
+	Subnet     string `json:"subnet"`
+	TapPrefix  string `json:"tap_prefix"`
+	NFTTable   string `json:"nft_table"`
+}
+
+// WorkdirInfo describes the per-job rootfs work directory.
+type WorkdirInfo struct {
+	Path           string `json:"path"`
+	FS             string `json:"fs"`
+	ReflinkCapable bool   `json:"reflink_capable"`
+}
+
+// VMSummary aggregates the live microVMs on the host.
+type VMSummary struct {
+	Active           int  `json:"active"`
+	FirecrackerProcs int  `json:"firecracker_procs"`
+	Taps             int  `json:"taps"`
+	Max              int  `json:"max"`
+	VMs              []VM `json:"vms,omitempty"`
+}
+
+// VM is a single live microVM.
+type VM struct {
+	Name        string `json:"name"`
+	RootfsBytes int64  `json:"rootfs_bytes"`
+	RootfsHuman string `json:"rootfs_human"`
+	AgeSeconds  int64  `json:"age_seconds"`
+}
+
+// DoctorReport is the structured result of the preflight health checks.
+type DoctorReport struct {
+	Version string  `json:"version"`
+	Checks  []Check `json:"checks"`
+	Total   int     `json:"total"`
+	Failed  int     `json:"failed"`
+	OK      bool    `json:"ok"`
+}
+
+// writeJSON marshals v with indentation and a trailing newline.
+func writeJSON(w io.Writer, v any) error {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write(b); err != nil {
+		return err
+	}
+	_, err = io.WriteString(w, "\n")
+	return err
+}
+
+// Status writes a snapshot of the deployment: resolved config, golden/kernel
+// images, network wiring and the microVMs currently on the host. When asJSON is
+// set it emits a StatusReport as JSON (for dashboards/scripts); otherwise a
+// human-readable table.
+func Status(cfg *config.Config, version string, w io.Writer, asJSON bool) error {
+	r := collectStatus(cfg, version)
+	if asJSON {
+		return writeJSON(w, r)
+	}
+	renderStatusText(r, w)
+	return nil
+}
+
+// collectStatus gathers the deployment snapshot into a StatusReport, the single
+// source of truth for both the JSON and text renderings.
+func collectStatus(cfg *config.Config, version string) StatusReport {
+	fc := cfg.Firecracker
 	mode := "direct"
 	if fc.Jailer {
 		mode = "jailer"
@@ -51,35 +144,115 @@ func Status(cfg *config.Config, version string, w io.Writer) error {
 			mode = "jailer+netns"
 		}
 	}
-	fmt.Fprintf(tw, "isolation\t%s\n", mode)
-	fmt.Fprintf(tw, "network\text-iface=%s  egress=%s  subnet=172.%d.0.0/16  tap=%s*  nft-table=%s\n",
-		ifaceState(fc.ExtIface), egressDesc(fc.Egress.Categories), fc.NetBase, fc.TapPrefix, fc.NFTTable)
-	fmt.Fprintf(tw, "workdir\t%s (%s)\n", fc.WorkDir, fsKind(fc.WorkDir))
+	r := StatusReport{
+		Version:   version,
+		ScaleSet:  cfg.ScaleSetName,
+		Group:     cfg.RunnerGroup,
+		URL:       cfg.URL,
+		Labels:    nonEmpty(append([]string{cfg.ScaleSetName}, cfg.Labels...)),
+		Warm:      cfg.MinRunners,
+		Max:       cfg.MaxRunners,
+		VCPU:      cfg.VCPU,
+		MemMiB:    cfg.MemMiB,
+		Kernel:    statFile(fc.KernelImage),
+		Golden:    statFile(fc.GoldenRootFS),
+		Isolation: mode,
+		Network: NetInfo{
+			ExtIface:   fc.ExtIface,
+			ExtIfaceUp: ifaceUp(fc.ExtIface),
+			Egress:     egressDesc(fc.Egress.Categories),
+			Subnet:     fmt.Sprintf("172.%d.0.0/16", fc.NetBase),
+			TapPrefix:  fc.TapPrefix,
+			NFTTable:   fc.NFTTable,
+		},
+		Workdir: WorkdirInfo{
+			Path:           fc.WorkDir,
+			FS:             fsKind(fc.WorkDir),
+			ReflinkCapable: reflinkCapable(fsKind(fc.WorkDir)),
+		},
+	}
+	if fc.ToolCacheImage != "" {
+		f := statFile(fc.ToolCacheImage)
+		r.ToolCache = &f
+	}
+
+	// Live microVMs, cross-checked three ways: work dirs (per-job rootfs clone +
+	// socket), tap devices and firecracker processes.
+	vms := activeVMs(fc)
+	r.MicroVMs = VMSummary{
+		Active:           len(vms),
+		FirecrackerProcs: firecrackerProcs(),
+		Taps:             countTaps(fc.TapPrefix),
+		Max:              cfg.MaxRunners,
+	}
+	for _, v := range vms {
+		r.MicroVMs.VMs = append(r.MicroVMs.VMs, VM{
+			Name:        v.name,
+			RootfsBytes: v.rootfsBytes,
+			RootfsHuman: humanBytes(v.rootfsBytes),
+			AgeSeconds:  int64(time.Since(v.started).Seconds()),
+		})
+	}
+	return r
+}
+
+func renderStatusText(r StatusReport, w io.Writer) {
+	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+	fmt.Fprintf(tw, "firerunner\t%s\n", r.Version)
+	fmt.Fprintf(tw, "scale set\t%s  (group %s)\n", or(r.ScaleSet, "-"), or(r.Group, "-"))
+	fmt.Fprintf(tw, "url\t%s\n", or(r.URL, "(unset)"))
+	fmt.Fprintf(tw, "runs-on labels\t%s\n", strings.Join(r.Labels, ", "))
+	fmt.Fprintf(tw, "capacity\twarm=%d  max=%d  vcpu=%d  mem=%dMiB\n", r.Warm, r.Max, r.VCPU, r.MemMiB)
+	fmt.Fprintf(tw, "kernel\t%s\n", r.Kernel.describe())
+	fmt.Fprintf(tw, "golden\t%s\n", r.Golden.describe())
+	if r.ToolCache != nil {
+		fmt.Fprintf(tw, "toolcache\t%s\n", r.ToolCache.describe())
+	} else {
+		fmt.Fprintf(tw, "toolcache\t(none; jobs download tools on demand)\n")
+	}
+	fmt.Fprintf(tw, "isolation\t%s\n", r.Isolation)
+	fmt.Fprintf(tw, "network\text-iface=%s  egress=%s  subnet=%s  tap=%s*  nft-table=%s\n",
+		ifaceStateStr(r.Network.ExtIface, r.Network.ExtIfaceUp), r.Network.Egress, r.Network.Subnet, r.Network.TapPrefix, r.Network.NFTTable)
+	fmt.Fprintf(tw, "workdir\t%s (%s)\n", r.Workdir.Path, r.Workdir.FS)
 	tw.Flush()
 
-	// Live microVMs on the host, cross-checked three ways: work dirs (the
-	// per-job rootfs clone + socket), tap devices, and firecracker processes.
-	vms := activeVMs(fc)
-	procs := firecrackerProcs()
-	taps := countTaps(fc.TapPrefix)
 	fmt.Fprintf(w, "\nmicroVMs: %d active  (firecracker procs=%d, taps=%d, max=%d)\n",
-		len(vms), procs, taps, cfg.MaxRunners)
-	if len(vms) > 0 {
+		r.MicroVMs.Active, r.MicroVMs.FirecrackerProcs, r.MicroVMs.Taps, r.MicroVMs.Max)
+	if len(r.MicroVMs.VMs) > 0 {
 		vtw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
 		fmt.Fprintln(vtw, "  RUNNER\tROOTFS\tAGE")
-		for _, v := range vms {
-			fmt.Fprintf(vtw, "  %s\t%s\t%s\n", v.name, humanBytes(v.rootfsBytes), humanDuration(time.Since(v.started)))
+		for _, v := range r.MicroVMs.VMs {
+			fmt.Fprintf(vtw, "  %s\t%s\t%s\n", v.Name, v.RootfsHuman, humanDuration(time.Duration(v.AgeSeconds)*time.Second))
 		}
 		vtw.Flush()
+	}
+}
+
+// Doctor runs preflight health checks. When asJSON is set it emits a
+// DoctorReport as JSON; otherwise one PASS/WARN/FAIL line each. It returns a
+// non-nil error if any check FAILs, so the command exits non-zero either way.
+func Doctor(cfg *config.Config, version string, w io.Writer, asJSON bool) error {
+	r := runDoctor(cfg, version)
+	if asJSON {
+		if err := writeJSON(w, r); err != nil {
+			return err
+		}
+	} else {
+		for _, c := range r.Checks {
+			fmt.Fprintf(w, "%s %-12s %s\n", c.Level, c.Name, c.Detail)
+		}
+		fmt.Fprintf(w, "\n%d checks, %d failed\n", r.Total, r.Failed)
+	}
+	if r.Failed > 0 {
+		return fmt.Errorf("%d check(s) failed", r.Failed)
 	}
 	return nil
 }
 
-// Doctor runs preflight health checks and prints one PASS/WARN/FAIL line each.
-// It returns a non-nil error if any check FAILs, so the command exits non-zero.
-func Doctor(cfg *config.Config, version string, w io.Writer) error {
+// runDoctor executes the preflight checks and folds them into a DoctorReport.
+func runDoctor(cfg *config.Config, version string) DoctorReport {
 	fc := cfg.Firecracker
-	var checks []check
+	var checks []Check
 
 	// Privileges. firerunner's default path runs unprivileged, but jailer/netns
 	// need root (creating a netns/chroot needs CAP_SYS_ADMIN).
@@ -144,19 +317,19 @@ func Doctor(cfg *config.Config, version string, w io.Writer) error {
 	// GitHub API reachability (best-effort; WARN offline, never FAIL).
 	checks = append(checks, apiReach("https://api.github.com/zen"))
 
-	// Emit.
-	var failed int
+	failed := 0
 	for _, c := range checks {
-		if c.level == levelFail {
+		if c.Level == levelFail {
 			failed++
 		}
-		fmt.Fprintf(w, "%s %-12s %s\n", c.level, c.name, c.detail)
 	}
-	fmt.Fprintf(w, "\n%d checks, %d failed\n", len(checks), failed)
-	if failed > 0 {
-		return fmt.Errorf("%d check(s) failed", failed)
+	return DoctorReport{
+		Version: version,
+		Checks:  checks,
+		Total:   len(checks),
+		Failed:  failed,
+		OK:      failed == 0,
 	}
-	return nil
 }
 
 // --- checks ---------------------------------------------------------------
@@ -167,18 +340,18 @@ const (
 	levelFail = "FAIL"
 )
 
-type check struct {
-	level  string
-	name   string
-	detail string
+type Check struct {
+	Level  string `json:"level"`
+	Name   string `json:"name"`
+	Detail string `json:"detail"`
 }
 
-func pass(name, f string, a ...any) check { return check{levelPass, name, fmt.Sprintf(f, a...)} }
-func warn(name, f string, a ...any) check { return check{levelWarn, name, fmt.Sprintf(f, a...)} }
-func fail(name, f string, a ...any) check { return check{levelFail, name, fmt.Sprintf(f, a...)} }
+func pass(name, f string, a ...any) Check { return Check{levelPass, name, fmt.Sprintf(f, a...)} }
+func warn(name, f string, a ...any) Check { return Check{levelWarn, name, fmt.Sprintf(f, a...)} }
+func fail(name, f string, a ...any) Check { return Check{levelFail, name, fmt.Sprintf(f, a...)} }
 
 // binVersion resolves an executable and captures its --version banner.
-func binVersion(name, bin string) check {
+func binVersion(name, bin string) Check {
 	path, err := exec.LookPath(bin)
 	if err != nil {
 		return fail(name, "%q not found: %v", bin, err)
@@ -193,7 +366,7 @@ func binVersion(name, bin string) check {
 }
 
 // fileCheck verifies a path exists, is readable and is at least minBytes.
-func fileCheck(name, path string, minBytes int64) check {
+func fileCheck(name, path string, minBytes int64) Check {
 	if path == "" {
 		return fail(name, "path is unset")
 	}
@@ -212,7 +385,7 @@ func fileCheck(name, path string, minBytes int64) check {
 	return pass(name, "%s (%s)", path, humanBytes(fi.Size()))
 }
 
-func workdirCheck(dir string) check {
+func workdirCheck(dir string) Check {
 	if dir == "" {
 		return fail("workdir", "path is unset")
 	}
@@ -231,7 +404,7 @@ func workdirCheck(dir string) check {
 	return pass("workdir", "%s writable, %s (reflink-capable)", dir, kind)
 }
 
-func authCheck(cfg *config.Config) check {
+func authCheck(cfg *config.Config) Check {
 	if cfg.Token != "" {
 		return pass("auth", "PAT configured")
 	}
@@ -247,7 +420,7 @@ func authCheck(cfg *config.Config) check {
 	return pass("auth", "GitHub App (client %s, installation %d)", cfg.AppClientID, cfg.AppInstallID)
 }
 
-func apiReach(url string) check {
+func apiReach(url string) Check {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -334,22 +507,35 @@ func countTaps(prefix string) int {
 
 // --- small helpers --------------------------------------------------------
 
-func describeFile(path string) string {
+func statFile(path string) FileStat {
+	f := FileStat{Path: path}
 	if path == "" {
-		return "(unset)"
+		return f
 	}
 	fi, err := os.Stat(path)
 	if err != nil {
-		return fmt.Sprintf("%s  MISSING", path)
+		return f
 	}
-	return fmt.Sprintf("%s  (%s, %s)", path, humanBytes(fi.Size()), fi.ModTime().Format("2006-01-02 15:04"))
+	f.Exists = true
+	f.Bytes = fi.Size()
+	f.Human = humanBytes(fi.Size())
+	f.ModTime = fi.ModTime().Format("2006-01-02 15:04")
+	return f
 }
 
-func ifaceState(name string) string {
+func ifaceUp(name string) bool {
+	if name == "" {
+		return false
+	}
+	_, err := net.InterfaceByName(name)
+	return err == nil
+}
+
+func ifaceStateStr(name string, up bool) string {
 	if name == "" {
 		return "(unset)"
 	}
-	if _, err := net.InterfaceByName(name); err != nil {
+	if !up {
 		return name + "(missing)"
 	}
 	return name

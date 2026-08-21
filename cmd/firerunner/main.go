@@ -67,16 +67,25 @@ func main() {
 // config leniently (config.Parse) so it can report on a partial or broken
 // deployment instead of refusing to start on a missing required field.
 func diagnose(cmd string, args []string) error {
-	cfg, err := config.Parse(args)
+	asJSON := false
+	rest := make([]string, 0, len(args))
+	for _, a := range args {
+		if a == "--json" || a == "-json" {
+			asJSON = true
+			continue
+		}
+		rest = append(rest, a)
+	}
+	cfg, err := config.Parse(rest)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "configuration error:", err)
 		return err
 	}
 	switch cmd {
 	case "status":
-		return diag.Status(cfg, version, os.Stdout)
+		return diag.Status(cfg, version, os.Stdout, asJSON)
 	case "doctor":
-		return diag.Doctor(cfg, version, os.Stdout)
+		return diag.Doctor(cfg, version, os.Stdout, asJSON)
 	}
 	return nil
 }
@@ -93,6 +102,7 @@ Usage:
 
 status and doctor read the same FR_* env / flags as the daemon, so run them
 with the same environment (e.g. the systemd EnvironmentFile) as the service.
+Pass --json to either for machine-readable output.
 `)
 }
 

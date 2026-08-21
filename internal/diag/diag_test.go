@@ -2,6 +2,7 @@ package diag
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,29 +61,29 @@ func TestFileCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if c := fileCheck("golden", big, 1<<20); c.level != levelPass {
-		t.Errorf("big file: level = %s, detail = %s", c.level, c.detail)
+	if c := fileCheck("golden", big, 1<<20); c.Level != levelPass {
+		t.Errorf("big file: level = %s, detail = %s", c.Level, c.Detail)
 	}
-	if c := fileCheck("golden", small, 1<<20); c.level != levelWarn {
-		t.Errorf("small file: level = %s, want WARN", c.level)
+	if c := fileCheck("golden", small, 1<<20); c.Level != levelWarn {
+		t.Errorf("small file: level = %s, want WARN", c.Level)
 	}
-	if c := fileCheck("golden", filepath.Join(dir, "nope"), 1); c.level != levelFail {
-		t.Errorf("missing file: level = %s, want FAIL", c.level)
+	if c := fileCheck("golden", filepath.Join(dir, "nope"), 1); c.Level != levelFail {
+		t.Errorf("missing file: level = %s, want FAIL", c.Level)
 	}
-	if c := fileCheck("golden", "", 1); c.level != levelFail {
-		t.Errorf("empty path: level = %s, want FAIL", c.level)
+	if c := fileCheck("golden", "", 1); c.Level != levelFail {
+		t.Errorf("empty path: level = %s, want FAIL", c.Level)
 	}
 }
 
 func TestAuthCheck(t *testing.T) {
-	if c := authCheck(&config.Config{Token: "ghp_x"}); c.level != levelPass {
-		t.Errorf("token: %s %s", c.level, c.detail)
+	if c := authCheck(&config.Config{Token: "ghp_x"}); c.Level != levelPass {
+		t.Errorf("token: %s %s", c.Level, c.Detail)
 	}
-	if c := authCheck(&config.Config{}); c.level != levelFail {
-		t.Errorf("no creds: want FAIL, got %s", c.level)
+	if c := authCheck(&config.Config{}); c.Level != levelFail {
+		t.Errorf("no creds: want FAIL, got %s", c.Level)
 	}
-	if c := authCheck(&config.Config{AppClientID: "id"}); c.level != levelFail {
-		t.Errorf("app without installation id: want FAIL, got %s", c.level)
+	if c := authCheck(&config.Config{AppClientID: "id"}); c.Level != levelFail {
+		t.Errorf("app without installation id: want FAIL, got %s", c.Level)
 	}
 }
 
@@ -91,7 +92,7 @@ func TestAuthCheck(t *testing.T) {
 func TestDoctor_ReportsFailures(t *testing.T) {
 	cfg := &config.Config{Firecracker: provisioner.FirecrackerConfig{WorkDir: t.TempDir()}}
 	var buf bytes.Buffer
-	err := Doctor(cfg, "test", &buf)
+	err := Doctor(cfg, "test", &buf, false)
 	if err == nil {
 		t.Fatal("Doctor returned nil error despite missing kernel/golden/ext-iface/auth")
 	}
@@ -108,7 +109,7 @@ func TestDoctor_ReportsFailures(t *testing.T) {
 func TestStatus_RendersPartialConfig(t *testing.T) {
 	cfg := &config.Config{ScaleSetName: "firerunner", Firecracker: provisioner.FirecrackerConfig{WorkDir: t.TempDir(), TapPrefix: "fr", NetBase: 16}}
 	var buf bytes.Buffer
-	if err := Status(cfg, "test", &buf); err != nil {
+	if err := Status(cfg, "test", &buf, false); err != nil {
 		t.Fatalf("Status: %v", err)
 	}
 	out := buf.String()
@@ -117,4 +118,52 @@ func TestStatus_RendersPartialConfig(t *testing.T) {
 			t.Errorf("Status output missing %q\n%s", want, out)
 		}
 	}
+}
+
+// TestStatus_JSON ensures --json emits a well-formed StatusReport.
+func TestStatus_JSON(t *testing.T) {
+	cfg := &config.Config{ScaleSetName: "firerunner", Firecracker: provisioner.FirecrackerConfig{WorkDir: t.TempDir(), TapPrefix: "fr", NetBase: 16}}
+	var buf bytes.Buffer
+	if err := Status(cfg, "test", &buf, true); err != nil {
+		t.Fatalf("Status --json: %v", err)
+	}
+	var r StatusReport
+	if err := json.Unmarshal(buf.Bytes(), &r); err != nil {
+		t.Fatalf("unmarshal StatusReport: %v\n%s", err, buf.String())
+	}
+	if r.Version != "test" {
+		t.Errorf("version = %q, want test", r.Version)
+	}
+	if r.ScaleSet != "firerunner" {
+		t.Errorf("scale_set = %q, want firerunner", r.ScaleSet)
+	}
+}
+
+// TestDoctor_JSON ensures --json emits a DoctorReport reflecting failures.
+func TestDoctor_JSON(t *testing.T) {
+	cfg := &config.Config{Firecracker: provisioner.FirecrackerConfig{WorkDir: t.TempDir()}}
+	var buf bytes.Buffer
+	if err := Doctor(cfg, "test", &buf, true); err == nil {
+		t.Fatal("Doctor --json returned nil error despite missing inputs")
+	}
+	var r DoctorReport
+	if err := json.Unmarshal(buf.Bytes(), &r); err != nil {
+		t.Fatalf("unmarshal DoctorReport: %v\n%s", err, buf.String())
+	}
+	if r.OK {
+		t.Error("report OK = true, want false")
+	}
+	if r.Failed == 0 || r.Failed != countFails(r.Checks) {
+		t.Errorf("failed = %d, checks-derived = %d", r.Failed, countFails(r.Checks))
+	}
+}
+
+func countFails(checks []Check) int {
+	n := 0
+	for _, c := range checks {
+		if c.Level == levelFail {
+			n++
+		}
+	}
+	return n
 }

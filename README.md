@@ -151,6 +151,14 @@ firerunner status   # config, kernel/golden images, network wiring, live microVM
 firerunner doctor   # preflight health checks; exits non-zero if any FAIL
 ```
 
+Pass `--json` to either subcommand for machine-readable output (dashboards,
+monitoring, or scripting a deploy gate):
+
+```bash
+firerunner status --json | jq .microvms.active
+firerunner doctor --json | jq -r '.checks[] | select(.level=="FAIL") | .name'
+```
+
 `status` prints the resolved scale-set config, the golden/kernel/tool-cache
 images (path, size, mtime), the network wiring, and the microVMs currently on
 the host (cross-checked against firecracker processes and tap devices).
