@@ -88,12 +88,29 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 		s.maintainMinimum(ctx)
 	}()
 
-	name, jit, err := s.opts.JIT.Generate(ctx, s.opts.Spec)
+	// Once shutdown has begun the listener has stopped accepting work and Drain
+	// is waiting to reap; don't boot a brand-new microVM into a draining host.
+	if ctx.Err() != nil {
+		return
+	}
+
+	// Detach the microVM's lifetime from ctx: once a runner is booting or running
+	// its single job we must let it finish rather than kill it mid-job. The
+	// provisioner boots Firecracker via exec.CommandContext, which SIGKILLs the
+	// VMM the instant its context is cancelled — so if we passed ctx straight
+	// through, a SIGTERM would abort every in-flight job. ctx still gates whether
+	// we accept *new* work (the guard above and maintainMinimum below); the VM
+	// itself runs under a cancellation-free context and is reaped by Drain when
+	// its job completes. systemd's TimeoutStopSec (with KillMode=mixed) is the
+	// backstop that SIGKILLs a VM whose job overruns the stop timeout.
+	vmCtx := context.WithoutCancel(ctx)
+
+	name, jit, err := s.opts.JIT.Generate(vmCtx, s.opts.Spec)
 	if err != nil {
 		s.opts.Logger.Error("generate JIT config", "err", err)
 		return
 	}
-	if err := s.opts.Provisioner.Launch(ctx, name, jit, s.opts.Spec); err != nil {
+	if err := s.opts.Provisioner.Launch(vmCtx, name, jit, s.opts.Spec); err != nil {
 		s.opts.Logger.Error("launch microVM", "runner", name, "err", err)
 	}
 }

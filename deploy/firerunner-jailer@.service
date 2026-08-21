@@ -37,6 +37,14 @@ RestartSec=5
 # a running job finish; otherwise systemd's default stop timeout SIGKILLs the
 # listener mid-job and orphans firecracker children (which leak tap devices).
 # Tune to your longest expected job.
+#
+# KillMode=mixed sends SIGTERM to the main firerunner process only (not the whole
+# cgroup) so firerunner owns the drain: it keeps in-flight Firecracker children
+# alive until their single job finishes. At TimeoutStopSec systemd SIGKILLs the
+# whole cgroup, which is the backstop that reaps a job overrunning the deadline.
+# The default KillMode=control-group would instead SIGTERM every Firecracker at
+# once, killing running jobs — defeating the drain.
+KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=1h
 

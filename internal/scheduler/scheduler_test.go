@@ -136,3 +136,64 @@ func TestMaintainsMinimumAfterExit(t *testing.T) {
 		t.Fatalf("running=%d want 0 after drain", got)
 	}
 }
+
+// TestInFlightVMOutlivesCancel is the core of the graceful-drain fix: a SIGTERM
+// (modelled here by cancelling the parent context) must not cancel the context
+// of a microVM that is already running its job, or the provisioner's
+// exec.CommandContext would SIGKILL Firecracker mid-job.
+func TestInFlightVMOutlivesCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan context.Context, 1)
+	release := make(chan struct{})
+	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec) error {
+		entered <- vmCtx
+		<-release
+		return nil
+	})
+	s := New(Options{Max: 1, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 1)
+
+	var vmCtx context.Context
+	select {
+	case vmCtx = <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("launch never started")
+	}
+
+	cancel() // simulate SIGTERM while the job is in flight
+
+	select {
+	case <-vmCtx.Done():
+		t.Fatal("in-flight microVM context was cancelled by shutdown; the job would be killed mid-run")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	s.Drain()
+	if got := s.Running(); got != 0 {
+		t.Fatalf("running=%d want 0 after drain", got)
+	}
+}
+
+// TestReconcileAfterShutdownLaunchesNothing verifies we stop accepting new work
+// once shutdown has begun: a Reconcile racing in after the context is cancelled
+// must not boot a fresh microVM into a draining host.
+func TestReconcileAfterShutdownLaunchesNothing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	prov := provFunc(func(context.Context, string, string, core.RunnerSpec) error {
+		t.Fatal("Launch must not run once shutdown has begun")
+		return nil
+	})
+	s := New(Options{Max: 4, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 3)
+	s.Drain()
+	if got := s.Running(); got != 0 {
+		t.Fatalf("running=%d want 0", got)
+	}
+}
