@@ -54,12 +54,35 @@ export USER=root
 # "hostedtoolcache"; mount it and point the runner at it so setup-* actions hit
 # the cache instead of downloading. Absent -> actions download exactly as on
 # ubuntu-latest, so the same golden works with or without the drive.
+#
+# The drive is read-only and shared across microVMs, so it is mounted as an
+# overlay LOWER layer under a per-VM tmpfs UPPER. Reads of pre-seeded versions
+# hit the drive (cache hit); when a job requests a version the drive lacks,
+# setup-* downloads and installs it into the writable upper instead of failing
+# with EROFS (cache miss). The upper is tmpfs: ephemeral, discarded with the VM.
 if [ -n "$(command -v blkid)" ] && blkid -L hostedtoolcache >/dev/null 2>&1; then
-	mkdir -p /opt/hostedtoolcache
-	if mount -o ro -L hostedtoolcache /opt/hostedtoolcache 2>/dev/null; then
-		export RUNNER_TOOL_CACHE=/opt/hostedtoolcache
-		export AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
-		echo "firerunner: mounted pre-seeded tool cache at /opt/hostedtoolcache"
+	mkdir -p /opt/hostedtoolcache /opt/.htc-lower
+	if mount -o ro -L hostedtoolcache /opt/.htc-lower 2>/dev/null; then
+		mkdir -p /run/htc
+		mount -t tmpfs tmpfs /run/htc 2>/dev/null
+		mkdir -p /run/htc/upper /run/htc/work
+		if mount -t overlay overlay \
+			-o lowerdir=/opt/.htc-lower,upperdir=/run/htc/upper,workdir=/run/htc/work \
+			/opt/hostedtoolcache 2>/dev/null; then
+			export RUNNER_TOOL_CACHE=/opt/hostedtoolcache
+			export AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
+			echo "firerunner: mounted pre-seeded tool cache (ro drive + tmpfs upper) at /opt/hostedtoolcache"
+		else
+			# Kernel without overlayfs: fall back to a read-only bind so cache
+			# hits still work. Cache misses download to the runner's own temp
+			# dir per setup-* (they will not write into the read-only cache).
+			umount /run/htc 2>/dev/null
+			if mount --bind /opt/.htc-lower /opt/hostedtoolcache 2>/dev/null; then
+				export RUNNER_TOOL_CACHE=/opt/hostedtoolcache
+				export AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
+				echo "firerunner: mounted pre-seeded tool cache (read-only, no overlay) at /opt/hostedtoolcache"
+			fi
+		fi
 	fi
 elif [ -d /opt/hostedtoolcache ] && [ -n "$(ls -A /opt/hostedtoolcache 2>/dev/null)" ]; then
 	# No external drive, but the golden baked a tool cache in (the "full"

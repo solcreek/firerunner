@@ -111,8 +111,11 @@ is an immutable file firerunner reflink-clones per job. Requires `debootstrap`,
 
 `firerunner --toolcache` / `FR_TOOLCACHE` attaches a **separate**, read-only
 `hostedtoolcache`-labelled ext4 to every microVM (mounted at
-`/opt/hostedtoolcache`), so `setup-go` / `setup-node` / `setup-python` find their
-toolchain on disk instead of downloading it per job. Unlike the baked-in cache
+`/opt/hostedtoolcache` as an overlay lower layer under a per-VM tmpfs upper),
+so `setup-go` / `setup-node` / `setup-python` find their toolchain on disk
+instead of downloading it per job — while still being able to install an
+uncached version into the writable tmpfs upper instead of hitting EROFS on the
+read-only drive. Unlike the baked-in cache
 of the `firerunner-ubuntu` full golden, this drive is **decoupled from the OS
 image**: an operator can re-cut it with new versions or more tools without
 rebuilding a rootfs, and one drive is shared by every tier.

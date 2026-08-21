@@ -323,8 +323,11 @@ tool-cache layout and is **labelled `hostedtoolcache`**:
 
 firerunner attaches it to every microVM as a **shared read-only drive** (one
 host image backs all VMs at once), and the golden mounts it by label at
-`/opt/hostedtoolcache`, exporting `RUNNER_TOOL_CACHE`. `setup-*` then hits the
-cache:
+`/opt/hostedtoolcache` as an overlay lower layer under a per-VM tmpfs upper,
+exporting `RUNNER_TOOL_CACHE`. `setup-*` reads pre-seeded versions from the
+drive (cache hit); when it needs a version the drive lacks, it downloads and
+installs into the writable upper instead of failing on the read-only drive
+(cache miss). The upper is tmpfs, so it is discarded with the VM:
 
 ```bash
 firerunner ... --toolcache /var/lib/firerunner/toolcache-go.ext4
