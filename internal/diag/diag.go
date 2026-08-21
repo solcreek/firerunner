@@ -40,6 +40,7 @@ type StatusReport struct {
 	ToolCache *FileStat   `json:"toolcache,omitempty"`
 	Isolation string      `json:"isolation"`
 	Network   NetInfo     `json:"network"`
+	Cache     *CacheInfo  `json:"cache,omitempty"`
 	Workdir   WorkdirInfo `json:"workdir"`
 	Tiers     []TierInfo  `json:"tiers,omitempty"`
 	MicroVMs  VMSummary   `json:"microvms"`
@@ -75,6 +76,19 @@ func (f FileStat) describe() string {
 		return fmt.Sprintf("%s  MISSING", f.Path)
 	}
 	return fmt.Sprintf("%s  (%s, %s)", f.Path, f.Human, f.ModTime)
+}
+
+// CacheInfo describes the self-hosted dependency cache firerunner points
+// microVMs at, when configured. It is nil when caching is off (the default),
+// in which case jobs use GitHub's hosted cache.
+type CacheInfo struct {
+	// Mode is "gateway" (guest builds the URL from its host gateway and Port) or
+	// "url" (an explicit CacheURL is used verbatim).
+	Mode string `json:"mode"`
+	// Port is the local cache-server port published to guests (gateway mode).
+	Port int `json:"port,omitempty"`
+	// URL is the explicit cache-server base URL (url mode).
+	URL string `json:"url,omitempty"`
 }
 
 // NetInfo captures the host network wiring for guest egress.
@@ -188,6 +202,12 @@ func collectStatus(cfg *config.Config, version string) StatusReport {
 		f := statFile(fc.ToolCacheImage)
 		r.ToolCache = &f
 	}
+	switch {
+	case fc.CacheURL != "":
+		r.Cache = &CacheInfo{Mode: "url", URL: fc.CacheURL}
+	case fc.CachePort != 0:
+		r.Cache = &CacheInfo{Mode: "gateway", Port: fc.CachePort}
+	}
 
 	// Tier catalog, when one is configured. Each tier is its own scale set with
 	// its own microVM shape and golden image, all sharing this host.
@@ -245,6 +265,15 @@ func renderStatusText(r StatusReport, w io.Writer) {
 	fmt.Fprintf(tw, "isolation\t%s\n", r.Isolation)
 	fmt.Fprintf(tw, "network\text-iface=%s  egress=%s  subnet=%s  tap=%s*  nft-table=%s\n",
 		ifaceStateStr(r.Network.ExtIface, r.Network.ExtIfaceUp), r.Network.Egress, r.Network.Subnet, r.Network.TapPrefix, r.Network.NFTTable)
+	if r.Cache != nil {
+		if r.Cache.Mode == "url" {
+			fmt.Fprintf(tw, "dep cache\tself-hosted %s\n", r.Cache.URL)
+		} else {
+			fmt.Fprintf(tw, "dep cache\tself-hosted (guest gateway:%d)\n", r.Cache.Port)
+		}
+	} else {
+		fmt.Fprintf(tw, "dep cache\t(none; jobs use GitHub's hosted cache)\n")
+	}
 	fmt.Fprintf(tw, "workdir\t%s (%s)\n", r.Workdir.Path, r.Workdir.FS)
 	tw.Flush()
 
@@ -364,6 +393,11 @@ func runDoctor(cfg *config.Config, version string) DoctorReport {
 	// GitHub API reachability (best-effort; WARN offline, never FAIL).
 	checks = append(checks, apiReach("https://api.github.com/zen"))
 
+	// Self-hosted dependency cache (only when configured).
+	if c := cacheCheck(fc); c != nil {
+		checks = append(checks, *c)
+	}
+
 	failed := 0
 	for _, c := range checks {
 		if c.Level == levelFail {
@@ -465,6 +499,34 @@ func authCheck(cfg *config.Config) Check {
 		return fail("auth", "GitHub App private key unreadable: %v", err)
 	}
 	return pass("auth", "GitHub App (client %s, installation %d)", cfg.AppClientID, cfg.AppInstallID)
+}
+
+// cacheCheck probes the self-hosted dependency cache when one is configured, and
+// is nil otherwise. In gateway mode the cache-server binds 0.0.0.0 on the host,
+// so doctor probes it on localhost; in url mode it probes the given URL. Any
+// HTTP response means the server is listening (there is no health endpoint), so
+// a 404 still passes. It never FAILs (the cache is a pure accelerator).
+func cacheCheck(fc provisioner.FirecrackerConfig) *Check {
+	var probe string
+	switch {
+	case fc.CacheURL != "":
+		probe = fc.CacheURL
+	case fc.CachePort != 0:
+		probe = fmt.Sprintf("http://127.0.0.1:%d/", fc.CachePort)
+	default:
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, probe, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		c := warn("dep-cache", "cache-server %s unreachable: %v (run 'firerunner cache-server')", probe, err)
+		return &c
+	}
+	resp.Body.Close()
+	c := pass("dep-cache", "cache-server reachable at %s (needs a --cache-redirect golden)", probe)
+	return &c
 }
 
 func apiReach(url string) Check {

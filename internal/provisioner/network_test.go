@@ -122,6 +122,22 @@ func TestSetupNetworkRunsOnce(t *testing.T) {
 	}
 }
 
+func TestCacheInputScript(t *testing.T) {
+	got := cacheInputScript("fr", 8099)
+	for _, want := range []string{
+		`insert rule ip filter INPUT iifname "fr*" tcp dport 8099`,
+		`counter accept comment "firerunner-cache-fr"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("cacheInputScript missing %q in:\n%s", want, got)
+		}
+	}
+	// Prefix-keyed comment so peer instances stay idempotent.
+	if other := cacheInputScript("fn", 9000); !strings.Contains(other, `comment "firerunner-cache-fn"`) {
+		t.Fatalf("second instance comment not prefix-keyed:\n%s", other)
+	}
+}
+
 func TestHostForwardScript(t *testing.T) {
 	got := hostForwardScript("enp2s0", "fr")
 	for _, want := range []string{

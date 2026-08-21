@@ -139,6 +139,50 @@ func TestStatus_JSON(t *testing.T) {
 	}
 }
 
+// TestStatus_Cache ensures a configured dependency cache appears in both
+// renderings, and that the default (off) is clearly marked.
+func TestStatus_Cache(t *testing.T) {
+	// Off by default.
+	off := &config.Config{ScaleSetName: "firerunner", Firecracker: provisioner.FirecrackerConfig{WorkDir: t.TempDir(), TapPrefix: "fr", NetBase: 16}}
+	var offBuf bytes.Buffer
+	if err := Status(off, "test", &offBuf, false); err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if !strings.Contains(offBuf.String(), "GitHub's hosted cache") {
+		t.Errorf("default status should note GitHub's hosted cache\n%s", offBuf.String())
+	}
+
+	// Gateway mode (local port).
+	gw := &config.Config{ScaleSetName: "firerunner", Firecracker: provisioner.FirecrackerConfig{WorkDir: t.TempDir(), TapPrefix: "fr", NetBase: 16, CachePort: 8099}}
+	var gwText, gwJSON bytes.Buffer
+	if err := Status(gw, "test", &gwText, false); err != nil {
+		t.Fatalf("Status text: %v", err)
+	}
+	if !strings.Contains(gwText.String(), "gateway:8099") {
+		t.Errorf("gateway status missing port\n%s", gwText.String())
+	}
+	if err := Status(gw, "test", &gwJSON, true); err != nil {
+		t.Fatalf("Status json: %v", err)
+	}
+	var r StatusReport
+	if err := json.Unmarshal(gwJSON.Bytes(), &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if r.Cache == nil || r.Cache.Mode != "gateway" || r.Cache.Port != 8099 {
+		t.Errorf("cache json = %+v, want gateway/8099", r.Cache)
+	}
+
+	// URL mode.
+	u := &config.Config{ScaleSetName: "firerunner", Firecracker: provisioner.FirecrackerConfig{WorkDir: t.TempDir(), TapPrefix: "fr", NetBase: 16, CacheURL: "http://cache.internal:8099"}}
+	var uText bytes.Buffer
+	if err := Status(u, "test", &uText, false); err != nil {
+		t.Fatalf("Status text: %v", err)
+	}
+	if !strings.Contains(uText.String(), "http://cache.internal:8099") {
+		t.Errorf("url status missing URL\n%s", uText.String())
+	}
+}
+
 // TestStatus_Tiers ensures a configured tier catalog appears in both renderings.
 func TestStatus_Tiers(t *testing.T) {
 	cfg := &config.Config{

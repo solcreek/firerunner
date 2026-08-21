@@ -313,6 +313,9 @@ func (f *Firecracker) applyNetwork(ctx context.Context) error {
 	if err := f.ensureHostForward(ctx); err != nil {
 		return err
 	}
+	if err := f.ensureHostCacheInput(ctx); err != nil {
+		return err
+	}
 	f.log.Info("egress network applied", "extIface", f.cfg.ExtIface, "open", rs.Open, "allowedCIDRs", len(rs.Allowed))
 	return nil
 }
@@ -374,6 +377,58 @@ func (f *Firecracker) ensureHostForward(ctx context.Context) error {
 	}
 	f.log.Info("added host forward accept for microVM egress",
 		"extIface", f.cfg.ExtIface, "tapPrefix", f.cfg.TapPrefix)
+	return nil
+}
+
+// cacheInputComment tags the INPUT accept rule firerunner adds for microVM ->
+// host cache-server traffic, keyed by tap prefix so peer instances stay
+// idempotent (same reasoning as forwardComment).
+func cacheInputComment(tapPrefix string) string {
+	return "firerunner-cache-" + tapPrefix
+}
+
+// cacheInputScript returns an nft script that accepts guest -> host traffic to
+// the local cache-server port on firerunner's tap interfaces.
+func cacheInputScript(tapPrefix string, port int) string {
+	tap := tapPrefix + "*"
+	comment := cacheInputComment(tapPrefix)
+	return fmt.Sprintf(
+		"insert rule ip filter INPUT iifname %q tcp dport %d ct state new,established,related counter accept comment %q\n",
+		tap, port, comment,
+	)
+}
+
+// ensureHostCacheInput lets microVMs reach the self-hosted cache-server on their
+// host gateway when the host's ip/filter INPUT policy defaults to drop (ufw,
+// hardened hosts). It is best-effort and idempotent, and a no-op unless a local
+// cache port is configured (a remote --cache-url is reached via egress, not the
+// host INPUT chain) and the INPUT chain actually drops by default.
+func (f *Firecracker) ensureHostCacheInput(ctx context.Context) error {
+	if f.cfg.CachePort == 0 {
+		return nil // no local cache-server to reach, or a remote --cache-url is in use
+	}
+	out, err := f.runOut(ctx, "nft", "list", "chain", "ip", "filter", "INPUT")
+	if err != nil {
+		// No ip/filter INPUT chain (default-accept host): the guest already
+		// reaches the host gateway, nothing to open.
+		f.log.Debug("no ip/filter INPUT chain; skipping host cache accept", "err", err)
+		return nil
+	}
+	if strings.Contains(out, cacheInputComment(f.cfg.TapPrefix)) {
+		return nil // already present
+	}
+	if !strings.Contains(out, "policy drop") {
+		return nil // permissive INPUT policy; the guest can already reach the host
+	}
+	path := filepath.Join(f.cfg.WorkDir, "firerunner-cache-input.nft")
+	if err := os.WriteFile(path, []byte(cacheInputScript(f.cfg.TapPrefix, f.cfg.CachePort)), 0o600); err != nil {
+		return fmt.Errorf("write host cache input ruleset: %w", err)
+	}
+	if err := f.run(ctx, "nft", "-f", path); err != nil {
+		return fmt.Errorf("apply host cache input accept: %w", err)
+	}
+	f.log.Info("added host INPUT accept for microVM cache access",
+		"tapPrefix", f.cfg.TapPrefix, "cachePort", f.cfg.CachePort)
 	return nil
 }
 
