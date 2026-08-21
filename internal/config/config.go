@@ -55,6 +55,21 @@ func (c *Config) RunnerSpec() core.RunnerSpec {
 // FromFlags parses configuration from the given argument list, falling back to
 // FR_* environment variables. It validates required fields.
 func FromFlags(args []string) (*Config, error) {
+	c, err := Parse(args)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// Parse loads configuration exactly like FromFlags but without enforcing
+// required-field validation, so diagnostic subcommands (status, doctor) can
+// inspect and report on a partial or misconfigured deployment instead of
+// refusing to start.
+func Parse(args []string) (*Config, error) {
 	fs := flag.NewFlagSet("firerunner", flag.ContinueOnError)
 	c := &Config{}
 	var labels string
@@ -115,9 +130,6 @@ func FromFlags(args []string) (*Config, error) {
 		}
 	}
 	c.Firecracker.CgroupLimits = splitSemi(jailerCgroup)
-	if err := c.validate(); err != nil {
-		return nil, err
-	}
 	// The provisioner's per-VM network pool is bounded by the runner capacity.
 	c.Firecracker.MaxVMs = c.MaxRunners
 	c.Firecracker.Egress = provisioner.EgressConfig{
