@@ -61,6 +61,14 @@ if [ -n "$(command -v blkid)" ] && blkid -L hostedtoolcache >/dev/null 2>&1; the
 		export AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
 		echo "firerunner: mounted pre-seeded tool cache at /opt/hostedtoolcache"
 	fi
+elif [ -d /opt/hostedtoolcache ] && [ -n "$(ls -A /opt/hostedtoolcache 2>/dev/null)" ]; then
+	# No external drive, but the golden baked a tool cache in (the "full"
+	# runner-images-parity image). Point the runner at it so setup-* actions
+	# resolve versions locally instead of downloading. Base golden has no such
+	# directory, so this is a no-op there and boot behaviour is unchanged.
+	export RUNNER_TOOL_CACHE=/opt/hostedtoolcache
+	export AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
+	echo "firerunner: using baked-in tool cache at /opt/hostedtoolcache"
 fi
 # Ephemeral JIT runner: registers, runs one job, then auto-deregisters.
 ./run.sh --jitconfig "$jit" || echo "firerunner: runner exited non-zero" >&2
