@@ -276,8 +276,10 @@ func repoOf(m *cacheMetadata) string {
 }
 
 // handleCreate reserves a new entry and returns an upload URL, or ok:false when
-// a completed entry with the same key+version already exists (entries are
-// immutable, matching GitHub's "another job may be creating this cache").
+// an entry with the same key+version already exists — completed (immutable) or a
+// still-live reservation (another job is creating it). Keeping reservations
+// unique per key+version is what makes the finalize step unambiguous, matching
+// GitHub's "another job may be creating this cache".
 func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var req createReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -292,10 +294,30 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	key := strings.ToLower(req.Key)
 
 	s.mu.Lock()
-	if e := s.findExact(repo, key, req.Version); e != nil && e.Complete {
-		s.mu.Unlock()
-		writeJSON(w, http.StatusOK, createResp{OK: false, Message: "cache entry already exists"})
-		return
+	if e := s.findExact(repo, key, req.Version); e != nil {
+		if e.Complete {
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, createResp{OK: false, Message: "cache entry already exists"})
+			return
+		}
+		// A reservation for this key+version already exists. Handing out a second
+		// one is the confused-deputy bug: the finalize RPC carries no entry id
+		// (the v2 toolkit correlates by key+version), so with two live
+		// reservations findReserved picks the newest and one caller's Finalize
+		// would publish the other caller's bytes. Keep reservations unique — the
+		// first reserver owns the key until it finalizes or the reservation goes
+		// stale, exactly like GitHub's "another job may be creating this cache".
+		if e.UsedAt >= time.Now().Add(-maxIncompleteAge).Unix() {
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, createResp{OK: false, Message: "cache entry is already being created"})
+			return
+		}
+		// The existing reservation is stale (its upload never completed); reclaim
+		// it so a fresh reservation can take the key over.
+		_ = os.Remove(s.blobPath(e.ID))
+		_ = os.RemoveAll(s.tmpDir(e.ID))
+		delete(s.entries, e.ID)
+		delete(s.staged, e.ID)
 	}
 	e := &Entry{
 		ID:        s.nextID,

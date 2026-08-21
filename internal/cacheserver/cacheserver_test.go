@@ -547,3 +547,38 @@ func TestFinalizedEntryIsImmutable(t *testing.T) {
 	}
 	_ = ts
 }
+
+// TestConcurrentReservationIsRejected verifies a second reservation for a live
+// key+version is refused (ok:false), so two callers cannot hold competing
+// reservations and have one's Finalize publish the other's bytes.
+func TestConcurrentReservationIsRejected(t *testing.T) {
+	_, base := newTestServer(t)
+
+	first := twirp(t, base, "CreateCacheEntry", createReq{Key: "shared", Version: "v"})
+	if ok, _ := first["ok"].(bool); !ok {
+		t.Fatalf("first reservation not ok: %v", first)
+	}
+	firstURL := first["signed_upload_url"].(string)
+
+	second := twirp(t, base, "CreateCacheEntry", createReq{Key: "shared", Version: "v"})
+	if ok, _ := second["ok"].(bool); ok {
+		t.Fatalf("second reservation should be refused, got %v", second)
+	}
+	if url, _ := second["signed_upload_url"].(string); url != "" {
+		t.Fatalf("refused reservation must not return an upload URL, got %q", url)
+	}
+
+	// The first (only) reservation's bytes are what get finalized and restored.
+	putBlob(t, firstURL, []byte("GOOD"))
+	twirp(t, base, "FinalizeCacheEntryUpload", finalizeReq{Key: "shared", Version: "v", SizeBytes: "4"})
+	get := twirp(t, base, "GetCacheEntryDownloadURL", getReq{Key: "shared", Version: "v"})
+	dresp, err := http.Get(get["signed_download_url"].(string))
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer dresp.Body.Close()
+	got, _ := io.ReadAll(dresp.Body)
+	if string(got) != "GOOD" {
+		t.Fatalf("restored %q, want GOOD", got)
+	}
+}
