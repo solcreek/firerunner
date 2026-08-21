@@ -49,5 +49,18 @@ export RUNNER_ALLOW_RUNASROOT=1
 # throwaway microVM, so anchor them explicitly.
 export HOME=/root
 export USER=root
+# Optional pre-seeded tool cache (progressive enhancement). When firerunner
+# attaches the shared read-only tool-cache drive it is labelled
+# "hostedtoolcache"; mount it and point the runner at it so setup-* actions hit
+# the cache instead of downloading. Absent -> actions download exactly as on
+# ubuntu-latest, so the same golden works with or without the drive.
+if [ -n "$(command -v blkid)" ] && blkid -L hostedtoolcache >/dev/null 2>&1; then
+	mkdir -p /opt/hostedtoolcache
+	if mount -o ro -L hostedtoolcache /opt/hostedtoolcache 2>/dev/null; then
+		export RUNNER_TOOL_CACHE=/opt/hostedtoolcache
+		export AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
+		echo "firerunner: mounted pre-seeded tool cache at /opt/hostedtoolcache"
+	fi
+fi
 # Ephemeral JIT runner: registers, runs one job, then auto-deregisters.
 ./run.sh --jitconfig "$jit" || echo "firerunner: runner exited non-zero" >&2

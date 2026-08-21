@@ -36,7 +36,7 @@ func shortSock(t *testing.T) string {
 func TestBuildAPISteps_OrderAndPayloads(t *testing.T) {
 	spec := core.RunnerSpec{VCPU: 4, MemMiB: 8192}
 	steps := buildAPISteps("/vmlinux", "console=ttyS0 reboot=k ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off",
-		"/job/rootfs.ext4", "fr0", "06:00:AC:10:00:02", "JIT-SECRET", spec)
+		"/job/rootfs.ext4", "", "fr0", "06:00:AC:10:00:02", "JIT-SECRET", spec)
 
 	wantOrder := []string{
 		"/boot-source", "/drives/rootfs", "/machine-config",
@@ -100,7 +100,7 @@ func TestConfigure_SendsSequenceOverUnixSocket(t *testing.T) {
 	defer srv.Close()
 
 	f := NewFirecracker(FirecrackerConfig{KernelImage: "/k", GoldenRootFS: "/g"}, testLogger())
-	err = f.configure(context.Background(), sock, "/k", "/rootfs", slotNet(0, "fr", 16), "console=ttyS0", "JIT", core.RunnerSpec{VCPU: 2, MemMiB: 512})
+	err = f.configure(context.Background(), sock, "/k", "/rootfs", "", slotNet(0, "fr", 16), "console=ttyS0", "JIT", core.RunnerSpec{VCPU: 2, MemMiB: 512})
 	if err != nil {
 		t.Fatalf("configure: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestConfigure_PropagatesAPIError(t *testing.T) {
 	defer srv.Close()
 
 	f := NewFirecracker(FirecrackerConfig{KernelImage: "/k"}, testLogger())
-	if err := f.configure(context.Background(), sock, "/k", "/rootfs", slotNet(0, "fr", 16), "console=ttyS0", "JIT", core.RunnerSpec{VCPU: 1, MemMiB: 128}); err == nil {
+	if err := f.configure(context.Background(), sock, "/k", "/rootfs", "", slotNet(0, "fr", 16), "console=ttyS0", "JIT", core.RunnerSpec{VCPU: 1, MemMiB: 128}); err == nil {
 		t.Fatal("expected error from 400 response")
 	}
 }
@@ -343,10 +343,64 @@ func TestJailCgroupDir(t *testing.T) {
 	}
 }
 
+func TestBuildAPISteps_ToolCacheDrive(t *testing.T) {
+	spec := core.RunnerSpec{VCPU: 2, MemMiB: 1024}
+	// Without a tool cache the step list and order are unchanged.
+	none := buildAPISteps("/vmlinux", "console=ttyS0", "/rootfs.ext4", "", "fr0", "06:00:AC:10:00:02", "JIT", spec)
+	for _, s := range none {
+		if s.path == "/drives/toolcache" {
+			t.Fatal("no toolcache drive expected when path is empty")
+		}
+	}
+
+	// With one, a read-only non-root drive appears right after the rootfs, and
+	// InstanceStart stays last.
+	steps := buildAPISteps("/vmlinux", "console=ttyS0", "/rootfs.ext4", "/toolcache.ext4", "fr0", "06:00:AC:10:00:02", "JIT", spec)
+	if steps[len(steps)-1].path != "/actions" {
+		t.Fatal("InstanceStart must remain last")
+	}
+	var rootfsIdx, tcIdx = -1, -1
+	for i, s := range steps {
+		switch s.path {
+		case "/drives/rootfs":
+			rootfsIdx = i
+		case "/drives/toolcache":
+			tcIdx = i
+		}
+	}
+	if tcIdx == -1 {
+		t.Fatal("expected a /drives/toolcache step")
+	}
+	if tcIdx != rootfsIdx+1 {
+		t.Fatalf("toolcache drive at %d, want right after rootfs %d", tcIdx, rootfsIdx)
+	}
+	tc := steps[tcIdx].body.(map[string]any)
+	if tc["path_on_host"] != "/toolcache.ext4" || tc["is_read_only"] != true || tc["is_root_device"] != false {
+		t.Fatalf("toolcache drive body = %v, want ro non-root /toolcache.ext4", tc)
+	}
+}
+
+func TestFcToolCachePath(t *testing.T) {
+	// Unset -> no drive.
+	if got := NewFirecracker(FirecrackerConfig{}, testLogger()).fcToolCachePath(); got != "" {
+		t.Fatalf("unset = %q, want empty", got)
+	}
+	// Direct launch -> the host path is opened directly.
+	direct := NewFirecracker(FirecrackerConfig{ToolCacheImage: "/var/lib/tc.ext4"}, testLogger())
+	if got := direct.fcToolCachePath(); got != "/var/lib/tc.ext4" {
+		t.Fatalf("direct = %q, want host path", got)
+	}
+	// Jailer -> the in-jail staged path.
+	jailed := NewFirecracker(FirecrackerConfig{ToolCacheImage: "/var/lib/tc.ext4", Jailer: true}, testLogger())
+	if got := jailed.fcToolCachePath(); got != "/toolcache.ext4" {
+		t.Fatalf("jailer = %q, want /toolcache.ext4", got)
+	}
+}
+
 func TestBuildAPISteps_InJailPaths(t *testing.T) {
 	// Under the jailer, Firecracker sees the kernel and rootfs at chroot-relative
 	// paths, not the host paths.
-	steps := buildAPISteps("/vmlinux", "console=ttyS0", "/rootfs.ext4", "fr0", "06:00:AC:10:00:02", "JIT", core.RunnerSpec{VCPU: 2, MemMiB: 1024})
+	steps := buildAPISteps("/vmlinux", "console=ttyS0", "/rootfs.ext4", "", "fr0", "06:00:AC:10:00:02", "JIT", core.RunnerSpec{VCPU: 2, MemMiB: 1024})
 	var boot, drive map[string]any
 	for _, s := range steps {
 		switch s.path {

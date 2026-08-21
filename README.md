@@ -162,6 +162,52 @@ Warm runners are still single-use and ephemeral: a pre-booted VM that has not
 run a job is discarded like any other once it does. Size the pool to your peak
 concurrency — `--max-runners` still caps the total.
 
+### Pre-seeded tool cache (`--toolcache`, opt-in)
+
+On GitHub-hosted `ubuntu-latest`, `setup-go` / `setup-node` / `setup-python`
+etc. are fast because the image ships a **hosted tool cache**
+(`/opt/hostedtoolcache`, `RUNNER_TOOL_CACHE`) pre-populated with common language
+versions: the action just finds the version and adds it to `PATH` instead of
+downloading it. A stock golden has no such cache, so every `setup-*` pays the
+download tax (a Go toolchain is ~5–9 s).
+
+`--toolcache <image>` (env `FR_TOOLCACHE`) closes that gap without changing any
+workflow YAML. Point it at a read-only ext4 image that mirrors the hosted
+tool-cache layout and is **labelled `hostedtoolcache`**:
+
+```
+/                      # ext4 labelled "hostedtoolcache"
+└── go/
+    └── 1.26.7/
+        ├── x64/       # the extracted toolchain
+        └── x64.complete
+```
+
+firerunner attaches it to every microVM as a **shared read-only drive** (one
+host image backs all VMs at once), and the golden mounts it by label at
+`/opt/hostedtoolcache`, exporting `RUNNER_TOOL_CACHE`. `setup-*` then hits the
+cache:
+
+```bash
+firerunner ... --toolcache /var/lib/firerunner/toolcache-go.ext4
+```
+
+Design properties:
+
+- **Zero workflow change.** Only `runs-on:` differs from `ubuntu-latest`; the
+  `setup-go@… with: go-version-file: go.mod` step is untouched.
+- **Pure accelerator, always safe.** When the image is absent, or a requested
+  toolchain/version is not in it, `setup-*` falls back to downloading — jobs
+  still pass, just slower. The same golden works with or without the drive.
+- **Opt-in, no bloat.** Include only the toolchains a project actually uses
+  (derive them from its `go.mod` / `setup-*` steps); no kitchen-sink image.
+- Measured on the node tier: `setup-go` for `go 1.26` dropped from **~6 s
+  (download) to ~0 s (cache hit)** with the drive attached.
+
+Under `--jailer` the image is staged read-only into each jail (reflink keeps
+this near-free on a reflink-capable filesystem); otherwise the host path is
+opened directly.
+
 ### Running as a service (systemd)
 
 `deploy/firerunner.service` is a hardened unit template (dedicated `firerunner`

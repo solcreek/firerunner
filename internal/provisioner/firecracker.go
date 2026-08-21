@@ -95,6 +95,15 @@ type FirecrackerConfig struct {
 	// non-root deployment lacks; the jailer already runs as root and joins the
 	// namespace natively via --netns).
 	NetNS bool
+	// ToolCacheImage, when set, is the host path to a read-only ext4 image that
+	// mirrors GitHub's hosted-tool-cache layout (e.g. go/<ver>/x64/ plus the
+	// x64.complete marker, labelled "hostedtoolcache"). firerunner attaches it to
+	// every microVM as a shared read-only drive; the golden mounts it at
+	// /opt/hostedtoolcache and points RUNNER_TOOL_CACHE at it, so setup-* actions
+	// hit the pre-seeded cache instead of downloading. It is opt-in and a pure
+	// accelerator: when unset (or when a requested toolchain is not in the image)
+	// setup-* falls back to downloading, so jobs still pass either way.
+	ToolCacheImage string
 }
 
 // DefaultBootArgs is a minimal, quiet serial console command line. reboot=k is
@@ -208,7 +217,7 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 	}
 
 	bootArgs := composeBootArgs(f.cfg.BootArgs, vnet)
-	if err := f.configure(ctx, sock, kernelPath, rootfsPath, vnet, bootArgs, jitConfig, spec); err != nil {
+	if err := f.configure(ctx, sock, kernelPath, rootfsPath, f.fcToolCachePath(), vnet, bootArgs, jitConfig, spec); err != nil {
 		_ = cmd.Process.Kill()
 		return fmt.Errorf("configure microVM: %w", err)
 	}
@@ -381,8 +390,8 @@ type apiStep struct {
 // It is a pure function so tests can assert the exact order and payloads —
 // notably that /mmds (the JIT secret) is set before InstanceStart, and that
 // InstanceStart is always last.
-func buildAPISteps(kernelImage, bootArgs, rootfs, tap, guestMAC, jit string, spec core.RunnerSpec) []apiStep {
-	return []apiStep{
+func buildAPISteps(kernelImage, bootArgs, rootfs, toolcache, tap, guestMAC, jit string, spec core.RunnerSpec) []apiStep {
+	steps := []apiStep{
 		{"/boot-source", map[string]any{
 			"kernel_image_path": kernelImage,
 			"boot_args":         bootArgs,
@@ -393,37 +402,63 @@ func buildAPISteps(kernelImage, bootArgs, rootfs, tap, guestMAC, jit string, spe
 			"is_root_device": true,
 			"is_read_only":   false,
 		}},
-		{"/machine-config", map[string]any{
+	}
+	// Optional shared read-only tool-cache drive. Read-only means the same host
+	// image can back many microVMs at once without conflict.
+	if toolcache != "" {
+		steps = append(steps, apiStep{"/drives/toolcache", map[string]any{
+			"drive_id":       "toolcache",
+			"path_on_host":   toolcache,
+			"is_root_device": false,
+			"is_read_only":   true,
+		}})
+	}
+	return append(steps,
+		apiStep{"/machine-config", map[string]any{
 			"vcpu_count":   spec.VCPU,
 			"mem_size_mib": spec.MemMiB,
 		}},
-		{"/network-interfaces/eth0", map[string]any{
+		apiStep{"/network-interfaces/eth0", map[string]any{
 			"iface_id":      "eth0",
 			"host_dev_name": tap,
 			"guest_mac":     guestMAC,
 		}},
-		{"/mmds/config", map[string]any{
+		apiStep{"/mmds/config", map[string]any{
 			"version":            "V2",
 			"network_interfaces": []string{"eth0"},
 			"ipv4_address":       "169.254.169.254",
 		}},
-		{"/mmds", map[string]any{"jitconfig": jit}},
-		{"/actions", map[string]any{"action_type": "InstanceStart"}},
-	}
+		apiStep{"/mmds", map[string]any{"jitconfig": jit}},
+		apiStep{"/actions", map[string]any{"action_type": "InstanceStart"}},
+	)
 }
 
 // configure runs the Firecracker API sequence. MMDS config and data MUST be set
 // before InstanceStart so the JIT secret is available to the guest at boot. The
 // kernel and rootfs paths are given as Firecracker will see them (host paths for
 // a direct launch, in-jail paths such as /vmlinux under the jailer).
-func (f *Firecracker) configure(ctx context.Context, sock, kernelPath, rootfs string, n vmNet, bootArgs, jit string, spec core.RunnerSpec) error {
+func (f *Firecracker) configure(ctx context.Context, sock, kernelPath, rootfs, toolcache string, n vmNet, bootArgs, jit string, spec core.RunnerSpec) error {
 	cl := newUnixClient(sock)
-	for _, s := range buildAPISteps(kernelPath, bootArgs, rootfs, n.tap, n.guestMAC, jit, spec) {
+	for _, s := range buildAPISteps(kernelPath, bootArgs, rootfs, toolcache, n.tap, n.guestMAC, jit, spec) {
 		if err := putJSON(ctx, cl, s.path, s.body); err != nil {
 			return fmt.Errorf("PUT %s: %w", s.path, err)
 		}
 	}
 	return nil
+}
+
+// fcToolCachePath returns the tool-cache image path as Firecracker will see it,
+// or "" when no tool cache is configured. Under the jailer the image is staged
+// inside the chroot, so the VMM sees the in-jail path; otherwise it opens the
+// host path directly.
+func (f *Firecracker) fcToolCachePath() string {
+	if f.cfg.ToolCacheImage == "" {
+		return ""
+	}
+	if f.cfg.Jailer {
+		return "/toolcache.ext4"
+	}
+	return f.cfg.ToolCacheImage
 }
 
 // jailChrootRoot returns the host path to a microVM's jail root, where its
@@ -511,6 +546,20 @@ func (f *Firecracker) prepare(ctx context.Context, name string, vnet vmNet, cons
 			if err := os.Chown(p, f.cfg.JailUID, f.cfg.JailGID); err != nil {
 				cleanup()
 				return nil, "", "", "", nil, fmt.Errorf("chown %s to jail user: %w", p, err)
+			}
+		}
+		// Stage the shared read-only tool cache into the jail so the chrooted VMM
+		// can open it at /toolcache.ext4. reflink keeps this near-free on a
+		// reflink-capable filesystem; the jail user needs read access.
+		if f.cfg.ToolCacheImage != "" {
+			tc := filepath.Join(root, "toolcache.ext4")
+			if err := f.run(ctx, "cp", "--reflink=auto", f.cfg.ToolCacheImage, tc); err != nil {
+				cleanup()
+				return nil, "", "", "", nil, fmt.Errorf("stage tool cache into jail: %w", err)
+			}
+			if err := os.Chown(tc, f.cfg.JailUID, f.cfg.JailGID); err != nil {
+				cleanup()
+				return nil, "", "", "", nil, fmt.Errorf("chown tool cache to jail user: %w", err)
 			}
 		}
 		var nsPath string

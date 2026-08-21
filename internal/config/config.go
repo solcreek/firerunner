@@ -93,6 +93,7 @@ func FromFlags(args []string) (*Config, error) {
 	var jailerCgroup string
 	fs.StringVar(&jailerCgroup, "jailer-cgroup", env("FR_JAILER_CGROUP", ""), "semicolon-separated cgroup v2 limits applied to each microVM via the jailer, each <file>=<value> (e.g. \"memory.max=2147483648;cpu.max=200000;pids.max=512\"); requires --jailer")
 	fs.BoolVar(&c.Firecracker.NetNS, "netns", envBool("FR_NETNS", false), "run each microVM in its own network namespace (tap lives in the netns, veth uplink to the host); strongest network isolation, requires --jailer")
+	fs.StringVar(&c.Firecracker.ToolCacheImage, "toolcache", env("FR_TOOLCACHE", ""), "path to a read-only ext4 image (labelled \"hostedtoolcache\", mirroring GitHub's tool-cache layout) attached to every microVM so setup-* actions hit a pre-seeded cache instead of downloading; opt-in accelerator, jobs fall back to downloading when unset")
 
 	var egress, dnsServers string
 	var metaRefresh time.Duration
@@ -175,6 +176,11 @@ func (c *Config) validate() error {
 		return fmt.Errorf("--jailer-cgroup requires --jailer")
 	case c.Firecracker.NetNS && !c.Firecracker.Jailer:
 		return fmt.Errorf("--netns requires --jailer")
+	}
+	if c.Firecracker.ToolCacheImage != "" {
+		if _, err := os.Stat(c.Firecracker.ToolCacheImage); err != nil {
+			return fmt.Errorf("--toolcache image %q not accessible: %w", c.Firecracker.ToolCacheImage, err)
+		}
 	}
 	for _, l := range c.Firecracker.CgroupLimits {
 		if !strings.Contains(l, "=") {

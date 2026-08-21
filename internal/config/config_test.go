@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -143,6 +144,26 @@ func TestFromFlags_NetNS(t *testing.T) {
 func TestFromFlags_NetNSRequiresJailer(t *testing.T) {
 	if _, err := FromFlags(append(baseArgs(), "--netns")); err == nil {
 		t.Fatal("expected error: --netns requires --jailer")
+	}
+}
+
+func TestFromFlags_ToolCache(t *testing.T) {
+	img := filepath.Join(t.TempDir(), "toolcache-go.ext4")
+	if err := os.WriteFile(img, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := FromFlags(append(baseArgs(), "--toolcache", img))
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	if c.Firecracker.ToolCacheImage != img {
+		t.Fatalf("ToolCacheImage = %q, want %q", c.Firecracker.ToolCacheImage, img)
+	}
+}
+
+func TestFromFlags_ToolCacheMissing(t *testing.T) {
+	if _, err := FromFlags(append(baseArgs(), "--toolcache", "/no/such/toolcache.ext4")); err == nil {
+		t.Fatal("expected error for a missing --toolcache image")
 	}
 }
 
