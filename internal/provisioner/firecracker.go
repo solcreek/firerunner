@@ -654,8 +654,10 @@ func jailCgroupDir(binary, id string) string {
 // jailer joins that named network namespace, where the per-slot tap lives. With
 // cgroup-version 2 and no CgroupLimits the jailer creates no cgroup (systemd
 // already scopes the service); each CgroupLimit adds a --cgroup flag so the
-// jailer places the VMM in its own cgroup and applies the limit. It is a pure
-// function so the argv can be asserted in tests.
+// jailer places the VMM in its own cgroup and applies the limit. --new-pid-ns
+// puts the VMM in its own PID namespace so it cannot see or signal host
+// processes (and dies with the namespace). It is a pure function so the argv can
+// be asserted in tests.
 func buildJailerArgs(cfg FirecrackerConfig, id, nsPath string) []string {
 	args := []string{
 		"--id", id,
@@ -664,6 +666,7 @@ func buildJailerArgs(cfg FirecrackerConfig, id, nsPath string) []string {
 		"--gid", strconv.Itoa(cfg.JailGID),
 		"--cgroup-version", "2",
 		"--chroot-base-dir", cfg.ChrootBase,
+		"--new-pid-ns",
 	}
 	if nsPath != "" {
 		args = append(args, "--netns", nsPath)

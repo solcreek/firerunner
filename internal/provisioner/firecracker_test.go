@@ -268,6 +268,7 @@ func TestBuildJailerArgs(t *testing.T) {
 		"--gid", "954",
 		"--cgroup-version", "2",
 		"--chroot-base-dir", "/srv/jailer",
+		"--new-pid-ns",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %d args %v, want %d", len(got), got, len(want))
