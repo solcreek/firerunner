@@ -43,6 +43,10 @@ type ScaleSet struct {
 	client     *scaleset.Client
 	session    *scaleset.MessageSessionClient
 	scaleSetID int
+	// created is true only when this process created the scale set (rather than
+	// reusing a pre-existing one). Close deletes the scale set only when created,
+	// so it never deregisters a set another instance is relying on.
+	created bool
 }
 
 // New builds a scaleset client, registers the runner scale set, and opens a
@@ -108,7 +112,7 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 	cfg.Logger.Info("registered runner scale set",
 		"name", cfg.Name, "scaleSetID", scaleSet.ID, "group", cfg.RunnerGroup, "reused", reused)
 
-	return &ScaleSet{cfg: cfg, log: cfg.Logger, client: client, session: session, scaleSetID: scaleSet.ID}, nil
+	return &ScaleSet{cfg: cfg, log: cfg.Logger, client: client, session: session, scaleSetID: scaleSet.ID, created: !reused}, nil
 }
 
 // openSessionWithRetry opens a message session, retrying while GitHub reports a
@@ -167,9 +171,16 @@ func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc) error {
 	return l.Run(ctx, &scaler{onDesired: onDesired, minRunners: s.cfg.MinRunners, log: s.log})
 }
 
-// Close deregisters the scale set and closes the message session.
+// Close deregisters the scale set and closes the message session. It deletes the
+// scale set only when this process created it; a scale set we merely reused (it
+// existed from a prior run or belongs to another instance) is left in place so
+// closing one instance never tears out a set another is depending on.
 func (s *ScaleSet) Close(ctx context.Context) error {
 	_ = s.session.Close(ctx)
+	if !s.created {
+		s.log.Info("leaving reused runner scale set registered", "scaleSetID", s.scaleSetID)
+		return nil
+	}
 	if err := s.client.DeleteRunnerScaleSet(ctx, s.scaleSetID); err != nil {
 		return fmt.Errorf("delete runner scale set: %w", err)
 	}
