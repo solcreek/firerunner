@@ -464,6 +464,11 @@ runner overwrites `ACTIONS_RESULTS_URL` with the value from its per-job message:
    exported. Without this patch the runner overrides our URL and caching stays on
    GitHub.
 
+Both pieces are required together. A cache-redirect golden run **without**
+`--cache-port`/`--cache-url` disables caching entirely: the runner no longer
+sets `ACTIONS_RESULTS_URL` (it writes the dead name) and firerunner exports
+nothing, so `actions/cache` has no endpoint. Jobs still run, just with no cache.
+
 ```bash
 # 1. build a cache-redirect golden (pair it with a --toolcache drive as usual):
 sudo images/build-ubuntu-rootfs.sh --toolset minimal --cache-redirect \

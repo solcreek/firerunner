@@ -227,8 +227,10 @@ DOCKERFILE
 # while actions/cache (a separate Node process) still reads the real
 # ACTIONS_RESULTS_URL that firerunner-run.sh exported. The rename is same-length,
 # so binary offsets are preserved and the runner keeps working. This golden MUST
-# be paired with a firerunner --cache-port/--cache-url deployment; on its own it
-# only changes which env var name holds GitHub's URL (caching still works).
+# be paired with a firerunner --cache-port/--cache-url deployment: only then does
+# firerunner-run.sh export ACTIONS_RESULTS_URL. On its own the runner no longer
+# sets it either (it now writes the dead name), so actions/cache has no endpoint
+# and caching is disabled — the job still runs, just without any cache.
 #
 # The string lives in the .NET assembly's user-string heap as UTF-16LE (a null
 # byte after each character), so we patch that encoding (with an ASCII fallback
