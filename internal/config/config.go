@@ -4,6 +4,7 @@
 package config
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -36,10 +37,56 @@ type Config struct {
 	VCPU   int
 	MemMiB int
 
+	// Tiers is an optional catalog of runner tiers served from this one
+	// process. Each tier is its own GitHub scale set (developers select it with
+	// runs-on: <name>) with its own microVM shape and golden image, while all
+	// tiers share the host provisioner: kernel, tool cache, network and the
+	// MaxRunners slot budget. When empty, EffectiveTiers derives a single tier
+	// from the top-level scalar fields, so a zero-config deployment is unchanged.
+	Tiers     []Tier
+	TiersPath string
+
 	Firecracker provisioner.FirecrackerConfig
 
 	LogLevel  string
 	LogFormat string
+}
+
+// Tier is one runner tier: a named scale set with its own microVM shape and
+// warm/max bounds. Developers pick a tier by its name via runs-on; the operator
+// defines the catalog. vcpu/mem and the golden image vary per tier; the kernel,
+// tool cache and network are shared by all tiers in the process.
+type Tier struct {
+	Name   string   `json:"name"`
+	Labels []string `json:"labels,omitempty"`
+	VCPU   int      `json:"vcpu"`
+	MemMiB int      `json:"mem_mib"`
+	Golden string   `json:"golden"`
+	Min    int      `json:"min"`
+	Max    int      `json:"max"`
+}
+
+// Spec returns the microVM spec for the tier.
+func (t Tier) Spec() core.RunnerSpec {
+	return core.RunnerSpec{Labels: t.Labels, VCPU: t.VCPU, MemMiB: t.MemMiB, RootFS: t.Golden}
+}
+
+// EffectiveTiers returns the configured tier catalog, or a single tier
+// synthesized from the top-level scalar config when no catalog is set. This
+// keeps the zero-config, single-tier deployment behaving exactly as before.
+func (c *Config) EffectiveTiers() []Tier {
+	if len(c.Tiers) > 0 {
+		return c.Tiers
+	}
+	return []Tier{{
+		Name:   c.ScaleSetName,
+		Labels: c.Labels,
+		VCPU:   c.VCPU,
+		MemMiB: c.MemMiB,
+		Golden: c.Firecracker.GoldenRootFS,
+		Min:    c.MinRunners,
+		Max:    c.MaxRunners,
+	}}
 }
 
 // RunnerSpec derives the microVM spec from the config.
@@ -89,6 +136,8 @@ func Parse(args []string) (*Config, error) {
 	fs.IntVar(&c.VCPU, "vcpu", envInt("FR_VCPU", 4), "vCPUs per microVM")
 	fs.IntVar(&c.MemMiB, "mem-mib", envInt("FR_MEM_MIB", 8192), "guest memory (MiB) per microVM")
 
+	fs.StringVar(&c.TiersPath, "tiers", env("FR_TIERS", ""), "path to a JSON tier catalog (array of {name,vcpu,mem_mib,golden,min,max,labels}). When set, firerunner serves every tier from this one process and developers pick one with runs-on: <name>; --max-runners is the shared slot budget. When unset, a single tier is derived from --name/--vcpu/--mem-mib/--golden.")
+
 	fs.StringVar(&c.Firecracker.Binary, "firecracker-bin", env("FR_FIRECRACKER_BIN", "firecracker"), "path to firecracker binary")
 	fs.StringVar(&c.Firecracker.KernelImage, "kernel", env("FR_KERNEL", ""), "path to guest kernel (vmlinux) (required)")
 	fs.StringVar(&c.Firecracker.GoldenRootFS, "golden", env("FR_GOLDEN", ""), "path to immutable golden rootfs (required)")
@@ -131,13 +180,37 @@ func Parse(args []string) (*Config, error) {
 	}
 	c.Firecracker.CgroupLimits = splitSemi(jailerCgroup)
 	// The provisioner's per-VM network pool is bounded by the runner capacity.
+	// With a tier catalog this is the slot budget shared across all tiers.
 	c.Firecracker.MaxVMs = c.MaxRunners
+	if c.TiersPath != "" {
+		tiers, err := loadTiers(c.TiersPath)
+		if err != nil {
+			return nil, err
+		}
+		c.Tiers = tiers
+	}
 	c.Firecracker.Egress = provisioner.EgressConfig{
 		Categories:      splitCSV(egress),
 		DNSServers:      splitCSV(dnsServers),
 		RefreshInterval: metaRefresh,
 	}
 	return c, nil
+}
+
+// loadTiers reads and decodes a JSON tier-catalog file.
+func loadTiers(path string) ([]Tier, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read tiers file: %w", err)
+	}
+	var tiers []Tier
+	if err := json.Unmarshal(b, &tiers); err != nil {
+		return nil, fmt.Errorf("parse tiers file %s: %w", path, err)
+	}
+	if len(tiers) == 0 {
+		return nil, fmt.Errorf("tiers file %s defines no tiers", path)
+	}
+	return tiers, nil
 }
 
 // splitCSV splits a comma-separated list, trimming spaces and dropping empties.
@@ -170,8 +243,8 @@ func (c *Config) validate() error {
 		return fmt.Errorf("--url is required")
 	case c.Firecracker.KernelImage == "":
 		return fmt.Errorf("--kernel is required")
-	case c.Firecracker.GoldenRootFS == "":
-		return fmt.Errorf("--golden is required")
+	case c.Firecracker.GoldenRootFS == "" && len(c.Tiers) == 0:
+		return fmt.Errorf("--golden is required (or configure a tier catalog with --tiers)")
 	case c.Firecracker.ExtIface == "":
 		return fmt.Errorf("--ext-iface is required for microVM egress")
 	case c.MaxRunners < 1:
@@ -189,6 +262,11 @@ func (c *Config) validate() error {
 	case c.Firecracker.NetNS && !c.Firecracker.Jailer:
 		return fmt.Errorf("--netns requires --jailer")
 	}
+	if len(c.Tiers) > 0 {
+		if err := c.validateTiers(); err != nil {
+			return err
+		}
+	}
 	if c.Firecracker.ToolCacheImage != "" {
 		if _, err := os.Stat(c.Firecracker.ToolCacheImage); err != nil {
 			return fmt.Errorf("--toolcache image %q not accessible: %w", c.Firecracker.ToolCacheImage, err)
@@ -202,7 +280,40 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// ResolvePrivateKey returns the GitHub App private key in PEM form. The
+// validateTiers checks a tier catalog: each tier must be well-formed and
+// uniquely named, and the tiers' warm pools must fit within the shared slot
+// budget (--max-runners) so they can all stay warm at once.
+func (c *Config) validateTiers() error {
+	seen := make(map[string]bool, len(c.Tiers))
+	totalMin := 0
+	for i, t := range c.Tiers {
+		switch {
+		case t.Name == "":
+			return fmt.Errorf("tier %d: name is required", i)
+		case seen[t.Name]:
+			return fmt.Errorf("tier %q: duplicate name", t.Name)
+		case t.VCPU < 1:
+			return fmt.Errorf("tier %q: vcpu must be >= 1", t.Name)
+		case t.MemMiB < 128:
+			return fmt.Errorf("tier %q: mem_mib must be >= 128", t.Name)
+		case t.Golden == "":
+			return fmt.Errorf("tier %q: golden is required", t.Name)
+		case t.Max < 1:
+			return fmt.Errorf("tier %q: max must be >= 1", t.Name)
+		case t.Min < 0:
+			return fmt.Errorf("tier %q: min must be >= 0", t.Name)
+		case t.Min > t.Max:
+			return fmt.Errorf("tier %q: min (%d) must not exceed max (%d)", t.Name, t.Min, t.Max)
+		}
+		seen[t.Name] = true
+		totalMin += t.Min
+	}
+	if totalMin > c.MaxRunners {
+		return fmt.Errorf("tiers' warm pools sum to %d but --max-runners (the shared slot budget) is %d", totalMin, c.MaxRunners)
+	}
+	return nil
+}
+
 // configured value may be either the PEM contents or a path to a PEM file.
 func (c *Config) ResolvePrivateKey() (string, error) {
 	if c.AppPrivateKey == "" {

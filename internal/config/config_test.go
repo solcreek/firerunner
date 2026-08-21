@@ -167,6 +167,103 @@ func TestFromFlags_ToolCacheMissing(t *testing.T) {
 	}
 }
 
+func TestEffectiveTiers_DefaultSingleTier(t *testing.T) {
+	c, err := FromFlags(append(baseArgs(), "--name", "fr", "--vcpu", "2", "--mem-mib", "4096", "--max-runners", "8", "--min-runners", "1"))
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	tiers := c.EffectiveTiers()
+	if len(tiers) != 1 {
+		t.Fatalf("want 1 synthesized tier, got %d", len(tiers))
+	}
+	tr := tiers[0]
+	if tr.Name != "fr" || tr.VCPU != 2 || tr.MemMiB != 4096 || tr.Golden != "/golden.ext4" || tr.Min != 1 || tr.Max != 8 {
+		t.Fatalf("synthesized tier = %+v", tr)
+	}
+	if spec := tr.Spec(); spec.VCPU != 2 || spec.RootFS != "/golden.ext4" {
+		t.Fatalf("tier spec = %+v", spec)
+	}
+}
+
+func writeTiers(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "tiers.json")
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestFromFlags_TierCatalog(t *testing.T) {
+	p := writeTiers(t, `[
+	  {"name":"firerunner","vcpu":2,"mem_mib":4096,"golden":"/g/base.ext4","min":1,"max":8},
+	  {"name":"firerunner-8c16g","vcpu":8,"mem_mib":16384,"golden":"/g/base.ext4","min":0,"max":2},
+	  {"name":"firerunner-node","labels":["node"],"vcpu":2,"mem_mib":4096,"golden":"/g/node.ext4","min":0,"max":4}
+	]`)
+	c, err := FromFlags(append(baseArgs(), "--tiers", p, "--max-runners", "8"))
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	tiers := c.EffectiveTiers()
+	if len(tiers) != 3 {
+		t.Fatalf("want 3 tiers, got %d", len(tiers))
+	}
+	if tiers[1].Name != "firerunner-8c16g" || tiers[1].VCPU != 8 || tiers[1].MemMiB != 16384 {
+		t.Fatalf("tier[1] = %+v", tiers[1])
+	}
+	if tiers[2].Golden != "/g/node.ext4" || len(tiers[2].Labels) != 1 || tiers[2].Labels[0] != "node" {
+		t.Fatalf("tier[2] = %+v", tiers[2])
+	}
+}
+
+func TestFromFlags_TierCatalogSatisfiesGolden(t *testing.T) {
+	// A tier catalog replaces the top-level --golden requirement.
+	p := writeTiers(t, `[{"name":"firerunner","vcpu":2,"mem_mib":4096,"golden":"/g/base.ext4","min":0,"max":4}]`)
+	args := []string{"--url", "u", "--kernel", "/k", "--ext-iface", "eth0", "--token", "t", "--tiers", p}
+	if _, err := FromFlags(args); err != nil {
+		t.Fatalf("tier catalog should satisfy the golden requirement: %v", err)
+	}
+}
+
+func TestFromFlags_TierCatalogErrors(t *testing.T) {
+	cases := map[string]string{
+		"empty array":     `[]`,
+		"missing name":    `[{"vcpu":2,"mem_mib":4096,"golden":"/g","max":2}]`,
+		"low vcpu":        `[{"name":"t","vcpu":0,"mem_mib":4096,"golden":"/g","max":2}]`,
+		"low mem":         `[{"name":"t","vcpu":2,"mem_mib":64,"golden":"/g","max":2}]`,
+		"no golden":       `[{"name":"t","vcpu":2,"mem_mib":4096,"max":2}]`,
+		"zero max":        `[{"name":"t","vcpu":2,"mem_mib":4096,"golden":"/g","max":0}]`,
+		"min over max":    `[{"name":"t","vcpu":2,"mem_mib":4096,"golden":"/g","min":3,"max":2}]`,
+		"duplicate names": `[{"name":"t","vcpu":2,"mem_mib":4096,"golden":"/g","max":2},{"name":"t","vcpu":2,"mem_mib":4096,"golden":"/g","max":2}]`,
+		"bad json":        `{not json}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := writeTiers(t, body)
+			if _, err := FromFlags(append(baseArgs(), "--tiers", p, "--max-runners", "8")); err == nil {
+				t.Fatalf("expected error for %q", name)
+			}
+		})
+	}
+}
+
+func TestFromFlags_TierWarmPoolsExceedBudget(t *testing.T) {
+	// Warm pools sum to 5 but the shared slot budget is 4.
+	p := writeTiers(t, `[
+	  {"name":"a","vcpu":2,"mem_mib":4096,"golden":"/g","min":3,"max":4},
+	  {"name":"b","vcpu":2,"mem_mib":4096,"golden":"/g","min":2,"max":4}
+	]`)
+	if _, err := FromFlags(append(baseArgs(), "--tiers", p, "--max-runners", "4")); err == nil {
+		t.Fatal("expected error: warm pools exceed the shared slot budget")
+	}
+}
+
+func TestFromFlags_TierFileMissing(t *testing.T) {
+	if _, err := FromFlags(append(baseArgs(), "--tiers", "/no/such/tiers.json")); err == nil {
+		t.Fatal("expected error for a missing tiers file")
+	}
+}
+
 func TestParseLevel(t *testing.T) {
 	if parseLevel("debug").String() != "DEBUG" {
 		t.Fatal("debug")
