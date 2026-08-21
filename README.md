@@ -362,7 +362,9 @@ Design properties:
   `setup-go@… with: go-version-file: go.mod` step is untouched.
 - **Pure accelerator, always safe.** When the image is absent, or a requested
   toolchain/version is not in it, `setup-*` falls back to downloading — jobs
-  still pass, just slower. The same golden works with or without the drive.
+  still pass, just slower. A cache miss copy-up lands on the per-VM rootfs
+  (disk-backed and discarded with the VM), not in guest RAM. The same golden
+  works with or without the drive.
 - **Opt-in, no bloat.** Include only the toolchains a project actually uses
   (derive them from its `go.mod` / `setup-*` steps); no kitchen-sink image.
 - Measured on the node tier: `setup-go` for `go 1.26` dropped from **~6 s
