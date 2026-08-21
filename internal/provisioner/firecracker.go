@@ -460,17 +460,29 @@ func (f *Firecracker) ensureHostForward(ctx context.Context) error {
 }
 
 // cacheInputComment tags the INPUT accept rule firerunner adds for microVM ->
-// host cache-server traffic, keyed by tap prefix so peer instances stay
-// idempotent (same reasoning as forwardComment).
-func cacheInputComment(tapPrefix string) string {
-	return "firerunner-cache-" + tapPrefix
+// host cache-server traffic, keyed by both tap prefix (so peer instances stay
+// idempotent, same reasoning as forwardComment) and port. The port is part of
+// the tag so that changing --cache-port is detected: the old port's rule no
+// longer matches the wanted comment, so it is swept as stale and the new one
+// inserted, instead of the port-less comment matching forever and leaving the
+// old port open while never opening the new one.
+func cacheInputComment(tapPrefix string, port int) string {
+	return fmt.Sprintf("firerunner-cache-%s-%d", tapPrefix, port)
+}
+
+// cacheInputCommentPrefix matches this instance's cache-input rules on any port.
+// The trailing "-" before the port keeps it from matching a different prefix
+// whose name extends this one (letters-only prefixes plus a numeric port make
+// the "-<port>" boundary unambiguous).
+func cacheInputCommentPrefix(tapPrefix string) string {
+	return "firerunner-cache-" + tapPrefix + "-"
 }
 
 // cacheInputScript returns an nft script that accepts guest -> host traffic to
 // the local cache-server port on firerunner's tap interfaces.
 func cacheInputScript(tapPrefix string, port int) string {
 	tap := tapPrefix + "*"
-	comment := cacheInputComment(tapPrefix)
+	comment := cacheInputComment(tapPrefix, port)
 	return fmt.Sprintf(
 		"insert rule ip filter INPUT iifname %q tcp dport %d ct state new,established,related counter accept comment %q\n",
 		tap, port, comment,
@@ -481,20 +493,26 @@ func cacheInputScript(tapPrefix string, port int) string {
 // host gateway when the host's ip/filter INPUT policy defaults to drop (ufw,
 // hardened hosts). It is best-effort and idempotent, and a no-op unless a local
 // cache port is configured (a remote --cache-url is reached via egress, not the
-// host INPUT chain) and the INPUT chain actually drops by default.
+// host INPUT chain) and the INPUT chain actually drops by default. It first
+// sweeps any of this instance's cache rules left over from a previous, different
+// --cache-port so a port change never strands the guest or leaves the old port
+// open.
 func (f *Firecracker) ensureHostCacheInput(ctx context.Context) error {
 	if f.cfg.CachePort == 0 {
 		return nil // no local cache-server to reach, or a remote --cache-url is in use
 	}
-	out, err := f.runOut(ctx, "nft", "list", "chain", "ip", "filter", "INPUT")
+	out, err := f.runOut(ctx, "nft", "-a", "list", "chain", "ip", "filter", "INPUT")
 	if err != nil {
 		// No ip/filter INPUT chain (default-accept host): the guest already
 		// reaches the host gateway, nothing to open.
 		f.log.Debug("no ip/filter INPUT chain; skipping host cache accept", "err", err)
 		return nil
 	}
-	if strings.Contains(out, cacheInputComment(f.cfg.TapPrefix)) {
-		return nil // already present
+	if err := f.removeStaleCacheInput(ctx, out); err != nil {
+		return err
+	}
+	if strings.Contains(out, cacheInputComment(f.cfg.TapPrefix, f.cfg.CachePort)) {
+		return nil // the rule for the current port is already present
 	}
 	if !strings.Contains(out, "policy drop") {
 		return nil // permissive INPUT policy; the guest can already reach the host
@@ -509,6 +527,40 @@ func (f *Firecracker) ensureHostCacheInput(ctx context.Context) error {
 	f.log.Info("added host INPUT accept for microVM cache access",
 		"tapPrefix", f.cfg.TapPrefix, "cachePort", f.cfg.CachePort)
 	return nil
+}
+
+// removeStaleCacheInput deletes this instance's cache-input rules whose port no
+// longer matches the configured one, using the rule handles in an `nft -a`
+// listing. Rules for the current port are kept.
+func (f *Firecracker) removeStaleCacheInput(ctx context.Context, listing string) error {
+	prefix := cacheInputCommentPrefix(f.cfg.TapPrefix)
+	current := cacheInputComment(f.cfg.TapPrefix, f.cfg.CachePort)
+	for _, line := range strings.Split(listing, "\n") {
+		if !strings.Contains(line, prefix) || strings.Contains(line, current) {
+			continue
+		}
+		handle := parseNFTHandle(line)
+		if handle == "" {
+			continue
+		}
+		if err := f.run(ctx, "nft", "delete", "rule", "ip", "filter", "INPUT", "handle", handle); err != nil {
+			return fmt.Errorf("delete stale cache input rule (handle %s): %w", handle, err)
+		}
+		f.log.Info("removed stale host INPUT cache rule after cache-port change",
+			"handle", handle, "tapPrefix", f.cfg.TapPrefix, "cachePort", f.cfg.CachePort)
+	}
+	return nil
+}
+
+// parseNFTHandle extracts the rule handle from an `nft -a` listing line, which
+// ends in "# handle N". It returns "" when the line carries no handle.
+func parseNFTHandle(line string) string {
+	const marker = "# handle "
+	i := strings.LastIndex(line, marker)
+	if i < 0 {
+		return ""
+	}
+	return strings.TrimSpace(line[i+len(marker):])
 }
 
 // openConsole returns the writer for the guest serial console. When LogDir is

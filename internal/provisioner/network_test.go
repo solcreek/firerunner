@@ -122,19 +122,99 @@ func TestSetupNetworkRunsOnce(t *testing.T) {
 	}
 }
 
+func TestEnsureHostCacheInputPortChange(t *testing.T) {
+	work := t.TempDir()
+	// The live INPUT chain drops by default and already carries a stale rule
+	// from a previous --cache-port 8099; the instance is now configured for 9000.
+	listing := `table ip filter {
+	chain INPUT {
+		type filter hook input priority filter; policy drop;
+		iifname "fr*" tcp dport 8099 ct state new,established,related counter accept comment "firerunner-cache-fr-8099" # handle 42
+	}
+}`
+	var cmds [][]string
+	f := NewFirecracker(FirecrackerConfig{WorkDir: work, TapPrefix: "fr", CachePort: 9000}, testLogger())
+	f.runOut = func(_ context.Context, _ string, _ ...string) (string, error) { return listing, nil }
+	f.run = func(_ context.Context, name string, args ...string) error {
+		cmds = append(cmds, append([]string{name}, args...))
+		return nil
+	}
+	if err := f.ensureHostCacheInput(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var deletedStale, appliedNew bool
+	for _, c := range cmds {
+		joined := strings.Join(c, " ")
+		if strings.Contains(joined, "delete rule ip filter INPUT handle 42") {
+			deletedStale = true
+		}
+		if strings.HasPrefix(joined, "nft -f ") {
+			appliedNew = true
+		}
+	}
+	if !deletedStale {
+		t.Errorf("stale port-8099 rule (handle 42) not deleted; cmds=%v", cmds)
+	}
+	if !appliedNew {
+		t.Errorf("new port-9000 rule not applied; cmds=%v", cmds)
+	}
+	// The freshly written ruleset must target the new port.
+	script, err := os.ReadFile(filepath.Join(work, "firerunner-cache-input.nft"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(script), `comment "firerunner-cache-fr-9000"`) {
+		t.Errorf("new ruleset not keyed to port 9000:\n%s", script)
+	}
+}
+
+func TestEnsureHostCacheInputIdempotent(t *testing.T) {
+	work := t.TempDir()
+	listing := `table ip filter {
+	chain INPUT {
+		type filter hook input priority filter; policy drop;
+		iifname "fr*" tcp dport 9000 ct state new,established,related counter accept comment "firerunner-cache-fr-9000" # handle 7
+	}
+}`
+	var ran bool
+	f := NewFirecracker(FirecrackerConfig{WorkDir: work, TapPrefix: "fr", CachePort: 9000}, testLogger())
+	f.runOut = func(_ context.Context, _ string, _ ...string) (string, error) { return listing, nil }
+	f.run = func(_ context.Context, _ string, _ ...string) error { ran = true; return nil }
+	if err := f.ensureHostCacheInput(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if ran {
+		t.Error("current-port rule already present; ensureHostCacheInput should be a no-op")
+	}
+}
+
 func TestCacheInputScript(t *testing.T) {
 	got := cacheInputScript("fr", 8099)
 	for _, want := range []string{
 		`insert rule ip filter INPUT iifname "fr*" tcp dport 8099`,
-		`counter accept comment "firerunner-cache-fr"`,
+		`counter accept comment "firerunner-cache-fr-8099"`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("cacheInputScript missing %q in:\n%s", want, got)
 		}
 	}
-	// Prefix-keyed comment so peer instances stay idempotent.
-	if other := cacheInputScript("fn", 9000); !strings.Contains(other, `comment "firerunner-cache-fn"`) {
-		t.Fatalf("second instance comment not prefix-keyed:\n%s", other)
+	// Prefix-keyed comment so peer instances stay idempotent; port-keyed so a
+	// --cache-port change is detectable.
+	if other := cacheInputScript("fn", 9000); !strings.Contains(other, `comment "firerunner-cache-fn-9000"`) {
+		t.Fatalf("second instance comment not prefix+port-keyed:\n%s", other)
+	}
+}
+
+func TestParseNFTHandle(t *testing.T) {
+	cases := map[string]string{
+		`		iifname "fr*" tcp dport 8099 accept comment "firerunner-cache-fr-8099" # handle 42`: "42",
+		`  accept comment "x" # handle 7`: "7",
+		`no handle here`:                  "",
+	}
+	for line, want := range cases {
+		if got := parseNFTHandle(line); got != want {
+			t.Errorf("parseNFTHandle(%q) = %q, want %q", line, got, want)
+		}
 	}
 }
 
