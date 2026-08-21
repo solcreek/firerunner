@@ -20,16 +20,30 @@ milliseconds and is thrown away after the run.
 ## Tiers
 
 Different workloads need different images. Each tier is a separate golden rootfs
-selected by the runner labels a workflow requests.
+selected by the runner label a workflow requests (`runs-on: <tier>`). In the
+scale-set model GitHub routes a job to the scale set whose name matches that
+label, so each tier runs as its own firerunner instance/scale set.
 
 | Tier                      | vCPU / RAM (suggested) | Contents                                              | Use for                                                     |
 | ------------------------- | ---------------------- | ---------------------------------------------------- | ----------------------------------------------------------- |
-| `firerunner-4c8g`         | 4 / 8 GiB              | actions/runner, git, Node LTS + pnpm, build-essential | typical JS/TS builds, tests, lint                           |
+| `firerunner-4c8g`         | 4 / 8 GiB              | actions/runner, git, curl, jq, build-essential base   | generic jobs; toolchains fetched by `setup-*` per workflow  |
+| `firerunner-node`         | 2 / 4 GiB              | everything above **+ Node.js LTS + npm** (baked)      | JS/TS builds where `setup-node` should hit a local toolchain |
 | `firerunner-8c16g-docker` | 8 / 16 GiB            | everything above **+ Docker Engine (dind-capable)**  | jobs using `container:`, service containers, `docker build` |
 
-The Docker tier exists because some pipelines rely on `docker build`, job
-`container:` and service containers, which need a real Docker daemon inside the
-guest.
+The base tier deliberately ships no language toolchain — a workflow's `setup-go`
+/ `setup-node` fetches one per run. Baking a toolchain (the `firerunner-node`
+tier) removes that download, mirroring GitHub's hosted **tool cache**
+(`/opt/hostedtoolcache`). The Docker tier exists because some pipelines rely on
+`docker build`, job `container:` and service containers, which need a real
+Docker daemon inside the guest.
+
+### Running several tiers on one host
+
+Each tier is a distinct scale set, so a host running more than one firerunner
+instance must give each its own network identity or their nftables tables and
+guest subnets collide. Set, per extra instance: `FR_NAME` (the tier label),
+`FR_GOLDEN` (its rootfs), and non-overlapping `FR_TAP_PREFIX`, `FR_NET_BASE`
+(second IP octet, e.g. 17), `FR_NFT_TABLE` and `FR_WORKDIR`.
 
 ## What the boot service does (MMDS → JIT)
 
@@ -58,13 +72,19 @@ sudo ./build-rootfs.sh \
   --tier firerunner-4c8g \
   --runner-version 2.320.0 \
   --out /var/lib/firerunner/golden-4c8g.ext4
+
+# Node tier (bakes Node.js LTS); --node-version overrides the default:
+sudo ./build-rootfs.sh \
+  --tier firerunner-node \
+  --node-version 22.11.0 \
+  --out /var/lib/firerunner/golden-node.ext4
 ```
 
 `build-rootfs.sh` creates/formats the ext4 image, debootstraps a minimal Debian
 base (systemd + git/curl/iproute2), installs `actions/runner` and runs its
 `installdependencies.sh`, drops in the boot service + a static resolv.conf,
-enables the service, and (for the docker tier) installs Docker. The result is an
-immutable file firerunner reflink-clones per job. Requires `debootstrap`,
+enables the service, and (per tier) installs Docker or bakes Node.js. The result
+is an immutable file firerunner reflink-clones per job. Requires `debootstrap`,
 `mkfs.ext4`, `curl` and `tar` on the host.
 
 ## Rebuild policy

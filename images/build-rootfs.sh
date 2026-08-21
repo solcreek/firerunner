@@ -18,6 +18,7 @@ ASSETS="$HERE/assets"
 
 TIER="firerunner-4c8g"
 RUNNER_VERSION=""            # empty => resolve latest from GitHub releases
+NODE_VERSION="22.11.0"       # Node LTS baked into the firerunner-node tier
 OUT=""
 SIZE_MB=8192
 DNS_SERVERS="1.1.1.1 8.8.8.8"
@@ -30,6 +31,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --tier)           TIER="$2"; shift 2 ;;
     --runner-version) RUNNER_VERSION="$2"; shift 2 ;;
+    --node-version)   NODE_VERSION="$2"; shift 2 ;;
     --out)            OUT="$2"; shift 2 ;;
     --size-mb)        SIZE_MB="$2"; shift 2 ;;
     --dns-servers)    DNS_SERVERS="${2//,/ }"; shift 2 ;;
@@ -44,8 +46,8 @@ done
 [[ -n "$OUT" ]] || die "--out is required"
 
 case "$TIER" in
-  firerunner-4c8g|firerunner-8c16g-docker) ;;
-  *) die "unknown tier: $TIER (want firerunner-4c8g or firerunner-8c16g-docker)" ;;
+  firerunner-4c8g|firerunner-8c16g-docker|firerunner-node) ;;
+  *) die "unknown tier: $TIER (want firerunner-4c8g, firerunner-8c16g-docker or firerunner-node)" ;;
 esac
 
 for t in mkfs.ext4 curl tar debootstrap; do
@@ -135,6 +137,18 @@ if [[ "$TIER" == "firerunner-8c16g-docker" ]]; then
   in_chroot apt-get update
   in_chroot apt-get install -y --no-install-recommends docker.io
   in_chroot systemctl enable docker.service
+fi
+
+# 6b. (node tier) bake Node.js LTS so runs-on:firerunner-node jobs find node/npm
+#     on PATH without a setup-node download (mirrors GitHub's hosted tool cache).
+#     Installed from the official static tarball into /usr/local (no apt, no
+#     nodesource) to keep the image minimal; --strip-components lands node in
+#     /usr/local/bin.
+if [[ "$TIER" == "firerunner-node" ]]; then
+  echo ">> installing Node.js v$NODE_VERSION for the node tier"
+  node_url="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz"
+  curl -fsSL "$node_url" | tar -xz -C "$MNT/usr/local" --strip-components=1
+  in_chroot /usr/local/bin/node --version
 fi
 
 # Trim apt caches to keep the image lean.
