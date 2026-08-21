@@ -41,7 +41,19 @@ type StatusReport struct {
 	Isolation string      `json:"isolation"`
 	Network   NetInfo     `json:"network"`
 	Workdir   WorkdirInfo `json:"workdir"`
+	Tiers     []TierInfo  `json:"tiers,omitempty"`
 	MicroVMs  VMSummary   `json:"microvms"`
+}
+
+// TierInfo is one configured runner tier as seen by status.
+type TierInfo struct {
+	Name   string   `json:"name"`
+	Labels []string `json:"labels,omitempty"`
+	VCPU   int      `json:"vcpu"`
+	MemMiB int      `json:"mem_mib"`
+	Golden FileStat `json:"golden"`
+	Min    int      `json:"min"`
+	Max    int      `json:"max"`
 }
 
 // FileStat describes an image file on disk.
@@ -176,6 +188,20 @@ func collectStatus(cfg *config.Config, version string) StatusReport {
 		r.ToolCache = &f
 	}
 
+	// Tier catalog, when one is configured. Each tier is its own scale set with
+	// its own microVM shape and golden image, all sharing this host.
+	for _, t := range cfg.Tiers {
+		r.Tiers = append(r.Tiers, TierInfo{
+			Name:   t.Name,
+			Labels: t.Labels,
+			VCPU:   t.VCPU,
+			MemMiB: t.MemMiB,
+			Golden: statFile(t.Golden),
+			Min:    t.Min,
+			Max:    t.Max,
+		})
+	}
+
 	// Live microVMs, cross-checked three ways: work dirs (per-job rootfs clone +
 	// socket), tap devices and firecracker processes.
 	vms := activeVMs(fc)
@@ -215,6 +241,17 @@ func renderStatusText(r StatusReport, w io.Writer) {
 		ifaceStateStr(r.Network.ExtIface, r.Network.ExtIfaceUp), r.Network.Egress, r.Network.Subnet, r.Network.TapPrefix, r.Network.NFTTable)
 	fmt.Fprintf(tw, "workdir\t%s (%s)\n", r.Workdir.Path, r.Workdir.FS)
 	tw.Flush()
+
+	if len(r.Tiers) > 0 {
+		fmt.Fprintf(w, "\ntiers: %d  (developers select one via runs-on: <name>; shared slot budget max=%d)\n", len(r.Tiers), r.Max)
+		ttw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+		fmt.Fprintln(ttw, "  RUNS-ON\tVCPU\tMEM\tWARM\tMAX\tGOLDEN")
+		for _, t := range r.Tiers {
+			fmt.Fprintf(ttw, "  %s\t%d\t%dMiB\t%d\t%d\t%s\n",
+				t.Name, t.VCPU, t.MemMiB, t.Min, t.Max, t.Golden.describe())
+		}
+		ttw.Flush()
+	}
 
 	fmt.Fprintf(w, "\nmicroVMs: %d active  (firecracker procs=%d, taps=%d, max=%d)\n",
 		r.MicroVMs.Active, r.MicroVMs.FirecrackerProcs, r.MicroVMs.Taps, r.MicroVMs.Max)

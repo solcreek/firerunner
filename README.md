@@ -140,6 +140,41 @@ firerunner \
 All flags can also be set via `FR_*` environment variables (see
 `config.example.env`).
 
+### Runner tiers (developer-selectable via `runs-on`)
+
+A single firerunner process can serve several **tiers** — each its own GitHub
+scale set with its own microVM shape and golden image — so developers pick the
+runner they need straight from the workflow:
+
+```yaml
+jobs:
+  build:   { runs-on: firerunner }          # default tier
+  heavy:   { runs-on: firerunner-8c16g }    # 8 vCPU / 16 GiB
+  web:     { runs-on: firerunner-node }     # Node-baked golden image
+```
+
+Point `--tiers` (or `FR_TIERS`) at a JSON catalog:
+
+```json
+[
+  { "name": "firerunner",       "vcpu": 2, "mem_mib": 4096,  "golden": "/var/lib/firerunner/golden.ext4",      "min": 1, "max": 8 },
+  { "name": "firerunner-8c16g", "vcpu": 8, "mem_mib": 16384, "golden": "/var/lib/firerunner/golden.ext4",      "min": 0, "max": 2 },
+  { "name": "firerunner-node",  "vcpu": 2, "mem_mib": 4096,  "golden": "/var/lib/firerunner/golden-node.ext4", "min": 0, "max": 4 }
+]
+```
+
+See [`examples/tiers.json`](examples/tiers.json). All tiers share the host
+kernel, tool cache, network and — importantly — the `--max-runners` **slot
+budget**: `vcpu`/`mem_mib`/`golden` vary per tier, but the total number of
+concurrent microVMs across every tier is capped at `--max-runners` (the tiers'
+warm pools, `min`, must fit within it). When `--tiers` is unset, firerunner
+runs the single tier derived from `--name`/`--vcpu`/`--mem-mib`/`--golden`, so
+existing deployments are unchanged.
+
+> The golden image is operator-scoped by design: a repo picks a tier from the
+> trusted catalog you publish, but never injects its own rootfs. Define new
+> tiers by building an image (see [`images/`](images/)) and adding an entry.
+
 ### Inspecting a deployment (`status`, `doctor`)
 
 Two read-only subcommands help operators inspect and diagnose a runner host.

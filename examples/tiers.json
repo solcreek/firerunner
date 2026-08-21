@@ -1,0 +1,27 @@
+[
+  {
+    "name": "firerunner",
+    "vcpu": 2,
+    "mem_mib": 4096,
+    "golden": "/var/lib/firerunner/golden.ext4",
+    "min": 1,
+    "max": 8
+  },
+  {
+    "name": "firerunner-8c16g",
+    "vcpu": 8,
+    "mem_mib": 16384,
+    "golden": "/var/lib/firerunner/golden.ext4",
+    "min": 0,
+    "max": 2
+  },
+  {
+    "name": "firerunner-node",
+    "labels": ["node"],
+    "vcpu": 2,
+    "mem_mib": 4096,
+    "golden": "/var/lib/firerunner/golden-node.ext4",
+    "min": 0,
+    "max": 4
+  }
+]

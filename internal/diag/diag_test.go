@@ -139,6 +139,41 @@ func TestStatus_JSON(t *testing.T) {
 	}
 }
 
+// TestStatus_Tiers ensures a configured tier catalog appears in both renderings.
+func TestStatus_Tiers(t *testing.T) {
+	cfg := &config.Config{
+		ScaleSetName: "firerunner",
+		MaxRunners:   8,
+		Firecracker:  provisioner.FirecrackerConfig{WorkDir: t.TempDir(), TapPrefix: "fr", NetBase: 16},
+		Tiers: []config.Tier{
+			{Name: "firerunner", VCPU: 2, MemMiB: 4096, Golden: "/g/base.ext4", Min: 1, Max: 8},
+			{Name: "firerunner-8c16g", VCPU: 8, MemMiB: 16384, Golden: "/g/base.ext4", Min: 0, Max: 2},
+		},
+	}
+
+	var text bytes.Buffer
+	if err := Status(cfg, "test", &text, false); err != nil {
+		t.Fatalf("Status text: %v", err)
+	}
+	for _, want := range []string{"tiers: 2", "firerunner-8c16g", "16384MiB"} {
+		if !strings.Contains(text.String(), want) {
+			t.Errorf("text status missing %q\n%s", want, text.String())
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := Status(cfg, "test", &buf, true); err != nil {
+		t.Fatalf("Status --json: %v", err)
+	}
+	var r StatusReport
+	if err := json.Unmarshal(buf.Bytes(), &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(r.Tiers) != 2 || r.Tiers[1].Name != "firerunner-8c16g" || r.Tiers[1].VCPU != 8 {
+		t.Errorf("tiers = %+v", r.Tiers)
+	}
+}
+
 // TestDoctor_JSON ensures --json emits a DoctorReport reflecting failures.
 func TestDoctor_JSON(t *testing.T) {
 	cfg := &config.Config{Firecracker: provisioner.FirecrackerConfig{WorkDir: t.TempDir()}}
