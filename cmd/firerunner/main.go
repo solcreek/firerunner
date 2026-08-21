@@ -15,6 +15,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -109,10 +111,14 @@ func cacheServe(args []string) error {
 	fs := flag.NewFlagSet("cache-server", flag.ContinueOnError)
 	addr := fs.String("addr", ":8099", "listen address")
 	dir := fs.String("dir", "/var/lib/firerunner/cache", "cache storage directory")
+	maxSize := fs.String("max-size", "50GB", "evict least-recently-used entries above this total size (e.g. 50GB, 0 for unlimited)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-
+	maxBytes, err := parseSize(*maxSize)
+	if err != nil {
+		return fmt.Errorf("--max-size: %w", err)
+	}
 	log := config.NewLogger("info", "text")
 	slog.SetDefault(log)
 
@@ -120,6 +126,7 @@ func cacheServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	srv.SetMaxSize(maxBytes)
 	stopJanitor := srv.StartJanitor()
 	defer stopJanitor()
 
@@ -134,12 +141,46 @@ func cacheServe(args []string) error {
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
-	log.Info("cache-server listening", "addr", *addr, "dir", *dir)
+	log.Info("cache-server listening", "addr", *addr, "dir", *dir, "max_size", *maxSize)
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	log.Info("cache-server stopped")
 	return nil
+}
+
+// parseSize turns a human byte size ("50GB", "512MB", "1TB", or a bare byte
+// count) into bytes. An empty string or "0" means unlimited (0). Both decimal
+// (KB/MB/GB/TB) and binary (KiB/MiB/GiB/TiB) suffixes are accepted, case
+// -insensitively; decimal suffixes use 1000, binary use 1024.
+func parseSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	u := strings.ToUpper(s)
+	mult := int64(1)
+	for _, p := range []struct {
+		suf string
+		m   int64
+	}{
+		{"TIB", 1 << 40}, {"GIB", 1 << 30}, {"MIB", 1 << 20}, {"KIB", 1 << 10},
+		{"TB", 1e12}, {"GB", 1e9}, {"MB", 1e6}, {"KB", 1e3}, {"B", 1},
+	} {
+		if strings.HasSuffix(u, p.suf) {
+			mult = p.m
+			u = strings.TrimSpace(strings.TrimSuffix(u, p.suf))
+			break
+		}
+	}
+	n, err := strconv.ParseFloat(u, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size %q", s)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("size must not be negative: %q", s)
+	}
+	return int64(n * float64(mult)), nil
 }
 
 func usage(w io.Writer) {
@@ -158,8 +199,9 @@ with the same environment (e.g. the systemd EnvironmentFile) as the service.
 Pass --json to either for machine-readable output.
 
 cache-server flags:
-  --addr string   listen address (default ":8099")
-  --dir string    cache storage directory (default "/var/lib/firerunner/cache")
+  --addr string      listen address (default ":8099")
+  --dir string       cache storage directory (default "/var/lib/firerunner/cache")
+  --max-size string  evict LRU entries above this total size (default "50GB"; 0 = unlimited)
 `)
 }
 

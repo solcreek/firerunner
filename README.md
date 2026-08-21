@@ -402,6 +402,15 @@ It implements the three Twirp methods plus the Azure block-blob upload
 namespaces entries by `repository_id`, guards each blob URL with a per-entry
 token, and persists an index so caches survive restarts.
 
+By default the store is capped at 50 GB; once a newly finalized entry pushes the
+total over the cap, the least-recently-used entries are evicted until it fits
+(mirroring GitHub's per-repo LRU). Tune it with `--max-size` (e.g. `--max-size
+100GB`, or `--max-size 0` for unlimited):
+
+```bash
+firerunner cache-server --addr :8099 --dir /var/lib/firerunner/cache --max-size 50GB
+```
+
 **Pointing microVMs at it.** Two pieces are needed because the *real* GitHub
 runner overwrites `ACTIONS_RESULTS_URL` with the value from its per-job message:
 

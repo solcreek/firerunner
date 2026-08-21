@@ -88,6 +88,17 @@ type Server struct {
 	mu      sync.Mutex
 	entries map[uint64]*Entry
 	nextID  uint64
+	maxSize int64 // 0 = unlimited; total completed-blob bytes to keep
+}
+
+// SetMaxSize caps the total size of completed cache blobs kept on disk. When a
+// newly finalized entry pushes the total over the cap, the least-recently-used
+// completed entries are evicted until it fits (the just-finalized entry is never
+// the victim). A non-positive value means unlimited. Call before serving.
+func (s *Server) SetMaxSize(n int64) {
+	s.mu.Lock()
+	s.maxSize = n
+	s.mu.Unlock()
 }
 
 // New opens (creating if needed) a cache store rooted at dir and returns a
@@ -270,6 +281,7 @@ func (s *Server) handleFinalize(w http.ResponseWriter, r *http.Request) {
 	e.Size = fi.Size()
 	e.Complete = true
 	e.UsedAt = time.Now().Unix()
+	s.evictLRU(e.ID)
 	if err := s.save(); err != nil {
 		twirpError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
@@ -544,6 +556,52 @@ func (s *Server) blobURL(r *http.Request, kind string, id uint64, sig string) st
 		scheme = "https"
 	}
 	return fmt.Sprintf("%s://%s/%s/%d?sig=%s", scheme, r.Host, kind, id, sig)
+}
+
+// evictLRU keeps the total size of completed blobs under s.maxSize by deleting
+// the least-recently-used completed entries (oldest UsedAt first). keepID is the
+// entry that just triggered the check and is never evicted, so a single blob
+// larger than the cap is still served rather than deleting the thing just
+// stored. The caller must hold s.mu; it does not save the index (the caller
+// does). A non-positive cap disables eviction.
+func (s *Server) evictLRU(keepID uint64) {
+	if s.maxSize <= 0 {
+		return
+	}
+	var total int64
+	for _, e := range s.entries {
+		if e.Complete {
+			total += e.Size
+		}
+	}
+	for total > s.maxSize {
+		var victim *Entry
+		for _, e := range s.entries {
+			if !e.Complete || e.ID == keepID {
+				continue
+			}
+			if victim == nil || lessRecentlyUsed(e, victim) {
+				victim = e
+			}
+		}
+		if victim == nil {
+			break // only the kept entry is left
+		}
+		total -= victim.Size
+		_ = os.Remove(s.blobPath(victim.ID))
+		_ = os.RemoveAll(s.tmpDir(victim.ID))
+		delete(s.entries, victim.ID)
+		s.log.Info("evicted cache entry (size cap)", "id", victim.ID, "key", victim.Key, "size", victim.Size)
+	}
+}
+
+// lessRecentlyUsed reports whether a is a better eviction victim than b: older
+// UsedAt loses first, ties broken by lower ID (the older entry).
+func lessRecentlyUsed(a, b *Entry) bool {
+	if a.UsedAt != b.UsedAt {
+		return a.UsedAt < b.UsedAt
+	}
+	return a.ID < b.ID
 }
 
 // gc reclaims reserved-but-unfinalized entries whose blob upload never completed.

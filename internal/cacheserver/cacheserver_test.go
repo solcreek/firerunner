@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
@@ -62,6 +63,86 @@ func putBlob(t *testing.T, url string, data []byte) {
 }
 
 func meta(repo string) *cacheMetadata { return &cacheMetadata{RepositoryID: repo} }
+
+// saveEntry runs the full reserve -> PUT -> finalize flow for a blob of n bytes.
+func saveEntry(t *testing.T, base, repo, key, version string, n int) {
+	t.Helper()
+	create := twirp(t, base, "CreateCacheEntry", createReq{Metadata: meta(repo), Key: key, Version: version})
+	if create["ok"] != true {
+		t.Fatalf("create %q not ok: %v", key, create)
+	}
+	putBlob(t, create["signed_upload_url"].(string), bytes.Repeat([]byte("x"), n))
+	fin := twirp(t, base, "FinalizeCacheEntryUpload", finalizeReq{
+		Metadata: meta(repo), Key: key, Version: version, SizeBytes: fmt.Sprint(n),
+	})
+	if fin["ok"] != true {
+		t.Fatalf("finalize %q not ok: %v", key, fin)
+	}
+}
+
+// TestEvictLRUOnSizeCap checks that finalizing an entry above the size cap evicts
+// the least-recently-used completed entries (lowest ID on a UsedAt tie) and never
+// the entry just stored.
+func TestEvictLRUOnSizeCap(t *testing.T) {
+	s, err := New(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s.SetMaxSize(250) // room for ~2 of the 100-byte blobs below
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+	const version = "v1"
+
+	saveEntry(t, ts.URL, "1", "key-a", version, 100) // id 1
+	saveEntry(t, ts.URL, "1", "key-b", version, 100) // id 2
+	saveEntry(t, ts.URL, "1", "key-c", version, 100) // id 3 -> total 300 > 250, evict oldest (id 1)
+
+	s.mu.Lock()
+	_, hasA := s.entries[1]
+	_, hasB := s.entries[2]
+	_, hasC := s.entries[3]
+	var total int64
+	for _, e := range s.entries {
+		total += e.Size
+	}
+	s.mu.Unlock()
+	if hasA {
+		t.Fatalf("expected id 1 (LRU) to be evicted")
+	}
+	if !hasB || !hasC {
+		t.Fatalf("expected id 2 and 3 to remain (b=%v c=%v)", hasB, hasC)
+	}
+	if total > 250 {
+		t.Fatalf("total %d still over cap", total)
+	}
+	// The evicted blob is gone from disk.
+	if _, err := os.Stat(s.blobPath(1)); !os.IsNotExist(err) {
+		t.Fatalf("evicted blob still on disk: %v", err)
+	}
+	// A restore of the kept entry still works.
+	get := twirp(t, ts.URL, "GetCacheEntryDownloadURL", getReq{Metadata: meta("1"), Key: "key-c", Version: version})
+	if get["ok"] != true {
+		t.Fatalf("kept entry not restorable: %v", get)
+	}
+}
+
+// TestEvictKeepsOversizeEntry checks a single blob larger than the cap is still
+// kept and served (we never evict the just-finalized entry down to nothing).
+func TestEvictKeepsOversizeEntry(t *testing.T) {
+	s, err := New(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s.SetMaxSize(50)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	saveEntry(t, ts.URL, "1", "big", "v1", 500) // over cap on its own
+	get := twirp(t, ts.URL, "GetCacheEntryDownloadURL", getReq{Metadata: meta("1"), Key: "big", Version: "v1"})
+	if get["ok"] != true {
+		t.Fatalf("oversize entry should still be served: %v", get)
+	}
+}
 
 // TestSaveRestoreSingleShot walks the full toolkit v2 flow: reserve -> single
 // PUT -> finalize -> resolve download URL -> GET, and checks the bytes round-trip.
