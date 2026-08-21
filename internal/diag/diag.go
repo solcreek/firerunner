@@ -370,10 +370,22 @@ func runDoctor(cfg *config.Config, version string) DoctorReport {
 		checks = append(checks, binVersion("jailer", fc.JailerBin))
 	}
 
-	checks = append(checks, fileCheck("kernel", fc.KernelImage, 1<<20))   // >=1MiB
-	checks = append(checks, fileCheck("golden", fc.GoldenRootFS, 64<<20)) // >=64MiB
-	if fc.ToolCacheImage != "" {
-		checks = append(checks, fileCheck("toolcache", fc.ToolCacheImage, 1<<20))
+	checks = append(checks, fileCheck("kernel", fc.KernelImage, 1<<20)) // >=1MiB
+	if len(cfg.Tiers) > 0 {
+		// Tier-catalog mode: each tier has its own golden (and optional
+		// toolcache); the top-level --golden may be unset, so check per tier
+		// instead of failing on an empty top-level path.
+		for _, t := range cfg.Tiers {
+			checks = append(checks, fileCheck("golden["+t.Name+"]", t.Golden, 64<<20))
+			if t.ToolCache != "" {
+				checks = append(checks, fileCheck("toolcache["+t.Name+"]", t.ToolCache, 1<<20))
+			}
+		}
+	} else {
+		checks = append(checks, fileCheck("golden", fc.GoldenRootFS, 64<<20)) // >=64MiB
+		if fc.ToolCacheImage != "" {
+			checks = append(checks, fileCheck("toolcache", fc.ToolCacheImage, 1<<20))
+		}
 	}
 
 	// External interface for egress NAT.

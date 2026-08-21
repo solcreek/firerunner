@@ -140,6 +140,45 @@ func TestDoctor_ReportsFailures(t *testing.T) {
 	}
 }
 
+// TestDoctor_ChecksPerTierGolden verifies that in tier-catalog mode Doctor
+// checks each tier's golden (and toolcache) by name instead of the top-level
+// --golden, which is legitimately empty when a tier catalog is configured.
+func TestDoctor_ChecksPerTierGolden(t *testing.T) {
+	dir := t.TempDir()
+	big := filepath.Join(dir, "golden.ext4")
+	if err := os.WriteFile(big, make([]byte, 65<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		Firecracker: provisioner.FirecrackerConfig{WorkDir: dir},
+		Tiers: []config.Tier{
+			{Name: "base", Golden: big},
+			{Name: "missing", Golden: filepath.Join(dir, "nope.ext4")},
+		},
+	}
+	r := runDoctor(cfg, "test")
+	var names []string
+	var basePass, missingFail bool
+	for _, c := range r.Checks {
+		names = append(names, c.Name)
+		if c.Name == "golden[base]" && c.Level == levelPass {
+			basePass = true
+		}
+		if c.Name == "golden[missing]" && c.Level == levelFail {
+			missingFail = true
+		}
+		if c.Name == "golden" {
+			t.Errorf("tier mode must not check the empty top-level golden; got %v", c)
+		}
+	}
+	if !basePass {
+		t.Errorf("expected golden[base] to pass; checks=%v", names)
+	}
+	if !missingFail {
+		t.Errorf("expected golden[missing] to fail; checks=%v", names)
+	}
+}
+
 // TestStatus_RendersPartialConfig ensures Status never errors on an unset/partial
 // config and clearly marks unset images.
 func TestStatus_RendersPartialConfig(t *testing.T) {
