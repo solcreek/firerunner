@@ -122,6 +122,76 @@ func TestFileCheck(t *testing.T) {
 	}
 }
 
+func TestWorkdirCheck(t *testing.T) {
+	dir := t.TempDir()
+	if c := workdirCheck(""); c.Level != levelFail {
+		t.Errorf("empty path: want FAIL, got %s", c.Level)
+	}
+	if c := workdirCheck(dir); c.Level == levelFail {
+		t.Errorf("writable existing dir: unexpected FAIL: %s", c.Detail)
+	}
+	// A not-yet-existing dir under a writable parent is created on first run.
+	if c := workdirCheck(filepath.Join(dir, "sub", "work")); c.Level != levelWarn {
+		t.Errorf("missing dir, writable parent: want WARN, got %s (%s)", c.Level, c.Detail)
+	}
+	// A file where a dir is expected is a hard failure.
+	f := filepath.Join(dir, "afile")
+	if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c := workdirCheck(f); c.Level != levelFail {
+		t.Errorf("file-not-dir: want FAIL, got %s", c.Level)
+	}
+}
+
+func TestLogDirCheck(t *testing.T) {
+	dir := t.TempDir()
+	if c := logDirCheck(dir); c.Level != levelPass {
+		t.Errorf("writable dir: want PASS, got %s (%s)", c.Level, c.Detail)
+	}
+	if c := logDirCheck(filepath.Join(dir, "sub", "logs")); c.Level != levelWarn {
+		t.Errorf("missing dir, writable parent: want WARN, got %s (%s)", c.Level, c.Detail)
+	}
+}
+
+func TestReflinkLocalityCheck(t *testing.T) {
+	dir := t.TempDir()
+	golden := filepath.Join(dir, "golden.ext4")
+	if err := os.WriteFile(golden, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Golden and workdir under the same tempdir share a device.
+	if c := reflinkLocalityCheck(dir, []string{golden}); c.Level != levelPass {
+		t.Errorf("same-device golden: want PASS, got %s (%s)", c.Level, c.Detail)
+	}
+	// An empty golden list still passes (nothing to compare).
+	if c := reflinkLocalityCheck(dir, nil); c.Level != levelPass {
+		t.Errorf("no goldens: want PASS, got %s", c.Level)
+	}
+}
+
+func TestParentWritable(t *testing.T) {
+	dir := t.TempDir()
+	if !parentWritable(filepath.Join(dir, "does-not-exist")) {
+		t.Error("writable tempdir parent should report writable")
+	}
+	if !parentWritable(filepath.Join(dir, "a", "b", "c")) {
+		t.Error("nearest existing ancestor (tempdir) is writable")
+	}
+}
+
+func TestDeviceID(t *testing.T) {
+	dir := t.TempDir()
+	dev, ok := deviceID(dir)
+	if !ok {
+		t.Fatal("existing dir should have a device id")
+	}
+	// A missing sub-path resolves to the same device as its existing ancestor.
+	if sub, ok := deviceID(filepath.Join(dir, "missing", "deep")); !ok || sub != dev {
+		t.Errorf("missing sub-path device = %d ok=%v, want %d", sub, ok, dev)
+	}
+}
+
 func TestAuthCheck(t *testing.T) {
 	if c := authCheck(&config.Config{Token: "ghp_x"}); c.Level != levelPass {
 		t.Errorf("token: %s %s", c.Level, c.Detail)

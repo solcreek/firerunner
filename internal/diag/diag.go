@@ -371,18 +371,21 @@ func runDoctor(cfg *config.Config, version string) DoctorReport {
 	}
 
 	checks = append(checks, fileCheck("kernel", fc.KernelImage, 1<<20)) // >=1MiB
+	var goldens []string
 	if len(cfg.Tiers) > 0 {
 		// Tier-catalog mode: each tier has its own golden (and optional
 		// toolcache); the top-level --golden may be unset, so check per tier
 		// instead of failing on an empty top-level path.
 		for _, t := range cfg.Tiers {
 			checks = append(checks, fileCheck("golden["+t.Name+"]", t.Golden, 64<<20))
+			goldens = append(goldens, t.Golden)
 			if t.ToolCache != "" {
 				checks = append(checks, fileCheck("toolcache["+t.Name+"]", t.ToolCache, 1<<20))
 			}
 		}
 	} else {
 		checks = append(checks, fileCheck("golden", fc.GoldenRootFS, 64<<20)) // >=64MiB
+		goldens = append(goldens, fc.GoldenRootFS)
 		if fc.ToolCacheImage != "" {
 			checks = append(checks, fileCheck("toolcache", fc.ToolCacheImage, 1<<20))
 		}
@@ -413,6 +416,13 @@ func runDoctor(cfg *config.Config, version string) DoctorReport {
 
 	// Work dir: writable and, ideally, reflink-capable so rootfs clones are cheap.
 	checks = append(checks, workdirCheck(fc.WorkDir))
+	// Reflink only works within one filesystem, so a golden on a different
+	// device than the workdir silently defeats it however capable the workdir is.
+	checks = append(checks, reflinkLocalityCheck(fc.WorkDir, goldens))
+	// Log dir (only when off-VM console log forwarding is configured).
+	if fc.LogDir != "" {
+		checks = append(checks, logDirCheck(fc.LogDir))
+	}
 
 	// GitHub auth: presence/parse first, then a live read-only verification.
 	apiBase := githubAPIBase(cfg.URL)
@@ -507,7 +517,12 @@ func workdirCheck(dir string) Check {
 	info, err := os.Stat(dir)
 	switch {
 	case os.IsNotExist(err):
-		return warn("workdir", "%s does not exist yet; firerunner creates it on first run (ensure its parent is writable by the service user)", dir)
+		// The provisioner will mkdir it on first run, which only succeeds if the
+		// nearest existing ancestor is writable — probe that rather than guess.
+		if !parentWritable(dir) {
+			return fail("workdir", "%s does not exist and no existing ancestor is writable by uid %d; firerunner cannot create it on first run", dir, os.Geteuid())
+		}
+		return warn("workdir", "%s does not exist yet; firerunner creates it on first run (parent writable, reflink capability unverified until then)", dir)
 	case err != nil:
 		return fail("workdir", "%s not accessible: %v", dir, err)
 	case !info.IsDir():
@@ -526,6 +541,93 @@ func workdirCheck(dir string) Check {
 		return warn("workdir", "%s is %s; reflink clones unsupported here, each microVM copies the full golden (slow)", dir, kind)
 	}
 	return pass("workdir", "%s writable as uid %d, %s (reflink-capable)", dir, uid, kind)
+}
+
+// logDirCheck reports whether the off-VM console log directory is usable. Like
+// workdirCheck it never creates the dir; the provisioner does so on first run.
+func logDirCheck(dir string) Check {
+	uid := os.Geteuid()
+	info, err := os.Stat(dir)
+	switch {
+	case os.IsNotExist(err):
+		if !parentWritable(dir) {
+			return fail("log-dir", "%s does not exist and no existing ancestor is writable by uid %d; console log forwarding will fail", dir, uid)
+		}
+		return warn("log-dir", "%s does not exist yet; firerunner creates it on first run (parent writable)", dir)
+	case err != nil:
+		return fail("log-dir", "%s not accessible: %v", dir, err)
+	case !info.IsDir():
+		return fail("log-dir", "%s exists but is not a directory", dir)
+	}
+	probe := filepath.Join(dir, ".firerunner-doctor")
+	if err := os.WriteFile(probe, []byte("ok"), 0o600); err != nil {
+		return fail("log-dir", "%s not writable as uid %d: %v", dir, uid, err)
+	}
+	os.Remove(probe)
+	return pass("log-dir", "%s writable as uid %d", dir, uid)
+}
+
+// reflinkLocalityCheck warns when any golden lives on a different filesystem
+// than the workdir: reflink (copy-on-write) clones cannot cross a device
+// boundary, so such a golden is copied in full for every microVM even when the
+// workdir filesystem is otherwise reflink-capable.
+func reflinkLocalityCheck(workdir string, goldens []string) Check {
+	wdev, ok := deviceID(workdir)
+	if !ok {
+		return warn("reflink-locality", "cannot determine the filesystem device of %s", workdir)
+	}
+	var elsewhere []string
+	for _, g := range goldens {
+		if g == "" {
+			continue
+		}
+		if gdev, ok := deviceID(g); ok && gdev != wdev {
+			elsewhere = append(elsewhere, g)
+		}
+	}
+	if len(elsewhere) > 0 {
+		return warn("reflink-locality", "golden(s) on a different filesystem than %s, so cross-device reflink is impossible and each microVM copies the full golden (slow): %s", workdir, strings.Join(elsewhere, ", "))
+	}
+	return pass("reflink-locality", "golden(s) share the workdir filesystem; reflink clones are possible")
+}
+
+// parentWritable reports whether the nearest existing ancestor of path is a
+// writable directory, by creating and removing a probe file there. It is how
+// doctor predicts whether the provisioner's mkdir on first run will succeed.
+func parentWritable(path string) bool {
+	for parent := filepath.Dir(path); ; parent = filepath.Dir(parent) {
+		info, err := os.Stat(parent)
+		if err == nil {
+			if !info.IsDir() {
+				return false
+			}
+			probe := filepath.Join(parent, ".firerunner-doctor")
+			if err := os.WriteFile(probe, []byte("ok"), 0o600); err != nil {
+				return false
+			}
+			os.Remove(probe)
+			return true
+		}
+		if parent == "/" || parent == "." {
+			return false
+		}
+	}
+}
+
+// deviceID returns the filesystem device id of path, walking up to the nearest
+// existing ancestor when path itself does not exist yet (e.g. a workdir the
+// provisioner has not created). The bool is false when nothing along the path
+// can be stat'd.
+func deviceID(path string) (uint64, bool) {
+	for p := path; ; p = filepath.Dir(p) {
+		var st syscall.Stat_t
+		if err := syscall.Stat(p, &st); err == nil {
+			return uint64(st.Dev), true
+		}
+		if p == "/" || p == "." || p == "" {
+			return 0, false
+		}
+	}
 }
 
 func authCheck(cfg *config.Config) Check {
