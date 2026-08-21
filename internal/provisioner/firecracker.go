@@ -263,8 +263,13 @@ func (f *Firecracker) applyNetwork(ctx context.Context) error {
 }
 
 // forwardComment tags the FORWARD accept rules firerunner adds to a foreign
-// (ufw/docker/hardened) filter chain, so refreshes stay idempotent.
-const forwardComment = "firerunner-egress"
+// (ufw/docker/hardened) filter chain, so refreshes stay idempotent. It is keyed
+// by tap prefix so multiple firerunner instances sharing a host each manage —
+// and detect — their own accept rules instead of mistaking a peer's rules for
+// their own and never inserting accepts for their tap devices.
+func forwardComment(tapPrefix string) string {
+	return "firerunner-egress-" + tapPrefix
+}
 
 // hostForwardScript returns an nft script that inserts accept rules for
 // firerunner's tap interfaces into the host's ip/filter FORWARD chain.
@@ -277,11 +282,12 @@ const forwardComment = "firerunner-egress"
 // terminal across chains), so this does not widen egress beyond the policy.
 func hostForwardScript(extIface, tapPrefix string) string {
 	tap := tapPrefix + "*"
+	comment := forwardComment(tapPrefix)
 	return fmt.Sprintf(
 		"insert rule ip filter FORWARD iifname %q oifname %q ct state established,related counter accept comment %q\n"+
 			"insert rule ip filter FORWARD iifname %q oifname %q counter accept comment %q\n",
-		extIface, tap, forwardComment,
-		tap, extIface, forwardComment,
+		extIface, tap, comment,
+		tap, extIface, comment,
 	)
 }
 
@@ -298,7 +304,7 @@ func (f *Firecracker) ensureHostForward(ctx context.Context) error {
 		f.log.Debug("no ip/filter FORWARD chain; skipping host forward accept", "err", err)
 		return nil
 	}
-	if strings.Contains(out, forwardComment) {
+	if strings.Contains(out, forwardComment(f.cfg.TapPrefix)) {
 		return nil // our accept rules are already present
 	}
 	if !strings.Contains(out, "policy drop") {

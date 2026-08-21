@@ -125,13 +125,18 @@ func TestSetupNetworkRunsOnce(t *testing.T) {
 func TestHostForwardScript(t *testing.T) {
 	got := hostForwardScript("enp2s0", "fr")
 	for _, want := range []string{
-		`iifname "enp2s0" oifname "fr*" ct state established,related counter accept comment "firerunner-egress"`,
-		`iifname "fr*" oifname "enp2s0" counter accept comment "firerunner-egress"`,
+		`iifname "enp2s0" oifname "fr*" ct state established,related counter accept comment "firerunner-egress-fr"`,
+		`iifname "fr*" oifname "enp2s0" counter accept comment "firerunner-egress-fr"`,
 		"insert rule ip filter FORWARD",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("hostForwardScript missing %q in:\n%s", want, got)
 		}
+	}
+	// A second instance's rules must carry a distinct, prefix-keyed comment so it
+	// does not mistake a peer's accepts for its own.
+	if other := hostForwardScript("enp2s0", "fn"); !strings.Contains(other, `comment "firerunner-egress-fn"`) {
+		t.Fatalf("second instance comment not prefix-keyed:\n%s", other)
 	}
 }
 
@@ -146,7 +151,10 @@ func TestEnsureHostForward(t *testing.T) {
 		{name: "no forward chain", outErr: errors.New("no such chain"), wantRun: false},
 		{name: "permissive policy", out: "chain FORWARD { policy accept; }", wantRun: false},
 		{name: "drop policy applies rules", out: dropChain, wantRun: true},
-		{name: "already present is idempotent", out: dropChain + " firerunner-egress", wantRun: false},
+		{name: "already present is idempotent", out: dropChain + " firerunner-egress-fr", wantRun: false},
+		// Regression: a peer instance's prefix-keyed comment must NOT make us
+		// think our own tap accepts are already installed.
+		{name: "peer instance comment does not suppress ours", out: dropChain + " firerunner-egress-fn", wantRun: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
