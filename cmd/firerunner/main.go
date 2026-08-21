@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -17,6 +18,7 @@ import (
 	"github.com/actions/scaleset"
 
 	"github.com/solcreek/firerunner/internal/config"
+	"github.com/solcreek/firerunner/internal/diag"
 	"github.com/solcreek/firerunner/internal/listener"
 	"github.com/solcreek/firerunner/internal/provisioner"
 	"github.com/solcreek/firerunner/internal/scheduler"
@@ -26,7 +28,24 @@ import (
 var version = "dev"
 
 func main() {
-	cfg, err := config.FromFlags(os.Args[1:])
+	args := os.Args[1:]
+	if len(args) > 0 {
+		switch args[0] {
+		case "status", "doctor":
+			if err := diagnose(args[0], args[1:]); err != nil {
+				os.Exit(1)
+			}
+			return
+		case "version", "--version", "-version":
+			fmt.Println("firerunner", version)
+			return
+		case "help", "-h", "--help":
+			usage(os.Stdout)
+			return
+		}
+	}
+
+	cfg, err := config.FromFlags(args)
 	if err != nil {
 		slog.Error("configuration error", "err", err)
 		os.Exit(2)
@@ -42,6 +61,39 @@ func main() {
 		log.Error("firerunner failed", "err", err)
 		os.Exit(1)
 	}
+}
+
+// diagnose runs the read-only "status" and "doctor" subcommands. It parses
+// config leniently (config.Parse) so it can report on a partial or broken
+// deployment instead of refusing to start on a missing required field.
+func diagnose(cmd string, args []string) error {
+	cfg, err := config.Parse(args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "configuration error:", err)
+		return err
+	}
+	switch cmd {
+	case "status":
+		return diag.Status(cfg, version, os.Stdout)
+	case "doctor":
+		return diag.Doctor(cfg, version, os.Stdout)
+	}
+	return nil
+}
+
+func usage(w io.Writer) {
+	fmt.Fprint(w, `firerunner - ephemeral Firecracker microVM GitHub Actions runners
+
+Usage:
+  firerunner [flags]      run the daemon (default; see --help output of flags)
+  firerunner status       show config, images, network and live microVMs
+  firerunner doctor       run preflight health checks (exits non-zero on failure)
+  firerunner version      print the version
+  firerunner help         show this help
+
+status and doctor read the same FR_* env / flags as the daemon, so run them
+with the same environment (e.g. the systemd EnvironmentFile) as the service.
+`)
 }
 
 func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {

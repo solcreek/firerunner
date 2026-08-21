@@ -140,6 +140,27 @@ firerunner \
 All flags can also be set via `FR_*` environment variables (see
 `config.example.env`).
 
+### Inspecting a deployment (`status`, `doctor`)
+
+Two read-only subcommands help operators inspect and diagnose a runner host.
+Both read the same flags / `FR_*` environment as the daemon, so run them with
+the same environment as the service (e.g. via the systemd `EnvironmentFile`):
+
+```bash
+firerunner status   # config, kernel/golden images, network wiring, live microVMs
+firerunner doctor   # preflight health checks; exits non-zero if any FAIL
+```
+
+`status` prints the resolved scale-set config, the golden/kernel/tool-cache
+images (path, size, mtime), the network wiring, and the microVMs currently on
+the host (cross-checked against firecracker processes and tap devices).
+
+`doctor` runs a checklist — `/dev/kvm`, the firecracker/jailer binaries, the
+kernel and golden images, the egress interface, `ip_forward`, `nftables`, a
+writable and reflink-capable work dir, GitHub auth, and API reachability — and
+prints one `PASS`/`WARN`/`FAIL` line each. It exits non-zero when any check
+fails, so it can gate a deploy.
+
 ### Warm pool (`--min-runners`)
 
 Every job runs in a fresh microVM, so by default a runner is cold-booted only
