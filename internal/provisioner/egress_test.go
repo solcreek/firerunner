@@ -63,6 +63,30 @@ func TestFetchMetaCIDRsHTTPError(t *testing.T) {
 	}
 }
 
+// TestBuildNFTRulesetCustomTable asserts a second instance can own an isolated
+// nft table so the two rulesets never clobber each other.
+func TestBuildNFTRulesetCustomTable(t *testing.T) {
+	out := buildNFTRuleset(egressRuleset{
+		Table:    "firerunner_node",
+		ExtIface: "enp2s0",
+		VMCidr:   "172.17.0.0/16",
+		Open:     true,
+	})
+	for _, want := range []string{
+		"add table ip firerunner_node",
+		"delete table ip firerunner_node",
+		"table ip firerunner_node {",
+		"172.17.0.0/16",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("ruleset missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "table ip firerunner {") {
+		t.Fatalf("custom table leaked the default name:\n%s", out)
+	}
+}
+
 func TestBuildNFTRulesetAllowlist(t *testing.T) {
 	rs := egressRuleset{
 		ExtIface:   "enp2s0",

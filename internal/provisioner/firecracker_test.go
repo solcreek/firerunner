@@ -99,7 +99,7 @@ func TestConfigure_SendsSequenceOverUnixSocket(t *testing.T) {
 	defer srv.Close()
 
 	f := NewFirecracker(FirecrackerConfig{KernelImage: "/k", GoldenRootFS: "/g"}, testLogger())
-	err = f.configure(context.Background(), sock, "/rootfs", slotNet(0, "fr"), "console=ttyS0", "JIT", core.RunnerSpec{VCPU: 2, MemMiB: 512})
+	err = f.configure(context.Background(), sock, "/rootfs", slotNet(0, "fr", 16), "console=ttyS0", "JIT", core.RunnerSpec{VCPU: 2, MemMiB: 512})
 	if err != nil {
 		t.Fatalf("configure: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestConfigure_PropagatesAPIError(t *testing.T) {
 	defer srv.Close()
 
 	f := NewFirecracker(FirecrackerConfig{KernelImage: "/k"}, testLogger())
-	if err := f.configure(context.Background(), sock, "/rootfs", slotNet(0, "fr"), "console=ttyS0", "JIT", core.RunnerSpec{VCPU: 1, MemMiB: 128}); err == nil {
+	if err := f.configure(context.Background(), sock, "/rootfs", slotNet(0, "fr", 16), "console=ttyS0", "JIT", core.RunnerSpec{VCPU: 1, MemMiB: 128}); err == nil {
 		t.Fatal("expected error from 400 response")
 	}
 }
@@ -175,7 +175,7 @@ func TestSetupTap_RunsExpectedCommands(t *testing.T) {
 		calls = append(calls, append([]string{name}, args...))
 		return nil
 	}
-	if err := f.setupTap(context.Background(), slotNet(0, "fr")); err != nil {
+	if err := f.setupTap(context.Background(), slotNet(0, "fr", 16)); err != nil {
 		t.Fatalf("setupTap: %v", err)
 	}
 	if len(calls) != 3 {

@@ -10,7 +10,7 @@ import (
 )
 
 func TestSlotNet(t *testing.T) {
-	n := slotNet(5, "fr")
+	n := slotNet(5, "fr", 16)
 	if n.tap != "fr5" {
 		t.Fatalf("tap = %q, want fr5", n.tap)
 	}
@@ -26,14 +26,34 @@ func TestSlotNet(t *testing.T) {
 }
 
 func TestSlotNetDistinctSubnets(t *testing.T) {
-	a, b := slotNet(0, "fr"), slotNet(1, "fr")
+	a, b := slotNet(0, "fr", 16), slotNet(1, "fr", 16)
 	if a.guestIP == b.guestIP || a.tap == b.tap || a.guestMAC == b.guestMAC {
 		t.Fatalf("slots overlap: %+v vs %+v", a, b)
 	}
 }
 
+// TestSlotNetDistinctNetBase asserts that two firerunner instances sharing a
+// host but using different network bases never collide on IP, MAC or tap, even
+// for the same slot index.
+func TestSlotNetDistinctNetBase(t *testing.T) {
+	a := slotNet(0, "fr", 16)
+	b := slotNet(0, "fn", 17)
+	if a.guestIP != "172.16.0.2" || b.guestIP != "172.17.0.2" {
+		t.Fatalf("ips = %q / %q, want 172.16.0.2 / 172.17.0.2", a.guestIP, b.guestIP)
+	}
+	if a.hostIP == b.hostIP || a.guestIP == b.guestIP || a.guestMAC == b.guestMAC || a.tap == b.tap {
+		t.Fatalf("instances overlap: %+v vs %+v", a, b)
+	}
+	if b.guestMAC != "06:00:AC:11:00:02" {
+		t.Fatalf("mac = %q, want 06:00:AC:11:00:02", b.guestMAC)
+	}
+	if got := vmCIDRFor(17); got != "172.17.0.0/16" {
+		t.Fatalf("vmCIDRFor(17) = %q", got)
+	}
+}
+
 func TestComposeBootArgs(t *testing.T) {
-	got := composeBootArgs("console=ttyS0 reboot=k", slotNet(3, "fr"))
+	got := composeBootArgs("console=ttyS0 reboot=k", slotNet(3, "fr", 16))
 	want := "console=ttyS0 reboot=k ip=172.16.3.2::172.16.3.1:255.255.255.252::eth0:off"
 	if got != want {
 		t.Fatalf("bootArgs =\n %q\nwant\n %q", got, want)

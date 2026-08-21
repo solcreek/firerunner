@@ -109,11 +109,15 @@ func fetchMetaCIDRs(ctx context.Context, cl *http.Client, url string, categories
 // forward filter drops any guest traffic not matching the allowlist. It is pure
 // so the generated policy can be asserted in tests.
 func buildNFTRuleset(cfg egressRuleset) string {
+	table := cfg.Table
+	if table == "" {
+		table = natTable
+	}
 	var b strings.Builder
 	// Atomic replace: ensure the table exists, delete it, recreate fresh.
-	fmt.Fprintf(&b, "add table ip %s\n", natTable)
-	fmt.Fprintf(&b, "delete table ip %s\n", natTable)
-	fmt.Fprintf(&b, "table ip %s {\n", natTable)
+	fmt.Fprintf(&b, "add table ip %s\n", table)
+	fmt.Fprintf(&b, "delete table ip %s\n", table)
+	fmt.Fprintf(&b, "table ip %s {\n", table)
 
 	if !cfg.Open {
 		fmt.Fprintf(&b, "\tset allowed {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\tauto-merge\n")
@@ -148,6 +152,9 @@ func buildNFTRuleset(cfg egressRuleset) string {
 
 // egressRuleset is the fully-resolved input to buildNFTRuleset.
 type egressRuleset struct {
+	// Table is the nftables table name to manage. Empty falls back to natTable
+	// so a second firerunner instance can own an isolated table.
+	Table      string
 	ExtIface   string
 	VMCidr     string
 	Allowed    []string

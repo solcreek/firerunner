@@ -41,6 +41,14 @@ type FirecrackerConfig struct {
 	WorkDir string
 	// TapPrefix is the prefix for per-job tap device names.
 	TapPrefix string
+	// NetBase is the second octet of the per-microVM /16 (default 16 ->
+	// 172.16.x). Distinct values let multiple firerunner instances share a host
+	// with non-overlapping guest subnets.
+	NetBase int
+	// NFTTable is the nftables table firerunner manages (default "firerunner").
+	// A second instance must use a distinct name so the two rulesets do not
+	// clobber each other.
+	NFTTable string
 	// ExtIface is the host's external interface used for microVM egress NAT
 	// (e.g. eth0, enp2s0). Required for the guest to reach GitHub.
 	ExtIface string
@@ -94,6 +102,12 @@ func NewFirecracker(cfg FirecrackerConfig, log *slog.Logger) *Firecracker {
 	if cfg.TapPrefix == "" {
 		cfg.TapPrefix = "fr"
 	}
+	if cfg.NetBase == 0 {
+		cfg.NetBase = 16
+	}
+	if cfg.NFTTable == "" {
+		cfg.NFTTable = natTable
+	}
 	if cfg.MaxVMs < 1 {
 		cfg.MaxVMs = 64
 	}
@@ -124,7 +138,7 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 		return fmt.Errorf("no free network slot (max %d microVMs)", f.cfg.MaxVMs)
 	}
 	defer f.ipam.release(slot)
-	vnet := slotNet(slot, f.cfg.TapPrefix)
+	vnet := slotNet(slot, f.cfg.TapPrefix, f.cfg.NetBase)
 
 	jobDir := filepath.Join(f.cfg.WorkDir, name)
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
@@ -211,8 +225,9 @@ func (f *Firecracker) applyNetwork(ctx context.Context) error {
 	}
 
 	rs := egressRuleset{
+		Table:      f.cfg.NFTTable,
 		ExtIface:   f.cfg.ExtIface,
-		VMCidr:     vmCIDR,
+		VMCidr:     vmCIDRFor(f.cfg.NetBase),
 		DNSServers: f.cfg.Egress.DNSServers,
 		AllowDNS:   f.cfg.Egress.has("dns"),
 		AllowNTP:   f.cfg.Egress.has("ntp"),
