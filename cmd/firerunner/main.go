@@ -8,16 +8,20 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/actions/scaleset"
 
+	"github.com/solcreek/firerunner/internal/cacheserver"
 	"github.com/solcreek/firerunner/internal/config"
 	"github.com/solcreek/firerunner/internal/diag"
 	"github.com/solcreek/firerunner/internal/listener"
@@ -34,6 +38,12 @@ func main() {
 		switch args[0] {
 		case "status", "doctor":
 			if err := diagnose(args[0], args[1:]); err != nil {
+				os.Exit(1)
+			}
+			return
+		case "cache-server":
+			if err := cacheServe(args[1:]); err != nil {
+				slog.Error("cache-server failed", "err", err)
 				os.Exit(1)
 			}
 			return
@@ -91,6 +101,47 @@ func diagnose(cmd string, args []string) error {
 	return nil
 }
 
+// cacheServe runs the self-hosted Actions dependency cache server. It binds
+// 0.0.0.0 so every microVM reaches it on its own per-slot tap gateway IP;
+// microVMs are pointed at it by firerunner's --cache-url/--cache-port config,
+// which publishes the address into the guest via MMDS.
+func cacheServe(args []string) error {
+	fs := flag.NewFlagSet("cache-server", flag.ContinueOnError)
+	addr := fs.String("addr", ":8099", "listen address")
+	dir := fs.String("dir", "/var/lib/firerunner/cache", "cache storage directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	log := config.NewLogger("info", "text")
+	slog.SetDefault(log)
+
+	srv, err := cacheserver.New(*dir, log)
+	if err != nil {
+		return err
+	}
+	stopJanitor := srv.StartJanitor()
+	defer stopJanitor()
+
+	httpSrv := &http.Server{Addr: *addr, Handler: srv}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(shutdownCtx)
+	}()
+
+	log.Info("cache-server listening", "addr", *addr, "dir", *dir)
+	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	log.Info("cache-server stopped")
+	return nil
+}
+
 func usage(w io.Writer) {
 	fmt.Fprint(w, `firerunner - ephemeral Firecracker microVM GitHub Actions runners
 
@@ -98,12 +149,17 @@ Usage:
   firerunner [flags]      run the daemon (default; see --help output of flags)
   firerunner status       show config, images, network and live microVMs
   firerunner doctor       run preflight health checks (exits non-zero on failure)
+  firerunner cache-server run the self-hosted Actions dependency cache server
   firerunner version      print the version
   firerunner help         show this help
 
 status and doctor read the same FR_* env / flags as the daemon, so run them
 with the same environment (e.g. the systemd EnvironmentFile) as the service.
 Pass --json to either for machine-readable output.
+
+cache-server flags:
+  --addr string   listen address (default ":8099")
+  --dir string    cache storage directory (default "/var/lib/firerunner/cache")
 `)
 }
 
