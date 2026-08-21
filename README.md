@@ -140,6 +140,11 @@ firerunner \
 All flags can also be set via `FR_*` environment variables (see
 `config.example.env`).
 
+Subcommands: `firerunner status` / `doctor` inspect a deployment (see below),
+`firerunner cache-server` runs the [self-hosted dependency
+cache](#self-hosted-dependency-cache---cache-port-opt-in), and `firerunner
+version` / `help` do the obvious.
+
 ### Onboarding: creating and installing the GitHub App
 
 firerunner registers runners through the Actions runner scale-set API. A GitHub
@@ -367,6 +372,74 @@ sudo images/build-toolcache.sh --out toolcache.ext4 --codeql latest
 Tailor it to a team: scan the repos you serve for their `setup-*` steps
 (`go-version-file: go.mod`, `.nvmrc`, `.python-version`) and bake only those
 versions.
+
+### Self-hosted dependency cache (`--cache-port`, opt-in)
+
+`actions/cache` (and everything built on it — `setup-node`'s `cache: pnpm`,
+`setup-go`'s build cache, `actions/setup-python`'s pip cache, etc.) normally
+uploads and downloads archives from **GitHub's hosted cache**. On a self-hosted
+runner every restore still crosses the internet to GitHub, and each repo is
+capped at a 10 GB quota. firerunner can instead keep those archives on the
+host's local disk, so dependency restore runs at LAN speed with no quota.
+
+**How GitHub's cache works (v2).** The `@actions/cache` toolkit talks a small
+Twirp/JSON RPC to the service at `ACTIONS_RESULTS_URL`
+(`CreateCacheEntry` → `FinalizeCacheEntryUpload` → `GetCacheEntryDownloadURL`),
+then streams the `tar+zstd` archive to/from a signed blob URL the RPC returns
+(never through the RPC itself). Entries are keyed by `key`+`version`, namespaced
+per repository, immutable, and restored by exact key first then `restore-keys`
+as prefixes.
+
+**Our server.** `firerunner cache-server` is a small, dependency-free
+implementation of exactly that protocol, backed by a directory on disk:
+
+```bash
+firerunner cache-server --addr :8099 --dir /var/lib/firerunner/cache
+```
+
+It implements the three Twirp methods plus the Azure block-blob upload
+(single-shot and staged `comp=block`/`comp=blocklist`) and ranged downloads,
+namespaces entries by `repository_id`, guards each blob URL with a per-entry
+token, and persists an index so caches survive restarts.
+
+**Pointing microVMs at it.** Two pieces are needed because the *real* GitHub
+runner overwrites `ACTIONS_RESULTS_URL` with the value from its per-job message:
+
+1. **Config** — run firerunner with `--cache-port 8099` (env `FR_CACHE_PORT`).
+   firerunner publishes the port to each microVM via MMDS; the guest boot script
+   builds `ACTIONS_RESULTS_URL` from its own default gateway (the host's per-slot
+   tap IP) and this port, so the URL always points back at the host. For a
+   cache-server that is *not* on the host gateway, use `--cache-url
+   http://host:8099` (env `FR_CACHE_URL`) instead, and add its host to the
+   egress allowlist.
+2. **A cache-redirect golden** — build the rootfs with
+   `build-ubuntu-rootfs.sh --cache-redirect`. This renames the
+   `ACTIONS_RESULTS_URL` string inside the runner agent so GitHub's URL lands in
+   a dead variable while `actions/cache` still reads the real one firerunner
+   exported. Without this patch the runner overrides our URL and caching stays on
+   GitHub.
+
+```bash
+# 1. build a cache-redirect golden (pair it with a --toolcache drive as usual):
+sudo images/build-ubuntu-rootfs.sh --toolset minimal --cache-redirect \
+  --out /var/lib/firerunner/ubuntu-rootfs-minimal.ext4
+# 2. run the cache-server, then point firerunner at it:
+firerunner cache-server --dir /var/lib/firerunner/cache &
+firerunner ... --golden /var/lib/firerunner/ubuntu-rootfs-minimal.ext4 --cache-port 8099
+```
+
+`status` shows the resolved cache configuration and `doctor` probes the
+cache-server for reachability; both note that the cache is off by default and
+that jobs fall back to GitHub's hosted cache when it is not configured.
+
+**Security model.** Entries are isolated per `repository_id`, so caches never
+leak across repositories. Within a repository the semantics match GitHub's
+(any job can read and write) **minus ref-scoping**: on a shared server a job
+triggered by untrusted code (e.g. a fork PR) can write an entry a later trusted
+job restores. Run **one cache-server per trust boundary** (e.g. don't share one
+cache across repos with different trust levels), exactly as you would isolate
+any self-hosted runner. The cache is a pure accelerator — every job still passes
+with caching disabled.
 
 ### Running as a service (systemd)
 
