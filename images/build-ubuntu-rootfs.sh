@@ -247,6 +247,19 @@ docker rm -f fr-rootfs-export >/dev/null
 mkdir -p "$ROOT/proc" "$ROOT/sys" "$ROOT/dev" "$ROOT/run" "$ROOT/tmp"
 chmod 1777 "$ROOT/tmp"
 
+# docker bind-mounts /etc/resolv.conf, /etc/hosts and /etc/hostname at runtime,
+# so `docker export` captures them as EMPTY files and shadows anything the
+# Dockerfile COPY'd in. An empty resolv.conf means the guest has no nameserver,
+# and the runner's connect to *.actions.githubusercontent.com fails with
+# EAI_AGAIN ("Resource temporarily unavailable"). Write them into the extracted
+# rootfs directly, after export, so the microVM boots with working DNS.
+{ for ns in $DNS_SERVERS; do echo "nameserver $ns"; done; } > "$ROOT/etc/resolv.conf"
+cat > "$ROOT/etc/hosts" <<'HOSTS'
+127.0.0.1	localhost
+::1	localhost ip6-localhost ip6-loopback
+HOSTS
+echo firerunner > "$ROOT/etc/hostname"
+
 if [[ -z "$SIZE_MB" ]]; then
   used_mb="$(du -sm "$ROOT" | awk '{print $1}')"
   SIZE_MB=$(( used_mb + used_mb * MARGIN_PCT / 100 + 512 ))
