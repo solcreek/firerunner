@@ -50,9 +50,11 @@ func TestBuildLabels(t *testing.T) {
 	if got := buildLabels("firerunner", nil); len(got) != 1 || got[0].Name != "firerunner" {
 		t.Fatalf("default labels = %v, want [firerunner]", got)
 	}
-	got := buildLabels("firerunner", []string{"a", "b"})
-	if len(got) != 2 || got[0].Name != "a" || got[1].Name != "b" {
-		t.Fatalf("labels = %v, want [a b]", got)
+	// The name is always advertised first; extra labels are additive and the
+	// name is not duplicated if repeated in the extras.
+	got := buildLabels("firerunner-node", []string{"node", "firerunner-node", "gpu"})
+	if len(got) != 3 || got[0].Name != "firerunner-node" || got[1].Name != "node" || got[2].Name != "gpu" {
+		t.Fatalf("labels = %v, want [firerunner-node node gpu]", got)
 	}
 }
 

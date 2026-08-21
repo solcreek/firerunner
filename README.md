@@ -175,6 +175,11 @@ existing deployments are unchanged.
 > trusted catalog you publish, but never injects its own rootfs. Define new
 > tiers by building an image (see [`images/`](images/)) and adding an entry.
 
+Each tier is reachable with `runs-on: <name>`. An optional `"labels"` array
+adds **extra** `runs-on` aliases for a tier (the tier name is always advertised
+too), e.g. `"labels": ["node"]` lets a job target the tier with either
+`runs-on: firerunner-node` or `runs-on: node`.
+
 ### Inspecting a deployment (`status`, `doctor`)
 
 Two read-only subcommands help operators inspect and diagnose a runner host.

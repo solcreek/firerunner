@@ -249,13 +249,16 @@ func runnerGroupID(ctx context.Context, client *scaleset.Client, group string) (
 	return rg.ID, nil
 }
 
+// buildLabels always advertises the scale set name as a label so a job can
+// reach the tier with runs-on: <name>; extra labels are additive (GitHub routes
+// jobs by matching runs-on against the advertised labels, so dropping the name
+// would make the tier unreachable by its own name).
 func buildLabels(name string, labels []string) []scaleset.Label {
-	if len(labels) == 0 {
-		return []scaleset.Label{{Name: name}}
-	}
-	out := make([]scaleset.Label, len(labels))
-	for i, l := range labels {
-		out[i] = scaleset.Label{Name: l}
+	out := []scaleset.Label{{Name: name}}
+	for _, l := range labels {
+		if l != name {
+			out = append(out, scaleset.Label{Name: l})
+		}
 	}
 	return out
 }
