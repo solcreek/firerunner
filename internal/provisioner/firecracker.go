@@ -227,12 +227,14 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 
 	if err := waitForSocket(ctx, sock, 5*time.Second); err != nil {
 		_ = cmd.Process.Kill()
+		_ = cmd.Wait() // reap the killed VMM so it leaves no zombie/fd/goroutine
 		return fmt.Errorf("wait for api socket: %w", err)
 	}
 
 	bootArgs := composeBootArgs(f.cfg.BootArgs, vnet)
 	if err := f.configure(ctx, sock, kernelPath, rootfsPath, f.fcToolCachePath(spec), vnet, bootArgs, jitConfig, spec); err != nil {
 		_ = cmd.Process.Kill()
+		_ = cmd.Wait() // reap the killed VMM so it leaves no zombie/fd/goroutine
 		return fmt.Errorf("configure microVM: %w", err)
 	}
 
