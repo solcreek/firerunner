@@ -109,7 +109,7 @@ func diagnose(cmd string, args []string) error {
 // which publishes the address into the guest via MMDS.
 func cacheServe(args []string) error {
 	fs := flag.NewFlagSet("cache-server", flag.ContinueOnError)
-	addr := fs.String("addr", ":8099", "listen address")
+	addr := fs.String("addr", "127.0.0.1:8099", "listen address (bind to a guest-facing gateway IP for microVM access; the server is unauthenticated so never expose it on a public interface)")
 	dir := fs.String("dir", "/var/lib/firerunner/cache", "cache storage directory")
 	maxSize := fs.String("max-size", "50GB", "evict least-recently-used entries above this total size (e.g. 50GB, 0 for unlimited)")
 	if err := fs.Parse(args); err != nil {
@@ -130,7 +130,18 @@ func cacheServe(args []string) error {
 	stopJanitor := srv.StartJanitor()
 	defer stopJanitor()
 
-	httpSrv := &http.Server{Addr: *addr, Handler: srv}
+	httpSrv := &http.Server{
+		Addr:    *addr,
+		Handler: srv,
+		// The server is unauthenticated and internet-adjacent; bound timeouts
+		// keep a slow or stalled client from pinning a connection (and its
+		// goroutine/fd) indefinitely. Body reads are streamed to disk with no
+		// overall deadline because a large cache archive can legitimately take a
+		// while, so slow-body abuse is bounded by the per-entry upload cap
+		// instead; header and idle phases get hard limits here.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -199,7 +210,9 @@ with the same environment (e.g. the systemd EnvironmentFile) as the service.
 Pass --json to either for machine-readable output.
 
 cache-server flags:
-  --addr string      listen address (default ":8099")
+  --addr string      listen address (default "127.0.0.1:8099"; bind to a
+                     guest-facing gateway IP for microVM access — never expose
+                     this unauthenticated server on a public interface)
   --dir string       cache storage directory (default "/var/lib/firerunner/cache")
   --max-size string  evict LRU entries above this total size (default "50GB"; 0 = unlimited)
 `)

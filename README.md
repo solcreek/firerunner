@@ -413,7 +413,7 @@ as prefixes.
 implementation of exactly that protocol, backed by a directory on disk:
 
 ```bash
-firerunner cache-server --addr :8099 --dir /var/lib/firerunner/cache
+firerunner cache-server --dir /var/lib/firerunner/cache
 ```
 
 It implements the three Twirp methods plus the Azure block-blob upload
@@ -422,13 +422,20 @@ tags each blob URL with a per-entry token, and persists an index so caches
 survive restarts. It performs **no authentication** and enforces **no tenant
 isolation** — see the security model below before deploying it.
 
+It binds `127.0.0.1:8099` by default. Because each microVM slot reaches the host
+on its own per-slot gateway IP (`172.16.<slot>.1`), serving guests means binding
+a broader address — in practice `--addr 0.0.0.0:8099`, which the host firewall
+**must** then keep off any LAN/WAN interface (the guest→host input chain already
+restricts guests to the cache port, but the host's own external NIC is your
+responsibility). Never leave `0.0.0.0:8099` reachable from an untrusted network.
+
 By default the store is capped at 50 GB; once a newly finalized entry pushes the
 total over the cap, the least-recently-used entries are evicted until it fits
 (mirroring GitHub's per-repo LRU). Tune it with `--max-size` (e.g. `--max-size
 100GB`, or `--max-size 0` for unlimited):
 
 ```bash
-firerunner cache-server --addr :8099 --dir /var/lib/firerunner/cache --max-size 50GB
+firerunner cache-server --dir /var/lib/firerunner/cache --max-size 50GB
 ```
 
 The server also exposes `GET /stats` (JSON: entry count, bytes, hits, misses,
@@ -457,8 +464,10 @@ runner overwrites `ACTIONS_RESULTS_URL` with the value from its per-job message:
 # 1. build a cache-redirect golden (pair it with a --toolcache drive as usual):
 sudo images/build-ubuntu-rootfs.sh --toolset minimal --cache-redirect \
   --out /var/lib/firerunner/ubuntu-rootfs-minimal.ext4
-# 2. run the cache-server, then point firerunner at it:
-firerunner cache-server --dir /var/lib/firerunner/cache &
+# 2. run the cache-server bound to the guest-facing address, then point
+#    firerunner at it (0.0.0.0 serves every per-slot gateway; keep it firewalled
+#    off any LAN/WAN interface):
+firerunner cache-server --addr 0.0.0.0:8099 --dir /var/lib/firerunner/cache &
 firerunner ... --golden /var/lib/firerunner/ubuntu-rootfs-minimal.ext4 --cache-port 8099
 ```
 
