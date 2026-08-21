@@ -778,3 +778,31 @@ func TestBusyDetectorReportsFullWrite(t *testing.T) {
 		t.Fatalf("Write = %d,%v want %d,nil", n, err, len(p))
 	}
 }
+
+func TestSanitizedEnv_ExcludesSecrets(t *testing.T) {
+	t.Setenv("FR_TOKEN", "ghp_secret")
+	t.Setenv("FR_APP_PRIVATE_KEY", "-----BEGIN RSA PRIVATE KEY-----")
+	t.Setenv("HOME", "/home/firerunner")
+	t.Setenv("PATH", "/custom/bin")
+
+	env := sanitizedEnv()
+
+	var hasPath, hasHome bool
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "FR_") {
+			t.Errorf("sanitizedEnv leaked secret: %q", kv)
+		}
+		switch {
+		case kv == "PATH=/custom/bin":
+			hasPath = true
+		case kv == "HOME=/home/firerunner":
+			hasHome = true
+		}
+	}
+	if !hasPath {
+		t.Error("sanitizedEnv should forward PATH")
+	}
+	if !hasHome {
+		t.Error("sanitizedEnv should forward HOME")
+	}
+}

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -122,6 +123,28 @@ func TestFromFlags_EnvFallback(t *testing.T) {
 	}
 	if c.Firecracker.KernelImage != "/env-kernel" || c.VCPU != 2 || c.Token != "ghp_env" {
 		t.Fatalf("env fallback not applied: %+v", c)
+	}
+}
+
+// A malformed typed env var must fail closed rather than silently reverting to
+// the default (the pre-fix fail-open behaviour).
+func TestParse_MalformedEnvFailsClosed(t *testing.T) {
+	cases := map[string]string{
+		"FR_VCPU":         "notanint",
+		"FR_JAILER":       "yesplease",
+		"FR_META_REFRESH": "5parsecs",
+	}
+	for key, val := range cases {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv(key, val)
+			_, err := Parse(nil)
+			if err == nil {
+				t.Fatalf("%s=%q should error, got nil", key, val)
+			}
+			if !strings.Contains(err.Error(), key) {
+				t.Fatalf("error should name %s, got: %v", key, err)
+			}
+		})
 	}
 }
 

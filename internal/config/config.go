@@ -127,21 +127,22 @@ func Parse(args []string) (*Config, error) {
 	fs := flag.NewFlagSet("firerunner", flag.ContinueOnError)
 	c := &Config{}
 	var labels string
+	er := &envReader{}
 
 	fs.StringVar(&c.URL, "url", env("FR_URL", ""), "GitHub org or repo URL to register the scale set (required)")
 	fs.StringVar(&c.ScaleSetName, "name", env("FR_NAME", "firerunner"), "scale set name; also the runs-on label")
 	fs.StringVar(&c.RunnerGroup, "runner-group", env("FR_RUNNER_GROUP", "default"), "runner group name")
 	fs.StringVar(&labels, "labels", env("FR_LABELS", ""), "extra comma-separated runs-on labels")
-	fs.IntVar(&c.MaxRunners, "max-runners", envInt("FR_MAX_RUNNERS", 4), "max concurrent microVMs")
-	fs.IntVar(&c.MinRunners, "min-runners", envInt("FR_MIN_RUNNERS", 0), "warm pool size: microVMs kept pre-booted and registered so jobs start without a cold boot (0 = on-demand; higher = faster pickup, more idle RAM)")
+	fs.IntVar(&c.MaxRunners, "max-runners", er.int("FR_MAX_RUNNERS", 4), "max concurrent microVMs")
+	fs.IntVar(&c.MinRunners, "min-runners", er.int("FR_MIN_RUNNERS", 0), "warm pool size: microVMs kept pre-booted and registered so jobs start without a cold boot (0 = on-demand; higher = faster pickup, more idle RAM)")
 
 	fs.StringVar(&c.Token, "token", env("FR_TOKEN", ""), "GitHub PAT (use a GitHub App in production)")
 	fs.StringVar(&c.AppClientID, "app-client-id", env("FR_APP_CLIENT_ID", ""), "GitHub App client id")
-	fs.Int64Var(&c.AppInstallID, "app-installation-id", int64(envInt("FR_APP_INSTALLATION_ID", 0)), "GitHub App installation id")
+	fs.Int64Var(&c.AppInstallID, "app-installation-id", int64(er.int("FR_APP_INSTALLATION_ID", 0)), "GitHub App installation id")
 	fs.StringVar(&c.AppPrivateKey, "app-private-key", env("FR_APP_PRIVATE_KEY", ""), "GitHub App private key (PEM path or contents)")
 
-	fs.IntVar(&c.VCPU, "vcpu", envInt("FR_VCPU", 4), "vCPUs per microVM")
-	fs.IntVar(&c.MemMiB, "mem-mib", envInt("FR_MEM_MIB", 8192), "guest memory (MiB) per microVM")
+	fs.IntVar(&c.VCPU, "vcpu", er.int("FR_VCPU", 4), "vCPUs per microVM")
+	fs.IntVar(&c.MemMiB, "mem-mib", er.int("FR_MEM_MIB", 8192), "guest memory (MiB) per microVM")
 
 	fs.StringVar(&c.TiersPath, "tiers", env("FR_TIERS", ""), "path to a JSON tier catalog (array of {name,vcpu,mem_mib,golden,toolcache,min,max,labels}). When set, firerunner serves every tier from this one process and developers pick one with runs-on: <name>; --max-runners is the shared slot budget. When unset, a single tier is derived from --name/--vcpu/--mem-mib/--golden.")
 
@@ -150,34 +151,39 @@ func Parse(args []string) (*Config, error) {
 	fs.StringVar(&c.Firecracker.GoldenRootFS, "golden", env("FR_GOLDEN", ""), "path to immutable golden rootfs (required)")
 	fs.StringVar(&c.Firecracker.WorkDir, "workdir", env("FR_WORKDIR", "/var/tmp/firerunner"), "reflink-capable work dir for per-job rootfs")
 	fs.StringVar(&c.Firecracker.TapPrefix, "tap-prefix", env("FR_TAP_PREFIX", "fr"), "prefix for per-job tap devices; must be unique per instance when several firerunners share a host")
-	fs.IntVar(&c.Firecracker.NetBase, "net-base", envInt("FR_NET_BASE", 16), "second octet of the per-microVM /16 (172.<base>.x); must differ per instance sharing a host")
+	fs.IntVar(&c.Firecracker.NetBase, "net-base", er.int("FR_NET_BASE", 16), "second octet of the per-microVM /16 (172.<base>.x); must differ per instance sharing a host")
 	fs.StringVar(&c.Firecracker.NFTTable, "nft-table", env("FR_NFT_TABLE", "firerunner"), "nftables table name; must be unique per instance when several firerunners share a host")
 	fs.StringVar(&c.Firecracker.BootArgs, "boot-args", env("FR_BOOT_ARGS", ""), "kernel command line (default keeps reboot=k)")
 	fs.StringVar(&c.Firecracker.ExtIface, "ext-iface", env("FR_EXT_IFACE", ""), "host external interface for microVM egress NAT (required)")
 	fs.StringVar(&c.Firecracker.LogDir, "log-dir", env("FR_LOG_DIR", ""), "directory for per-runner console logs (off-VM log forwarding)")
 
-	fs.BoolVar(&c.Firecracker.Jailer, "jailer", envBool("FR_JAILER", false), "run each microVM under the Firecracker jailer (chroot + PID ns + privilege drop); opt-in, requires a root launcher and --jail-uid/--jail-gid")
+	fs.BoolVar(&c.Firecracker.Jailer, "jailer", er.boolean("FR_JAILER", false), "run each microVM under the Firecracker jailer (chroot + PID ns + privilege drop); opt-in, requires a root launcher and --jail-uid/--jail-gid")
 	fs.StringVar(&c.Firecracker.JailerBin, "jailer-bin", env("FR_JAILER_BIN", "jailer"), "path to the jailer binary (must match the firecracker version)")
 	fs.StringVar(&c.Firecracker.ChrootBase, "chroot-base", env("FR_CHROOT_BASE", "/srv/jailer"), "jailer chroot base dir")
-	fs.IntVar(&c.Firecracker.JailUID, "jail-uid", envInt("FR_JAIL_UID", 0), "uid the jailer drops Firecracker to (required with --jailer)")
-	fs.IntVar(&c.Firecracker.JailGID, "jail-gid", envInt("FR_JAIL_GID", 0), "gid the jailer drops Firecracker to (required with --jailer)")
+	fs.IntVar(&c.Firecracker.JailUID, "jail-uid", er.int("FR_JAIL_UID", 0), "uid the jailer drops Firecracker to (required with --jailer)")
+	fs.IntVar(&c.Firecracker.JailGID, "jail-gid", er.int("FR_JAIL_GID", 0), "gid the jailer drops Firecracker to (required with --jailer)")
 	var jailerCgroup string
 	fs.StringVar(&jailerCgroup, "jailer-cgroup", env("FR_JAILER_CGROUP", ""), "semicolon-separated cgroup v2 limits applied to each microVM via the jailer, each <file>=<value> (e.g. \"memory.max=2147483648;cpu.max=200000;pids.max=512\"); requires --jailer")
-	fs.BoolVar(&c.Firecracker.NetNS, "netns", envBool("FR_NETNS", false), "run each microVM in its own network namespace (tap lives in the netns, veth uplink to the host); strongest network isolation, requires --jailer")
+	fs.BoolVar(&c.Firecracker.NetNS, "netns", er.boolean("FR_NETNS", false), "run each microVM in its own network namespace (tap lives in the netns, veth uplink to the host); strongest network isolation, requires --jailer")
 	fs.StringVar(&c.Firecracker.ToolCacheImage, "toolcache", env("FR_TOOLCACHE", ""), "path to a read-only ext4 image (labelled \"hostedtoolcache\", mirroring GitHub's tool-cache layout) attached to every microVM so setup-* actions hit a pre-seeded cache instead of downloading; opt-in accelerator, jobs fall back to downloading when unset")
-	fs.IntVar(&c.Firecracker.CachePort, "cache-port", envInt("FR_CACHE_PORT", 0), "TCP port of a firerunner cache-server reachable on each microVM's host gateway; when set, microVMs use it for actions/cache (dependency caching) instead of GitHub's hosted cache. Opt-in and off by default; the guest builds the URL from its default gateway and this port")
+	fs.IntVar(&c.Firecracker.CachePort, "cache-port", er.int("FR_CACHE_PORT", 0), "TCP port of a firerunner cache-server reachable on each microVM's host gateway; when set, microVMs use it for actions/cache (dependency caching) instead of GitHub's hosted cache. Opt-in and off by default; the guest builds the URL from its default gateway and this port")
 	fs.StringVar(&c.Firecracker.CacheURL, "cache-url", env("FR_CACHE_URL", ""), "explicit base URL of a firerunner cache-server (e.g. http://cache.internal:8099); overrides --cache-port for deployments where the cache-server is not on the microVM's host gateway. Opt-in and off by default")
 
 	var egress, dnsServers string
 	var metaRefresh time.Duration
 	fs.StringVar(&egress, "egress", env("FR_EGRESS", "api,actions,git,dns,packages,ntp"), "comma-separated egress allowlist: GitHub /meta categories (api,actions,git,packages) plus dns,ntp; or 'open' for no allowlist")
 	fs.StringVar(&dnsServers, "dns-servers", env("FR_DNS_SERVERS", "1.1.1.1,8.8.8.8"), "comma-separated resolver IPs guests may reach")
-	fs.DurationVar(&metaRefresh, "meta-refresh", envDuration("FR_META_REFRESH", 24*time.Hour), "how often to refresh GitHub /meta ranges (0 disables)")
+	fs.DurationVar(&metaRefresh, "meta-refresh", er.duration("FR_META_REFRESH", 24*time.Hour), "how often to refresh GitHub /meta ranges (0 disables)")
 
 	fs.StringVar(&c.LogLevel, "log-level", env("FR_LOG_LEVEL", "info"), "log level: debug, info, warn, error")
 	fs.StringVar(&c.LogFormat, "log-format", env("FR_LOG_FORMAT", "text"), "log format: text or json")
 
 	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+	// Surface any malformed FR_* env values now, so a typo fails closed instead
+	// of silently running with a default.
+	if err := er.err(); err != nil {
 		return nil, err
 	}
 	if labels != "" {
@@ -384,29 +390,58 @@ func env(key, def string) string {
 	return def
 }
 
-func envInt(key string, def int) int {
+// envReader parses typed environment variables while accumulating parse errors
+// instead of silently falling back to the default. A malformed FR_* value is a
+// misconfiguration the operator must see, not something to paper over — Parse
+// surfaces any accumulated errors so firerunner fails closed rather than running
+// with unintended defaults.
+type envReader struct {
+	errs []string
+}
+
+func (r *envReader) fail(key, val string, err error) {
+	r.errs = append(r.errs, fmt.Sprintf("%s=%q: %v", key, val, err))
+}
+
+func (r *envReader) err() error {
+	if len(r.errs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("invalid environment configuration: %s", strings.Join(r.errs, "; "))
+}
+
+func (r *envReader) int(key string, def int) int {
 	if v, ok := os.LookupEnv(key); ok {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			r.fail(key, v, err)
+			return def
 		}
+		return n
 	}
 	return def
 }
 
-func envBool(key string, def bool) bool {
+func (r *envReader) boolean(key string, def bool) bool {
 	if v, ok := os.LookupEnv(key); ok {
-		if b, err := strconv.ParseBool(v); err == nil {
-			return b
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			r.fail(key, v, err)
+			return def
 		}
+		return b
 	}
 	return def
 }
 
-func envDuration(key string, def time.Duration) time.Duration {
+func (r *envReader) duration(key string, def time.Duration) time.Duration {
 	if v, ok := os.LookupEnv(key); ok {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			r.fail(key, v, err)
+			return def
 		}
+		return d
 	}
 	return def
 }

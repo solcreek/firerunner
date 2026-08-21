@@ -238,10 +238,27 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 
 	f.log.Info("microVM started", "runner", name, "slot", slot, "guestIP", vnet.guestIP, "vcpu", spec.VCPU, "memMiB", spec.MemMiB)
 	err = cmd.Wait() // returns when the guest reboots (self-destruct)
-	f.log.Info("microVM exited", "runner", name, "err", err)
-	// A clean self-destruct makes the VMM exit non-zero on some kernels; that
-	// is expected and not treated as a launch failure.
-	return nil
+	if err == nil {
+		f.log.Info("microVM exited", "runner", name)
+		return nil
+	}
+	// We cancelled this VM ourselves (idle-drain / shutdown SIGKILLs the VMM via
+	// exec.CommandContext); that death is expected, not a failure.
+	if ctx.Err() != nil {
+		f.log.Info("microVM cancelled", "runner", name)
+		return nil
+	}
+	// The guest's reboot=k self-destruct makes the VMM exit non-zero on some
+	// kernels, so a normal non-zero process exit after a successful boot is
+	// expected. Anything else (I/O error, lost process, OOM before boot) is a
+	// real failure and must be surfaced rather than swallowed.
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		f.log.Info("microVM exited", "runner", name, "code", exitErr.ExitCode())
+		return nil
+	}
+	f.log.Error("microVM wait failed", "runner", name, "err", err)
+	return fmt.Errorf("wait for microVM %s: %w", name, err)
 }
 
 // SetupNetwork installs host forwarding, the egress allowlist and NAT exactly
@@ -718,6 +735,7 @@ func (f *Firecracker) prepare(ctx context.Context, name string, vnet vmNet, cons
 		sock = filepath.Join(root, "run", "firecracker.socket")
 		cmd = exec.CommandContext(ctx, f.cfg.JailerBin, buildJailerArgs(f.cfg, name, nsPath)...)
 		cmd.Stdout, cmd.Stderr = console, console
+		cmd.Env = sanitizedEnv()
 		return cmd, sock, "/vmlinux", "/rootfs.ext4", cleanup, nil
 	}
 
@@ -734,7 +752,27 @@ func (f *Firecracker) prepare(ctx context.Context, name string, vnet vmNet, cons
 	sock = filepath.Join(jobDir, "fc.sock")
 	cmd = exec.CommandContext(ctx, f.cfg.Binary, "--api-sock", sock, "--id", name)
 	cmd.Stdout, cmd.Stderr = console, console
+	cmd.Env = sanitizedEnv()
 	return cmd, sock, f.cfg.KernelImage, rootfs, cleanup, nil
+}
+
+// sanitizedEnv returns a minimal environment for the Firecracker/jailer child so
+// the firerunner daemon's own secrets (FR_TOKEN, FR_APP_PRIVATE_KEY, …) never
+// leak into the VMM process environment, which is world-readable via
+// /proc/<pid>/environ. Only PATH (needed to resolve helper binaries) plus HOME
+// and TMPDIR are forwarded.
+func sanitizedEnv() []string {
+	path := os.Getenv("PATH")
+	if path == "" {
+		path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	}
+	env := []string{"PATH=" + path}
+	for _, key := range []string{"HOME", "TMPDIR"} {
+		if v, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+v)
+		}
+	}
+	return env
 }
 
 // CleanupStale reclaims host resources left behind by microVMs from a previous,
