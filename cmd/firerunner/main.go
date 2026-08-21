@@ -112,12 +112,17 @@ func cacheServe(args []string) error {
 	addr := fs.String("addr", "127.0.0.1:8099", "listen address (bind to a guest-facing gateway IP for microVM access; the server is unauthenticated so never expose it on a public interface)")
 	dir := fs.String("dir", "/var/lib/firerunner/cache", "cache storage directory")
 	maxSize := fs.String("max-size", "50GB", "evict least-recently-used entries above this total size (e.g. 50GB, 0 for unlimited)")
+	maxEntry := fs.String("max-entry-size", "10GB", "refuse any single cache entry larger than this (e.g. 10GB, 0 for unlimited)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	maxBytes, err := parseSize(*maxSize)
 	if err != nil {
 		return fmt.Errorf("--max-size: %w", err)
+	}
+	maxEntryBytes, err := parseSize(*maxEntry)
+	if err != nil {
+		return fmt.Errorf("--max-entry-size: %w", err)
 	}
 	log := config.NewLogger("info", "text")
 	slog.SetDefault(log)
@@ -127,6 +132,7 @@ func cacheServe(args []string) error {
 		return err
 	}
 	srv.SetMaxSize(maxBytes)
+	srv.SetMaxEntrySize(maxEntryBytes)
 	stopJanitor := srv.StartJanitor()
 	defer stopJanitor()
 
@@ -215,6 +221,7 @@ cache-server flags:
                      this unauthenticated server on a public interface)
   --dir string       cache storage directory (default "/var/lib/firerunner/cache")
   --max-size string  evict LRU entries above this total size (default "50GB"; 0 = unlimited)
+  --max-entry-size string  refuse any single entry larger than this (default "10GB"; 0 = unlimited)
 `)
 }
 

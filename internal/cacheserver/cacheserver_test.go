@@ -447,3 +447,67 @@ func TestStorePermsAreTight(t *testing.T) {
 		}
 	}
 }
+
+// TestMaxEntrySizeRejectsSingleShot verifies a single-shot PUT over the
+// per-entry cap is refused mid-stream (413) and leaves no oversized blob behind,
+// so one job cannot fill the host disk with an unbounded upload.
+func TestMaxEntrySizeRejectsSingleShot(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s.SetMaxEntrySize(1024)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	create := twirp(t, ts.URL, "CreateCacheEntry", createReq{Key: "k", Version: "v"})
+	uploadURL := create["signed_upload_url"].(string)
+
+	req, _ := http.NewRequest(http.MethodPut, uploadURL, bytes.NewReader(bytes.Repeat([]byte("x"), 4096)))
+	req.Header.Set("x-ms-blob-type", "BlockBlob")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PUT: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+	if fi, err := os.Stat(s.blobPath(1)); err == nil {
+		t.Fatalf("oversized blob left on disk: %d bytes", fi.Size())
+	}
+}
+
+// TestMaxEntrySizeRejectsBlockList verifies staged blocks whose committed total
+// exceeds the cap are refused and the live blob path is never created.
+func TestMaxEntrySizeRejectsBlockList(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s.SetMaxEntrySize(1024)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	create := twirp(t, ts.URL, "CreateCacheEntry", createReq{Key: "big", Version: "v"})
+	uploadURL := create["signed_upload_url"].(string)
+
+	// Stage one 4 KiB block, then commit it: assembled total (4096) > cap (1024).
+	blockID := "blk-0"
+	stage := uploadURL + "&comp=block&blockid=" + blockID
+	req, _ := http.NewRequest(http.MethodPut, stage, bytes.NewReader(bytes.Repeat([]byte("y"), 4096)))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("stage block: %v", err)
+	}
+	resp.Body.Close()
+	// The block itself already exceeds the remaining budget, so it is refused.
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("stage status = %d, want 413", resp.StatusCode)
+	}
+	if _, err := os.Stat(s.blobPath(1)); err == nil {
+		t.Fatal("blob created despite over-cap upload")
+	}
+}

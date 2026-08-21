@@ -51,6 +51,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -95,10 +96,12 @@ type Server struct {
 	log *slog.Logger
 	mux *http.ServeMux
 
-	mu      sync.Mutex
-	entries map[uint64]*Entry
-	nextID  uint64
-	maxSize int64 // 0 = unlimited; total completed-blob bytes to keep
+	mu       sync.Mutex
+	entries  map[uint64]*Entry
+	nextID   uint64
+	maxSize  int64            // 0 = unlimited; total completed-blob bytes to keep
+	maxEntry int64            // 0 = unlimited; hard cap on a single entry's blob
+	staged   map[uint64]int64 // bytes written so far for a not-yet-finalized entry
 
 	// counters (under mu) for observability via /stats and /metrics.
 	hits      uint64
@@ -143,6 +146,23 @@ func (s *Server) SetMaxSize(n int64) {
 	s.mu.Unlock()
 }
 
+// SetMaxEntrySize caps the size of any single cache entry's blob. Uploads that
+// exceed it are refused (413) mid-stream rather than after the fact, so one job
+// cannot fill the host disk with a single unbounded upload. A non-positive value
+// means unlimited. Call before serving.
+func (s *Server) SetMaxEntrySize(n int64) {
+	s.mu.Lock()
+	s.maxEntry = n
+	s.mu.Unlock()
+}
+
+// entryCap returns the effective per-entry byte cap (0 = unlimited).
+func (s *Server) entryCap() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.maxEntry
+}
+
 // New opens (creating if needed) a cache store rooted at dir and returns a
 // ready-to-serve Server. The on-disk index is loaded so caches survive restarts.
 func New(dir string, log *slog.Logger) (*Server, error) {
@@ -164,6 +184,7 @@ func New(dir string, log *slog.Logger) (*Server, error) {
 		dir:     dir,
 		log:     log.With("module", "cacheserver"),
 		entries: make(map[uint64]*Entry),
+		staged:  make(map[uint64]int64),
 		nextID:  1,
 	}
 	if err := s.load(); err != nil {
@@ -331,6 +352,7 @@ func (s *Server) handleFinalize(w http.ResponseWriter, r *http.Request) {
 	e.Size = fi.Size()
 	e.Complete = true
 	e.UsedAt = time.Now().Unix()
+	delete(s.staged, e.ID) // it now counts as a completed blob, not in-flight
 	s.saves++
 	s.evictLRU(e.ID)
 	if err := s.save(); err != nil {
@@ -396,10 +418,19 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) uploadSingle(w http.ResponseWriter, r *http.Request, e *Entry) {
-	if err := writeFile(s.blobPath(e.ID), r.Body); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	body := r.Body
+	if cap := s.entryCap(); cap > 0 {
+		body = http.MaxBytesReader(w, r.Body, cap)
+	}
+	n, err := writeFile(s.blobPath(e.ID), body)
+	if err != nil {
+		_ = os.Remove(s.blobPath(e.ID)) // don't leave an oversized/partial blob squatting disk
+		s.clearStaged(e.ID)
+		code, msg := uploadStatus(err)
+		http.Error(w, msg, code)
 		return
 	}
+	s.setStaged(e.ID, n)
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -414,10 +445,25 @@ func (s *Server) uploadBlock(w http.ResponseWriter, r *http.Request, e *Entry) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if err := writeFile(filepath.Join(dir, hex.EncodeToString([]byte(blockID))), r.Body); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	body := r.Body
+	if cap := s.entryCap(); cap > 0 {
+		// Bound the block by the entry's remaining budget so staged blocks can't
+		// accumulate past the per-entry cap before the block list is committed.
+		remaining := cap - s.stagedBytes(e.ID)
+		if remaining < 0 {
+			remaining = 0
+		}
+		body = http.MaxBytesReader(w, r.Body, remaining)
+	}
+	blockPath := filepath.Join(dir, hex.EncodeToString([]byte(blockID)))
+	n, err := writeFile(blockPath, body)
+	if err != nil {
+		_ = os.Remove(blockPath)
+		code, msg := uploadStatus(err)
+		http.Error(w, msg, code)
 		return
 	}
+	s.addStaged(e.ID, n)
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -444,28 +490,58 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 		return
 	}
 
+	// Assemble into a temp file and rename over the blob only once it is fully
+	// built and within the per-entry cap. Streaming straight into the live blob
+	// would truncate a previously finalized entry the instant a commit arrives,
+	// even if a staged block is missing or the total exceeds the cap.
 	dir := s.tmpDir(e.ID)
-	out, err := os.Create(s.blobPath(e.ID))
+	tmp := s.blobPath(e.ID) + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer out.Close()
+	cap := s.entryCap()
+	var total int64
 	for _, id := range ids {
 		blockPath := filepath.Join(dir, hex.EncodeToString([]byte(id)))
 		f, err := os.Open(blockPath)
 		if err != nil {
+			out.Close()
+			_ = os.Remove(tmp)
 			http.Error(w, "missing staged block: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		_, err = io.Copy(out, f)
+		n, err := io.Copy(out, f)
 		f.Close()
+		total += n
 		if err != nil {
+			out.Close()
+			_ = os.Remove(tmp)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		if cap > 0 && total > cap {
+			out.Close()
+			_ = os.Remove(tmp)
+			_ = os.RemoveAll(dir)
+			s.clearStaged(e.ID)
+			http.Error(w, "cache entry exceeds max entry size", http.StatusRequestEntityTooLarge)
+			return
+		}
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(tmp)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := os.Rename(tmp, s.blobPath(e.ID)); err != nil {
+		_ = os.Remove(tmp)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 	_ = os.RemoveAll(dir)
+	s.setStaged(e.ID, total)
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -642,7 +718,9 @@ func (s *Server) blobURL(r *http.Request, kind string, id uint64, sig string) st
 // the least-recently-used completed entries (oldest UsedAt first). keepID is the
 // entry that just triggered the check and is never evicted, so a single blob
 // larger than the cap is still served rather than deleting the thing just
-// stored. The caller must hold s.mu; it does not save the index (the caller
+// stored. In-flight (staged but not-yet-finalized) bytes count toward the total
+// so a wave of concurrent uploads cannot blow past the cap before any of them
+// finalizes. The caller must hold s.mu; it does not save the index (the caller
 // does). A non-positive cap disables eviction.
 func (s *Server) evictLRU(keepID uint64) {
 	if s.maxSize <= 0 {
@@ -653,6 +731,9 @@ func (s *Server) evictLRU(keepID uint64) {
 		if e.Complete {
 			total += e.Size
 		}
+	}
+	for _, n := range s.staged {
+		total += n
 	}
 	for total > s.maxSize {
 		var victim *Entry
@@ -665,12 +746,13 @@ func (s *Server) evictLRU(keepID uint64) {
 			}
 		}
 		if victim == nil {
-			break // only the kept entry is left
+			break // only the kept entry (and in-flight uploads) are left
 		}
 		total -= victim.Size
 		_ = os.Remove(s.blobPath(victim.ID))
 		_ = os.RemoveAll(s.tmpDir(victim.ID))
 		delete(s.entries, victim.ID)
+		delete(s.staged, victim.ID)
 		s.evictions++
 		s.log.Info("evicted cache entry (size cap)", "id", victim.ID, "key", victim.Key, "size", victim.Size)
 	}
@@ -696,6 +778,7 @@ func (s *Server) gc() {
 			_ = os.Remove(s.blobPath(id))
 			_ = os.RemoveAll(s.tmpDir(id))
 			delete(s.entries, id)
+			delete(s.staged, id)
 			removed++
 		}
 	}
@@ -749,19 +832,52 @@ func (s *Server) save() error {
 
 // --- small helpers ---
 
-func writeFile(path string, r io.Reader) error {
+func writeFile(path string, r io.Reader) (int64, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
+		return 0, err
 	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if _, err := io.Copy(f, r); err != nil {
+	n, err := io.Copy(f, r)
+	if err != nil {
 		f.Close()
-		return err
+		return n, err
 	}
-	return f.Close()
+	return n, f.Close()
+}
+
+// uploadStatus maps an upload write error to an HTTP status: an over-cap body
+// (http.MaxBytesError) is a 413, anything else a 500.
+func uploadStatus(err error) (int, string) {
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		return http.StatusRequestEntityTooLarge, "cache entry exceeds max entry size"
+	}
+	return http.StatusInternalServerError, err.Error()
+}
+
+// staged-byte accounting bounds the disk a not-yet-finalized entry occupies.
+func (s *Server) setStaged(id uint64, n int64) {
+	s.mu.Lock()
+	s.staged[id] = n
+	s.mu.Unlock()
+}
+func (s *Server) addStaged(id uint64, n int64) {
+	s.mu.Lock()
+	s.staged[id] += n
+	s.mu.Unlock()
+}
+func (s *Server) stagedBytes(id uint64) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.staged[id]
+}
+func (s *Server) clearStaged(id uint64) {
+	s.mu.Lock()
+	delete(s.staged, id)
+	s.mu.Unlock()
 }
 
 func newToken() string {
