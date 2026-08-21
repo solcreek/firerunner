@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/actions/scaleset"
@@ -117,55 +118,70 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		owner = "firerunner"
 	}
 
-	lis, err := listener.New(ctx, listener.Config{
-		URL:         cfg.URL,
-		Name:        cfg.ScaleSetName,
-		RunnerGroup: cfg.RunnerGroup,
-		Labels:      cfg.Labels,
-		MaxRunners:  cfg.MaxRunners,
-		MinRunners:  cfg.MinRunners,
-		Token:       cfg.Token,
-		App: scaleset.GitHubAppAuth{
-			ClientID:       cfg.AppClientID,
-			InstallationID: cfg.AppInstallID,
-			PrivateKey:     privateKey,
-		},
-		Version: version,
-		Logger:  log,
-	}, owner)
-	if err != nil {
-		return err
+	app := scaleset.GitHubAppAuth{
+		ClientID:       cfg.AppClientID,
+		InstallationID: cfg.AppInstallID,
+		PrivateKey:     privateKey,
 	}
-	defer func() { _ = lis.Close(context.WithoutCancel(ctx)) }()
 
+	// One provisioner backs every tier: they share the host kernel, tool cache,
+	// network and the MaxRunners slot budget. Each tier is its own GitHub scale
+	// set with its own microVM shape and golden image; developers pick one with
+	// runs-on: <tier name>.
 	prov := provisioner.NewFirecracker(cfg.Firecracker, log)
+	tiers := cfg.EffectiveTiers()
 
-	sched := scheduler.New(scheduler.Options{
-		Max:         cfg.MaxRunners,
-		Min:         cfg.MinRunners,
-		Spec:        cfg.RunnerSpec(),
-		Provisioner: prov,
-		JIT:         lis.JIT(),
-		Logger:      log,
-	})
+	// Register every tier's scale set up front so a failure aborts cleanly
+	// before we start booting microVMs.
+	var (
+		listeners []*listener.ScaleSet
+		scheds    []*scheduler.Scheduler
+	)
+	closeAll := func() {
+		for _, l := range listeners {
+			_ = l.Close(context.WithoutCancel(ctx))
+		}
+	}
+	for _, t := range tiers {
+		tlog := log.With("tier", t.Name)
+		lis, err := listener.New(ctx, listener.Config{
+			URL:         cfg.URL,
+			Name:        t.Name,
+			RunnerGroup: cfg.RunnerGroup,
+			Labels:      t.Labels,
+			MaxRunners:  t.Max,
+			MinRunners:  t.Min,
+			Token:       cfg.Token,
+			App:         app,
+			Version:     version,
+			Logger:      tlog,
+		}, owner)
+		if err != nil {
+			closeAll()
+			return fmt.Errorf("tier %q: %w", t.Name, err)
+		}
+		listeners = append(listeners, lis)
+		scheds = append(scheds, scheduler.New(scheduler.Options{
+			Max:         t.Max,
+			Min:         t.Min,
+			Spec:        t.Spec(),
+			Provisioner: prov,
+			JIT:         lis.JIT(),
+			Logger:      tlog,
+		}))
+	}
+	defer closeAll()
 
 	log.Info("firerunner starting",
 		"provisioner", prov.Name(),
-		"scaleSet", cfg.ScaleSetName,
 		"url", cfg.URL,
+		"tiers", len(tiers),
 		"maxRunners", cfg.MaxRunners,
-		"vcpu", cfg.VCPU,
-		"memMiB", cfg.MemMiB,
 	)
-
-	// microVMs must live and die with the process, not with the per-message
-	// context the scale-set listener passes in. That context is detached from
-	// cancellation (listener uses context.WithoutCancel so in-flight job
-	// handling survives shutdown), so binding a microVM to it would leak idle
-	// warm runners on shutdown and hang Drain. Bind to the shutdown ctx instead.
-	onDesired := func(_ context.Context, desired int) int {
-		sched.Reconcile(ctx, desired)
-		return sched.Running()
+	for _, t := range tiers {
+		log.Info("serving tier",
+			"name", t.Name, "vcpu", t.VCPU, "memMiB", t.MemMiB,
+			"golden", t.Golden, "min", t.Min, "max", t.Max)
 	}
 
 	// Reclaim taps and job dirs orphaned by a previous unclean exit before we
@@ -177,14 +193,42 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 	go prov.RefreshNetwork(ctx)
 
-	runErr := lis.Run(ctx, onDesired)
+	// Drive every tier's listener concurrently. runCtx lets the first fatal
+	// listener error tear down the rest; on SIGTERM the parent ctx cancels it.
+	// microVMs and the warm-pool top-up bind to runCtx too, so both a signal and
+	// a fatal error unwind identically (listeners stop, Reconcile no-ops, and
+	// Drain settles) — matching the single-tier lifecycle.
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(listeners))
+	for i := range listeners {
+		lis, sched := listeners[i], scheds[i]
+		onDesired := func(_ context.Context, desired int) int {
+			sched.Reconcile(runCtx, desired)
+			return sched.Running()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := lis.Run(runCtx, onDesired); err != nil && runCtx.Err() == nil {
+				errCh <- err
+				cancel()
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
 
 	log.Info("shutdown signalled, draining in-flight microVMs")
-	sched.Drain()
+	for _, sched := range scheds {
+		sched.Drain()
+	}
 	log.Info("firerunner stopped")
 
-	if runErr != nil && ctx.Err() == nil {
-		return runErr
+	if err := <-errCh; err != nil && ctx.Err() == nil {
+		return err
 	}
 	return nil
 }
