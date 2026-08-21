@@ -370,10 +370,10 @@ Notes:
 - Per-launch overhead is ~single-digit milliseconds (chroot + staging the VMM),
   negligible against the microVM boot.
 - The systemd unit must run as `root` when the jailer is enabled: use
-  `deploy/firerunner-jailer@.service` (a root, jailer-forced variant of
-  `firerunner@.service` with a trimmed capability set and cgroup-writable
-  sandbox). The default `deploy/firerunner.service` / `firerunner@.service` run
-  as the unprivileged `firerunner` user for the non-jailer mode.
+  `deploy/firerunner-jailer@.service` (a root, jailer-forced unit with a trimmed
+  capability set and cgroup-writable sandbox). The default
+  `deploy/firerunner.service` runs as the unprivileged `firerunner` user for the
+  non-jailer mode.
 
 ## License
 

@@ -22,7 +22,8 @@ milliseconds and is thrown away after the run.
 Different workloads need different images. Each tier is a separate golden rootfs
 selected by the runner label a workflow requests (`runs-on: <tier>`). In the
 scale-set model GitHub routes a job to the scale set whose name matches that
-label, so each tier runs as its own firerunner instance/scale set.
+label; one firerunner process serves every tier (each registered as its own
+scale set) from a single [tier catalog](../examples/tiers.json).
 
 | Tier                      | vCPU / RAM (suggested) | Contents                                              | Use for                                                     |
 | ------------------------- | ---------------------- | ---------------------------------------------------- | ----------------------------------------------------------- |
@@ -45,11 +46,13 @@ Docker daemon inside the guest.
 
 ### Running several tiers on one host
 
-Each tier is a distinct scale set, so a host running more than one firerunner
-instance must give each its own network identity or their nftables tables and
-guest subnets collide. Set, per extra instance: `FR_NAME` (the tier label),
-`FR_GOLDEN` (its rootfs), and non-overlapping `FR_TAP_PREFIX`, `FR_NET_BASE`
-(second IP octet, e.g. 17), `FR_NFT_TABLE` and `FR_WORKDIR`.
+Serve every tier from **one** firerunner process: list them in a JSON tier
+catalog and point `--tiers` (or `FR_TIERS`) at it (see
+[`examples/tiers.json`](../examples/tiers.json) and the "Runner tiers" section
+of the top-level [README](../README.md)). All tiers then share one host
+network, tool cache and the `--max-runners` slot budget — `vcpu`/`mem_mib`/
+`golden` vary per tier — and developers pick one with `runs-on: <name>`. No
+per-instance network identity or extra systemd units are needed.
 
 ## What the boot service does (MMDS → JIT)
 

@@ -3,17 +3,19 @@ Description=firerunner (%i tier, jailer) - jailed ephemeral Firecracker microVM 
 After=network-online.target
 Wants=network-online.target
 
-# Root, jailer-enabled variant of firerunner@.service. Use this unit (instead of
-# firerunner@.service) when running with FR_JAILER=true: the Firecracker jailer
-# must chroot, mknod jail-local /dev nodes and drop privileges, which requires a
-# ROOT launcher — the opposite of the non-jailer unit that runs as the
-# unprivileged `firerunner` user. That privilege inversion is exactly why the
-# jailer is opt-in. Everything else (per-tier env file, per-instance network
-# identity, graceful drain) matches firerunner@.service.
+# Root, jailer-enabled firerunner unit. Use this unit when running with
+# FR_JAILER=true: the Firecracker jailer must chroot, mknod jail-local /dev nodes
+# and drop privileges, which requires a ROOT launcher — the opposite of the
+# default deploy/firerunner.service that runs as the unprivileged `firerunner`
+# user. That privilege inversion is exactly why the jailer is opt-in.
 #
-# The instance env file (/etc/firerunner/%i.env) MUST set FR_JAIL_UID and
-# FR_JAIL_GID (the unprivileged uid/gid the jailer drops Firecracker to, e.g.
-# the `firerunner` user) and MAY set FR_JAILER_CGROUP for per-VM cgroup limits.
+# This is a templated unit (`firerunner-jailer@<instance>`): the instance name
+# selects the env file /etc/firerunner/%i.env and the per-instance work/log dirs
+# below. A single instance can serve every tier via FR_TIERS (see the tier
+# catalog); run more than one instance only if you need separate jailer/network
+# identities. The env file MUST set FR_JAIL_UID and FR_JAIL_GID (the unprivileged
+# uid/gid the jailer drops Firecracker to, e.g. the `firerunner` user) and MAY
+# set FR_JAILER_CGROUP for per-VM cgroup limits.
 
 [Service]
 Type=simple
