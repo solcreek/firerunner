@@ -289,9 +289,10 @@ the host (cross-checked against firecracker processes and tap devices).
 
 `doctor` runs a checklist — `/dev/kvm`, the firecracker/jailer binaries, the
 kernel and golden images, the egress interface, `ip_forward`, `nftables`, a
-writable and reflink-capable work dir, GitHub auth, and API reachability — and
-prints one `PASS`/`WARN`/`FAIL` line each. It exits non-zero when any check
-fails, so it can gate a deploy.
+writable and reflink-capable work dir, GitHub auth (presence plus a live
+read-only credential check), and API reachability (against the derived API base,
+so GitHub Enterprise Server works too) — and prints one `PASS`/`WARN`/`FAIL`
+line each. It exits non-zero when any check fails, so it can gate a deploy.
 
 ### Warm pool (`--min-runners`)
 

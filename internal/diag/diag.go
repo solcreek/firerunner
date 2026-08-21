@@ -199,7 +199,7 @@ func collectStatus(cfg *config.Config, version string) StatusReport {
 		Workdir: WorkdirInfo{
 			Path:           fc.WorkDir,
 			FS:             fsKind(fc.WorkDir),
-			ReflinkCapable: reflinkCapable(fsKind(fc.WorkDir)),
+			ReflinkCapable: reflinkProbe(fc.WorkDir),
 		},
 	}
 	if fc.ToolCacheImage != "" {
@@ -402,11 +402,16 @@ func runDoctor(cfg *config.Config, version string) DoctorReport {
 	// Work dir: writable and, ideally, reflink-capable so rootfs clones are cheap.
 	checks = append(checks, workdirCheck(fc.WorkDir))
 
-	// GitHub auth.
-	checks = append(checks, authCheck(cfg))
+	// GitHub auth: presence/parse first, then a live read-only verification.
+	apiBase := githubAPIBase(cfg.URL)
+	auth := authCheck(cfg)
+	checks = append(checks, auth)
+	if auth.Level == levelPass {
+		checks = append(checks, authVerify(cfg, apiBase))
+	}
 
 	// GitHub API reachability (best-effort; WARN offline, never FAIL).
-	checks = append(checks, apiReach("https://api.github.com/zen"))
+	checks = append(checks, apiReach(apiBase))
 
 	// Self-hosted dependency cache (only when configured).
 	if c := cacheCheck(fc); c != nil {
@@ -485,19 +490,30 @@ func workdirCheck(dir string) Check {
 	if dir == "" {
 		return fail("workdir", "path is unset")
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fail("workdir", "%s not creatable: %v", dir, err)
+	// A diagnostic must not mutate host state, so don't create the dir; report
+	// whether it exists and is usable. The provisioner creates it on first run.
+	info, err := os.Stat(dir)
+	switch {
+	case os.IsNotExist(err):
+		return warn("workdir", "%s does not exist yet; firerunner creates it on first run (ensure its parent is writable by the service user)", dir)
+	case err != nil:
+		return fail("workdir", "%s not accessible: %v", dir, err)
+	case !info.IsDir():
+		return fail("workdir", "%s exists but is not a directory", dir)
 	}
+	// Writability and reflink support are probed as the INVOKING user, which is
+	// only meaningful when doctor runs as the service user; say so.
+	uid := os.Geteuid()
 	probe := filepath.Join(dir, ".firerunner-doctor")
 	if err := os.WriteFile(probe, []byte("ok"), 0o600); err != nil {
-		return fail("workdir", "%s not writable: %v", dir, err)
+		return fail("workdir", "%s not writable as uid %d: %v", dir, uid, err)
 	}
 	os.Remove(probe)
 	kind := fsKind(dir)
-	if !reflinkCapable(kind) {
-		return warn("workdir", "%s is %s; reflink clones unsupported, each microVM copies the full golden (slow)", dir, kind)
+	if !reflinkProbe(dir) {
+		return warn("workdir", "%s is %s; reflink clones unsupported here, each microVM copies the full golden (slow)", dir, kind)
 	}
-	return pass("workdir", "%s writable, %s (reflink-capable)", dir, kind)
+	return pass("workdir", "%s writable as uid %d, %s (reflink-capable)", dir, uid, kind)
 }
 
 func authCheck(cfg *config.Config) Check {
@@ -513,7 +529,7 @@ func authCheck(cfg *config.Config) Check {
 	if _, err := cfg.ResolvePrivateKey(); err != nil {
 		return fail("auth", "GitHub App private key unreadable: %v", err)
 	}
-	return pass("auth", "GitHub App (client %s, installation %d)", cfg.AppClientID, cfg.AppInstallID)
+	return pass("auth", "GitHub App configured (client %s, installation %d)", cfg.AppClientID, cfg.AppInstallID)
 }
 
 // fetchCacheStats best-effort reads the cache-server's /stats snapshot for the
@@ -594,10 +610,12 @@ func apiReach(url string) Check {
 		return warn("github-api", "%s unreachable: %v", url, err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	// Any HTTP response proves reachability (a 401/404 still means we reached
+	// the host); only a server-side failure or transport error is a concern.
+	if resp.StatusCode >= 500 {
 		return warn("github-api", "%s returned HTTP %d", url, resp.StatusCode)
 	}
-	return pass("github-api", "reachable (HTTP %d)", resp.StatusCode)
+	return pass("github-api", "%s reachable (HTTP %d)", url, resp.StatusCode)
 }
 
 // --- host probes ----------------------------------------------------------
@@ -734,13 +752,26 @@ func fsKind(dir string) string {
 	}
 }
 
-func reflinkCapable(kind string) bool {
-	switch kind {
-	case "btrfs", "xfs", "zfs":
-		return true
-	default:
+// reflinkProbe reports whether dir's filesystem can actually make reflink
+// (copy-on-write) clones, by running the very cp --reflink the provisioner uses.
+// cp --reflink=always fails when the filesystem cannot reflink, so this is
+// ground truth rather than a guess from the fs type — XFS without reflink=1 or
+// ZFS without block cloning would otherwise be mis-reported as capable. Returns
+// false if dir is not writable or cp is unavailable.
+func reflinkProbe(dir string) bool {
+	src, err := os.CreateTemp(dir, ".firerunner-reflink-*")
+	if err != nil {
 		return false
 	}
+	srcPath := src.Name()
+	_, _ = src.WriteString("probe")
+	_ = src.Close()
+	defer os.Remove(srcPath)
+	dstPath := srcPath + ".clone"
+	defer os.Remove(dstPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, "cp", "--reflink=always", srcPath, dstPath).Run() == nil
 }
 
 // actualBytes reports on-disk usage (st_blocks*512), so a reflink/sparse clone
