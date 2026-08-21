@@ -229,7 +229,8 @@ See [`examples/tiers.json`](examples/tiers.json). All tiers share the host
 kernel, network and — importantly — the `--max-runners` **slot budget**:
 `vcpu`/`mem_mib`/`golden` vary per tier, but the total number of
 concurrent microVMs across every tier is capped at `--max-runners` (the tiers'
-warm pools, `min`, must fit within it). When `--tiers` is unset, firerunner
+warm pools, `min`, must fit within it, and no single tier's `max` may exceed it).
+When `--tiers` is unset, firerunner
 runs the single tier derived from `--name`/`--vcpu`/`--mem-mib`/`--golden`, so
 existing deployments are unchanged.
 

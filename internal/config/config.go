@@ -305,8 +305,9 @@ func (c *Config) validate() error {
 }
 
 // validateTiers checks a tier catalog: each tier must be well-formed and
-// uniquely named, and the tiers' warm pools must fit within the shared slot
-// budget (--max-runners) so they can all stay warm at once.
+// uniquely named, no tier's max may exceed the shared slot budget
+// (--max-runners) — or it could never reach that max — and the tiers' warm
+// pools must fit within the budget so they can all stay warm at once.
 func (c *Config) validateTiers() error {
 	seen := make(map[string]bool, len(c.Tiers))
 	totalMin := 0
@@ -328,6 +329,8 @@ func (c *Config) validateTiers() error {
 			return fmt.Errorf("tier %q: min must be >= 0", t.Name)
 		case t.Min > t.Max:
 			return fmt.Errorf("tier %q: min (%d) must not exceed max (%d)", t.Name, t.Min, t.Max)
+		case t.Max > c.MaxRunners:
+			return fmt.Errorf("tier %q: max (%d) exceeds --max-runners (%d), the shared slot budget, so the tier can never reach its max", t.Name, t.Max, c.MaxRunners)
 		}
 		if t.ToolCache != "" {
 			if _, err := os.Stat(t.ToolCache); err != nil {

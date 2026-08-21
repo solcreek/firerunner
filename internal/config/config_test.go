@@ -304,6 +304,19 @@ func TestFromFlags_TierToolCache(t *testing.T) {
 	}
 }
 
+func TestFromFlags_TierMaxExceedsBudget(t *testing.T) {
+	// A tier whose max is larger than --max-runners can never reach it, so the
+	// catalog is rejected rather than silently clamped.
+	p := writeTiers(t, `[{"name":"big","vcpu":2,"mem_mib":4096,"golden":"/g/base.ext4","min":0,"max":8}]`)
+	if _, err := FromFlags(append(baseArgs(), "--tiers", p, "--max-runners", "4")); err == nil {
+		t.Fatal("expected error when a tier max exceeds --max-runners")
+	}
+	// Equal to the budget is fine.
+	if _, err := FromFlags(append(baseArgs(), "--tiers", p, "--max-runners", "8")); err != nil {
+		t.Fatalf("tier max == budget should be valid: %v", err)
+	}
+}
+
 func TestFromFlags_TierToolCacheMissing(t *testing.T) {
 	p := writeTiers(t, `[{"name":"t","vcpu":2,"mem_mib":4096,"golden":"/g","toolcache":"/no/such/tc.ext4","min":0,"max":4}]`)
 	if _, err := FromFlags(append(baseArgs(), "--tiers", p, "--max-runners", "8")); err == nil {
