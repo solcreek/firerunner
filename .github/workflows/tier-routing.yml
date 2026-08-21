@@ -1,0 +1,29 @@
+name: tier-routing
+
+# Proves multi-tier label routing: GitHub routes each job to the scale set whose
+# name matches its runs-on label, so a job lands on that tier's golden image.
+# The base tier has no Node; the firerunner-node tier bakes Node LTS. Each job
+# reports whether node is present, which is a clean image-identity fingerprint.
+on:
+  workflow_dispatch:
+
+jobs:
+  base:
+    runs-on: firerunner
+    steps:
+      - run: |
+          echo "tier=base runner=firerunner nproc=$(nproc)"
+          if command -v node >/dev/null; then
+            echo "UNEXPECTED: node present on base tier: $(node --version)"; exit 1
+          fi
+          echo "OK: base tier has no baked node (as expected)"
+
+  node:
+    runs-on: firerunner-node
+    steps:
+      - run: |
+          echo "tier=node runner=firerunner-node nproc=$(nproc)"
+          if ! command -v node >/dev/null; then
+            echo "FAIL: node missing on node tier"; exit 1
+          fi
+          echo "OK: node tier has baked node: $(node --version), npm $(npm --version)"

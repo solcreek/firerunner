@@ -1,0 +1,55 @@
+[Unit]
+Description=firerunner (%i tier) - ephemeral Firecracker microVM GitHub Actions runners
+After=network-online.target
+Wants=network-online.target
+
+# Templated multi-tier unit. Run one instance per golden-image tier/scale set,
+# e.g. `systemctl enable --now firerunner@node`. Each instance reads its own
+# env file and MUST set a non-overlapping network identity (FR_NAME, FR_GOLDEN,
+# FR_TAP_PREFIX, FR_NET_BASE, FR_NFT_TABLE) plus the per-instance work/log dirs
+# below, so instances sharing a host do not clobber each other's nftables table
+# or guest subnet. See images/README.md ("Running several tiers on one host").
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/firerunner/%i.env
+# Pin the per-instance dirs the sandbox grants write access to; the env file's
+# FR_WORKDIR/FR_LOG_DIR must match these paths.
+Environment=FR_WORKDIR=/var/tmp/firerunner-%i
+Environment=FR_LOG_DIR=/var/log/firerunner-%i
+ExecStart=/usr/local/bin/firerunner
+Restart=on-failure
+RestartSec=5
+
+# Graceful shutdown: firerunner cancels its context on SIGTERM, stops accepting
+# work, and drains in-flight microVMs before exiting. Give it long enough to let
+# a running job finish; otherwise systemd's default stop timeout SIGKILLs the
+# listener mid-job and orphans firecracker children (which leak tap devices).
+# Tune to your longest expected job.
+KillSignal=SIGTERM
+TimeoutStopSec=1h
+
+# The process needs KVM and network/tap management. Run as a dedicated,
+# non-login user with only the capabilities it requires.
+User=firerunner
+Group=firerunner
+SupplementaryGroups=kvm
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/tmp/firerunner-%i /var/log/firerunner-%i
+# ip_forward must be writable to enable microVM egress; firerunner sets it at
+# startup, so kernel tunables cannot be fully protected.
+ProtectKernelTunables=false
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# PrivateTmp is intentionally disabled: the work dir must sit on a reflink-
+# capable filesystem (btrfs/XFS), not the tmpfs that PrivateTmp would provide.
+
+[Install]
+WantedBy=multi-user.target
