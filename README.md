@@ -418,8 +418,9 @@ firerunner cache-server --addr :8099 --dir /var/lib/firerunner/cache
 
 It implements the three Twirp methods plus the Azure block-blob upload
 (single-shot and staged `comp=block`/`comp=blocklist`) and ranged downloads,
-namespaces entries by `repository_id`, guards each blob URL with a per-entry
-token, and persists an index so caches survive restarts.
+tags each blob URL with a per-entry token, and persists an index so caches
+survive restarts. It performs **no authentication** and enforces **no tenant
+isolation** — see the security model below before deploying it.
 
 By default the store is capped at 50 GB; once a newly finalized entry pushes the
 total over the cap, the least-recently-used entries are evicted until it fits
@@ -465,14 +466,27 @@ firerunner ... --golden /var/lib/firerunner/ubuntu-rootfs-minimal.ext4 --cache-p
 cache-server for reachability; both note that the cache is off by default and
 that jobs fall back to GitHub's hosted cache when it is not configured.
 
-**Security model.** Entries are isolated per `repository_id`, so caches never
-leak across repositories. Within a repository the semantics match GitHub's
-(any job can read and write) **minus ref-scoping**: on a shared server a job
-triggered by untrusted code (e.g. a fork PR) can write an entry a later trusted
-job restores. Run **one cache-server per trust boundary** (e.g. don't share one
-cache across repos with different trust levels), exactly as you would isolate
-any self-hosted runner. The cache is a pure accelerator — every job still passes
-with caching disabled.
+**Security model.** This server performs **no authentication** and enforces
+**no tenant isolation**. The only tenant key is the caller-supplied
+`repository_id`, which is unauthenticated (any guest can send any value) and
+which the `@actions/cache` toolkit does not actually send — so in practice all
+entries share **one global namespace**. Any caller can read another entry with a
+blank restore key (`restore-keys: ['']` prefix-matches everything), and the
+per-entry blob token is the **same for download and upload**, so anyone who can
+read an entry can also overwrite it. Uploads are unbounded.
+
+Treat the store as a **shared, unauthenticated, guest-writable cache**:
+
+- Run **one cache-server per single trust boundary** — ideally one repository.
+  Never share one store across repositories or across trust levels.
+- Keep the listen address reachable **only from its own microVMs**. The default
+  `--addr :8099` binds all interfaces; firewall it, or bind it to the host's
+  guest-facing gateway IP, so no LAN/WAN client can reach it.
+- Assume any job that can reach it can read and overwrite every entry (a fork-PR
+  job can poison a cache a later trusted job restores).
+
+The cache is a pure accelerator — every job still passes with caching disabled,
+so when in doubt, leave it off.
 
 ### Running as a service (systemd)
 

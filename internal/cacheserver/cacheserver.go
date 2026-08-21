@@ -25,13 +25,23 @@
 // off disk with Range support. Signed URLs are built from the request's Host
 // header so each microVM reaches the server on its own per-slot gateway IP.
 //
-// # Isolation
+// # Isolation and trust model
 //
-// Entries are namespaced by the caller's repository_id (from the RPC metadata),
-// so caches never leak across repositories. Within a repository the semantics
-// match GitHub's cache (any job can read/write) minus ref-scoping: on a shared
-// self-hosted server a job triggered by untrusted code can write an entry a
-// later trusted job restores, so run one server per trust boundary. See the
+// This server performs NO authentication and enforces NO tenant isolation.
+// The only tenant key is the caller-supplied repository_id in the RPC metadata,
+// which is unauthenticated (any guest can send any value) and which the real
+// @actions/cache toolkit does not send at all — so in practice every entry
+// shares one global namespace. A caller can also read another entry via a blank
+// restore key (restore_keys:[""] prefix-matches everything), and the per-entry
+// blob token is the SAME for upload and download, so anyone who can read an
+// entry can also overwrite it. Uploads are unbounded and written straight to
+// disk.
+//
+// Treat the store as a shared, unauthenticated, guest-writable cache. Run ONE
+// server per single trust boundary (ideally one repository), keep it reachable
+// only from its own microVMs (do not expose the listen address on any LAN/WAN
+// NIC), and never share it across repositories or trust levels. It remains a
+// pure accelerator: every job still passes with caching disabled. See the
 // README security notes.
 package cacheserver
 
