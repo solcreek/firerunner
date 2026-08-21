@@ -6,6 +6,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/solcreek/firerunner/internal/core"
 	"github.com/solcreek/firerunner/internal/provisioner"
@@ -38,6 +39,11 @@ type Scheduler struct {
 	// tell an idle warm-pool VM (cancel it immediately) from one running a job
 	// (let it finish). MarkBusy flips a VM to busy when its guest dequeues a job.
 	active map[string]*vmHandle
+	// failures counts consecutive unhealthy microVM boots so the warm-pool
+	// replenish path can back off exponentially instead of hot-looping a broken
+	// golden (which burns a JIT registration per attempt). Reset on any healthy
+	// launch. Guarded by mu.
+	failures int
 }
 
 // vmHandle is the shutdown-relevant state of one in-flight microVM.
@@ -155,6 +161,9 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 	name, jit, err := s.opts.JIT.Generate(context.WithoutCancel(ctx), s.opts.Spec)
 	if err != nil {
 		s.opts.Logger.Error("generate JIT config", "err", err)
+		// A failed JIT generation is a GitHub API error; without pacing, the
+		// maintainMinimum defer relaunches at once and spins a tight retry loop.
+		s.backoff(ctx)
 		return
 	}
 
@@ -184,9 +193,70 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 		}
 	}()
 
-	if err := s.opts.Provisioner.Launch(vmCtx, name, jit, s.opts.Spec, func() { s.MarkBusy(name) }); err != nil {
-		s.opts.Logger.Error("launch microVM", "runner", name, "err", err)
+	launchErr := s.opts.Provisioner.Launch(vmCtx, name, jit, s.opts.Spec, func() { s.MarkBusy(name) })
+	switch {
+	case vmCtx.Err() != nil:
+		// We cancelled this VM ourselves (scale-down or shutdown); any error it
+		// returns is expected, so treat it as healthy churn.
+		s.resetBackoff()
+	case launchErr != nil:
+		s.opts.Logger.Error("launch microVM", "runner", name, "err", launchErr)
+		s.backoff(ctx)
+	default:
+		s.resetBackoff()
 	}
+}
+
+// backoff paces warm-pool replenishment after an unhealthy microVM boot so a
+// persistently failing golden (or a GitHub API error during JIT generation)
+// cannot spin a tight relaunch loop that burns a runner registration per
+// attempt. The delay grows exponentially with the consecutive-failure count and
+// returns early if shutdown begins, so it never delays Drain.
+func (s *Scheduler) backoff(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	s.mu.Lock()
+	s.failures++
+	n := s.failures
+	s.mu.Unlock()
+	d := backoffDelay(n)
+	s.opts.Logger.Warn("microVM boot failed; backing off before replenishing", "consecutiveFailures", n, "delay", d)
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
+
+// resetBackoff clears the consecutive-failure count after a healthy launch.
+func (s *Scheduler) resetBackoff() {
+	s.mu.Lock()
+	s.failures = 0
+	s.mu.Unlock()
+}
+
+const (
+	backoffBase = 500 * time.Millisecond
+	backoffMax  = 30 * time.Second
+)
+
+// backoffDelay returns the delay for the nth consecutive failure: backoffBase
+// doubled per failure, capped at backoffMax (a loop, not a shift, so a long
+// failure streak cannot overflow the duration).
+func backoffDelay(failures int) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	d := backoffBase
+	for i := 1; i < failures && d < backoffMax; i++ {
+		d *= 2
+	}
+	if d > backoffMax {
+		d = backoffMax
+	}
+	return d
 }
 
 // track registers an in-flight microVM so a shutdown drain can find and, if it

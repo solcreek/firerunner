@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strconv"
@@ -359,4 +360,46 @@ func TestScaleDownPreservesMin(t *testing.T) {
 
 	s.Reconcile(ctx, 0) // demand 0, but Min=1 keeps one warm
 	waitRunning(t, s, 1)
+}
+
+func TestBackoffDelay(t *testing.T) {
+	cases := []struct {
+		failures int
+		want     time.Duration
+	}{
+		{0, 500 * time.Millisecond},
+		{1, 500 * time.Millisecond},
+		{2, 1 * time.Second},
+		{3, 2 * time.Second},
+		{4, 4 * time.Second},
+		{100, 30 * time.Second}, // capped
+	}
+	for _, tc := range cases {
+		if got := backoffDelay(tc.failures); got != tc.want {
+			t.Errorf("backoffDelay(%d)=%s want %s", tc.failures, got, tc.want)
+		}
+	}
+}
+
+// TestFailedBootBacksOff proves a golden that always fails to boot is retried at
+// a paced (exponentially backing off) rate rather than in a tight loop.
+func TestFailedBootBacksOff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var launches int32
+	prov := provFunc(func(context.Context, string, string, core.RunnerSpec, func()) error {
+		atomic.AddInt32(&launches, 1)
+		return errors.New("boot failed")
+	})
+	s := New(Options{Max: 4, Min: 1, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 1)
+	time.Sleep(1200 * time.Millisecond)
+	cancel()
+	s.Drain()
+
+	// With 500ms/1s/2s backoff, only a handful of attempts fit in 1.2s; without
+	// backoff this loop would run thousands of times.
+	if n := atomic.LoadInt32(&launches); n < 1 || n > 6 {
+		t.Fatalf("expected a small paced number of boot attempts, got %d", n)
+	}
 }
