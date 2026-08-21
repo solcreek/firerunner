@@ -32,8 +32,14 @@ NODE_VERSION="22.11.0"
 UBUNTU_TAG="24.04"
 RI_REF="ubuntu24/20260816.277"   # actions/runner-images pinned ref for --toolset full
 DNS_SERVERS="1.1.1.1 8.8.8.8"
-SIZE_MB=""              # empty => sized from rootfs du + margin
+SIZE_MB=""              # empty => sized from rootfs du + max(margin, free floor)
 MARGIN_PCT=35
+FREE_MB=12288           # absolute writable free space to guarantee for job
+                        # scratch (CodeQL databases, large builds, _work/_temp).
+                        # The image is sparse + reflink-cloned, so a big virtual
+                        # size is near-free on disk; a lean rootfs would otherwise
+                        # leave only a percentage of its own small size free,
+                        # which is far too little for real CI jobs.
 IMAGE_TAG="firerunner-ubuntu-rootfs:latest"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -48,6 +54,7 @@ while [[ $# -gt 0 ]]; do
     --runner-images-ref) RI_REF="$2"; shift 2 ;;
     --dns-servers)    DNS_SERVERS="${2//,/ }"; shift 2 ;;
     --size-mb)        SIZE_MB="$2"; shift 2 ;;
+    --free-mb)        FREE_MB="$2"; shift 2 ;;
     *) die "unknown flag: $1" ;;
   esac
 done
@@ -273,9 +280,11 @@ echo firerunner > "$ROOT/etc/hostname"
 
 if [[ -z "$SIZE_MB" ]]; then
   used_mb="$(du -sm "$ROOT" | awk '{print $1}')"
-  SIZE_MB=$(( used_mb + used_mb * MARGIN_PCT / 100 + 512 ))
+  margin_mb=$(( used_mb * MARGIN_PCT / 100 ))
+  free_mb=$(( margin_mb > FREE_MB ? margin_mb : FREE_MB ))
+  SIZE_MB=$(( used_mb + free_mb + 512 ))
 fi
-echo ">> rootfs sized ${SIZE_MB}MB"
+echo ">> rootfs sized ${SIZE_MB}MB (used ${used_mb:-?}MB + free scratch)"
 
 mkdir -p "$(dirname "$OUT")"
 rm -f "$OUT"
