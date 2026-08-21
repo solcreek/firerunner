@@ -412,3 +412,38 @@ func TestBlockIDEncoding(t *testing.T) {
 		t.Fatal("hex encoding empty")
 	}
 }
+
+// TestStorePermsAreTight verifies the on-disk store is not world/group readable:
+// the index holds every entry's blob token (which authorizes overwrite), so a
+// loose mode would let any local account read and poison the cache.
+func TestStorePermsAreTight(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	create := twirp(t, ts.URL, "CreateCacheEntry", createReq{Key: "k", Version: "v"})
+	putBlob(t, create["signed_upload_url"].(string), []byte("secret"))
+	twirp(t, ts.URL, "FinalizeCacheEntryUpload", finalizeReq{Key: "k", Version: "v", SizeBytes: "6"})
+
+	cases := []struct {
+		path string
+		want os.FileMode
+	}{
+		{dir, 0o700},
+		{s.blobPath(1), 0o600},
+		{s.indexPath(), 0o600},
+	}
+	for _, c := range cases {
+		fi, err := os.Stat(c.path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", c.path, err)
+		}
+		if got := fi.Mode().Perm(); got != c.want {
+			t.Errorf("%s mode = %o, want %o", c.path, got, c.want)
+		}
+	}
+}

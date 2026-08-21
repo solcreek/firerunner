@@ -150,9 +150,15 @@ func New(dir string, log *slog.Logger) (*Server, error) {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	for _, d := range []string{dir, filepath.Join(dir, "blobs"), filepath.Join(dir, "tmp")} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
+		if err := os.MkdirAll(d, 0o700); err != nil {
 			return nil, fmt.Errorf("create cache dir %q: %w", d, err)
 		}
+	}
+	// MkdirAll leaves an already-existing dir's mode untouched, so tighten the
+	// root explicitly: it holds index.json (every entry's blob token) and must
+	// not be group/world readable even if it was pre-created by the operator.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("chmod cache dir %q: %w", dir, err)
 	}
 	s := &Server{
 		dir:     dir,
@@ -404,7 +410,7 @@ func (s *Server) uploadBlock(w http.ResponseWriter, r *http.Request, e *Entry) {
 		return
 	}
 	dir := s.tmpDir(e.ID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -735,7 +741,7 @@ func (s *Server) save() error {
 		return err
 	}
 	tmp := s.indexPath() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, s.indexPath())
@@ -744,10 +750,10 @@ func (s *Server) save() error {
 // --- small helpers ---
 
 func writeFile(path string, r io.Reader) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	f, err := os.Create(path)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
