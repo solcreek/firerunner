@@ -298,6 +298,9 @@ sudo images/build-toolcache.sh --out /var/lib/firerunner/toolcache.ext4 \
 # Python is fetched from actions/python-versions and relocated in an
 # ubuntu:24.04 container (so its layout matches the guest) -> needs Docker:
 sudo images/build-toolcache.sh --out toolcache.ext4 --python 3.12
+# CodeQL bundle (accelerates github/codeql-action / SAST); `latest` tracks the
+# version the newest codeql-action pins, or pass a CLI version to pin it:
+sudo images/build-toolcache.sh --out toolcache.ext4 --codeql latest
 ```
 
 Tailor it to a team: scan the repos you serve for their `setup-*` steps

@@ -25,13 +25,17 @@
 # Runs on a Linux host. Node and Go need only curl/tar/mkfs.ext4 (no Docker).
 # Python is fetched from actions/python-versions and relocated inside an
 # ubuntu:24.04 container (matching the guest) so its shebangs/rpaths are correct,
-# so `--python` additionally requires Docker.
+# so `--python` additionally requires Docker. CodeQL bakes the github/codeql-action
+# bundle the same way runner-images does (self-contained, no Docker; needs jq).
 #
 # Usage:
 #   sudo ./build-toolcache.sh --out /var/tmp/fr-golden/toolcache.ext4 \
 #     --node 22.22.2 --go 1.26.7                 # no Docker needed
 #   sudo ./build-toolcache.sh --out toolcache.ext4 \
 #     --node 20.18.0,22.22.2 --python 3.12       # Python => needs Docker
+#   sudo ./build-toolcache.sh --out toolcache.ext4 --codeql latest
+#     #  ^ bake the CodeQL bundle (accelerates github/codeql-action / SAST);
+#     #    pass an explicit CLI version (e.g. --codeql 2.20.3) to pin it.
 #
 set -euo pipefail
 
@@ -41,6 +45,7 @@ LABEL="hostedtoolcache"
 SIZE_MB=""            # empty => sized from staged du + margin
 MARGIN_PCT=25
 UBUNTU_TAG="24.04"    # for the Python relocation container (match the guest)
+CODEQL_VERSION=""     # "" => skip; "latest" => resolve like runner-images; or a CLI version
 declare -a NODE_VERSIONS=() GO_VERSIONS=() PYTHON_VERSIONS=()
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -54,6 +59,7 @@ while [[ $# -gt 0 ]]; do
     --node)      mapfile -t -O "${#NODE_VERSIONS[@]}"   NODE_VERSIONS   < <(split_csv "$2"); shift 2 ;;
     --go)        mapfile -t -O "${#GO_VERSIONS[@]}"     GO_VERSIONS     < <(split_csv "$2"); shift 2 ;;
     --python)    mapfile -t -O "${#PYTHON_VERSIONS[@]}" PYTHON_VERSIONS < <(split_csv "$2"); shift 2 ;;
+    --codeql)    CODEQL_VERSION="$2"; shift 2 ;;
     --arch)      ARCH="$2"; shift 2 ;;
     --label)     LABEL="$2"; shift 2 ;;
     --size-mb)   SIZE_MB="$2"; shift 2 ;;
@@ -68,12 +74,15 @@ done
 [[ -n "$OUT" ]] || die "--out is required"
 [[ "$ARCH" == "x64" ]] || die "only --arch x64 is supported"
 for t in curl tar mkfs.ext4 e2label; do command -v "$t" >/dev/null || die "missing tool: $t"; done
-if (( ${#NODE_VERSIONS[@]} + ${#GO_VERSIONS[@]} + ${#PYTHON_VERSIONS[@]} == 0 )); then
-  die "nothing to build: pass at least one of --node / --go / --python"
+if (( ${#NODE_VERSIONS[@]} + ${#GO_VERSIONS[@]} + ${#PYTHON_VERSIONS[@]} == 0 )) && [[ -z "$CODEQL_VERSION" ]]; then
+  die "nothing to build: pass at least one of --node / --go / --python / --codeql"
 fi
 if (( ${#PYTHON_VERSIONS[@]} > 0 )); then
   command -v docker >/dev/null || die "--python requires docker (faithful actions/python-versions relocation)"
   docker info >/dev/null 2>&1 || die "--python requires a running docker daemon"
+fi
+if [[ -n "$CODEQL_VERSION" ]]; then
+  command -v jq >/dev/null || die "--codeql requires jq (to resolve the codeql-action bundle version)"
 fi
 
 STAGE="$(mktemp -d)"
@@ -139,6 +148,37 @@ if (( ${#PYTHON_VERSIONS[@]} > 0 )); then
     ' || die "python relocation failed"
 fi
 
+# ---- CodeQL: bake the github/codeql-action bundle, runner-images style ------
+# Mirrors actions/runner-images install-codeql-bundle.sh exactly so the stock
+# github/codeql-action finds it the same way it does on ubuntu-latest:
+#   CodeQL/<cliVersion>/x64/codeql/     (the bundle)
+#   CodeQL/<cliVersion>/x64/pinned-version   (use this bundle authoritatively)
+#   CodeQL/<cliVersion>/x64.complete    (tool-cache marker)
+if [[ -n "$CODEQL_VERSION" ]]; then
+  ver="$CODEQL_VERSION"
+  if [[ "$ver" == "latest" ]]; then
+    log "resolving the CodeQL bundle version pinned by the latest codeql-action"
+    major="$(curl -fsSL https://api.github.com/repos/github/codeql-action/releases \
+      | jq -r '.[].tag_name' | grep -E '^v[0-9]' | sort -rV | head -n1 | sed -E 's/^v([0-9]+).*/\1/')"
+    [[ -n "$major" ]] || die "could not resolve the codeql-action major version"
+    ver="$(curl -fsSL "https://raw.githubusercontent.com/github/codeql-action/v${major}/src/defaults.json" | jq -r '.cliVersion')"
+    [[ -n "$ver" && "$ver" != "null" ]] || die "could not resolve the CodeQL cliVersion"
+  fi
+  log "codeql $ver"
+  dest="$STAGE/CodeQL/$ver/$ARCH"
+  mkdir -p "$dest"
+  # The linux64 bundle is self-contained (its own runtimes + query packs); no
+  # host toolchain or Docker needed.
+  curl -fSL --retry 3 \
+    "https://github.com/github/codeql-action/releases/download/codeql-bundle-v${ver}/codeql-bundle-linux64.tar.gz" \
+    | tar -xz -C "$dest" || die "codeql $ver download/extract failed"
+  [[ -x "$dest/codeql/codeql" ]] || die "codeql $ver: codeql/codeql missing after extract"
+  # pinned-version marks the bundle as shipped-with-the-toolcache so the Action
+  # uses it authoritatively even when its default bundle bumps (no re-download).
+  : > "$dest/pinned-version"
+  : > "$STAGE/CodeQL/$ver/$ARCH.complete"
+fi
+
 # Read-only in the guest; make sure everything is traversable/readable.
 chmod -R a+rX "$STAGE"
 
@@ -158,7 +198,7 @@ sync
 
 log "tool-cache drive written: $OUT ($(du -h "$OUT" | awk '{print $1}'), label=$LABEL)"
 log "contents:"
-for t in node go Python; do
+for t in node go Python CodeQL; do
   [[ -d "$STAGE/$t" ]] && for d in "$STAGE/$t"/*/; do echo "   - $t $(basename "$d")"; done
 done
 log "next: attach with  firerunner --toolcache $OUT  (or FR_TOOLCACHE=$OUT)"

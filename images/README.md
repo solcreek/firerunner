@@ -118,14 +118,21 @@ sudo ./build-toolcache.sh --out /var/lib/firerunner/toolcache.ext4 \
 # ubuntu:24.04 container (its interpreter bakes an absolute RUNPATH under
 # /opt/hostedtoolcache, matching where the guest mounts the drive) => needs Docker.
 sudo ./build-toolcache.sh --out toolcache.ext4 --python 3.12
+
+# CodeQL: bakes the github/codeql-action bundle exactly as runner-images does
+# (self-contained, no Docker; needs jq). `latest` tracks the version the newest
+# codeql-action pins; pass a CLI version (e.g. 2.26.3) to pin it.
+sudo ./build-toolcache.sh --out toolcache.ext4 --codeql latest
 ```
 
 It lays out the exact hosted-tool-cache structure the stock actions look for
-(`<tool>/<version>/x64/` + a `<version>/x64.complete` marker), sizes and formats
-the ext4, and labels it `hostedtoolcache`. The drive is a **pure accelerator**:
-a missing tool/version just means `setup-*` downloads it and the job still
-passes. Tailor the version list to the repos you serve by reading their
-`go.mod` / `.nvmrc` / `.python-version`.
+(`<tool>/<version>/x64/` + a `<version>/x64.complete` marker; CodeQL also gets a
+`pinned-version` file so the Action uses the baked bundle authoritatively instead
+of re-downloading when its default bumps), sizes and formats the ext4, and labels
+it `hostedtoolcache`. The drive is a **pure accelerator**: a missing tool/version
+just means `setup-*` downloads it and the job still passes. Tailor the version
+list to the repos you serve by reading their `go.mod` / `.nvmrc` /
+`.python-version`.
 
 ## Rebuild policy
 
