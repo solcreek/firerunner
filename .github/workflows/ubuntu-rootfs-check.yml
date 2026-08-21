@@ -1,0 +1,38 @@
+name: ubuntu-rootfs-check
+
+# Smoke test for the "full" ubuntu-rootfs golden (build-ubuntu-rootfs.sh
+# --toolset full): confirms the baked-in actions/runner-images tool cache is
+# present on the rootfs and that the cached Go/Node/Python toolchains run.
+# Also dumps how the runner resolved RUNNER_TOOL_CACHE so we can see whether
+# firerunner-run.sh wired AGENT_TOOLSDIRECTORY to the baked cache.
+on:
+  workflow_dispatch:
+
+jobs:
+  toolcache:
+    runs-on: firerunner
+    steps:
+      - name: runtime tool-cache wiring
+        run: |
+          echo "RUNNER_TOOL_CACHE=${RUNNER_TOOL_CACHE:-unset}"
+          echo "AGENT_TOOLSDIRECTORY=${AGENT_TOOLSDIRECTORY:-unset}"
+          echo "--- mounts ---"; mount | grep -Ei 'hostedtoolcache|/opt' || echo "(no /opt or hostedtoolcache mount)"
+          echo "--- blkid ---"; (command -v blkid >/dev/null && blkid || echo "blkid not installed")
+      - name: baked tool cache present + runnable
+        run: |
+          set -e
+          # Read the baked cache directly off the rootfs: this proves --toolset
+          # full produced a usable /opt/hostedtoolcache regardless of env wiring.
+          TC=/opt/hostedtoolcache
+          test -d "$TC" || { echo "MISSING: $TC does not exist"; exit 1; }
+          echo "cache tools: $(ls "$TC" | tr '\n' ' ')"
+          for t in Python node go; do
+            test -d "$TC/$t" || { echo "MISSING: $t not in tool cache"; exit 1; }
+            echo "$t: $(ls "$TC/$t" | tr '\n' ' ')"
+          done
+          GO=$(ls -d "$TC"/go/*/x64/bin/go | sort -V | tail -1)
+          NODE=$(ls -d "$TC"/node/*/x64/bin/node | sort -V | tail -1)
+          PY=$(ls -d "$TC"/Python/*/x64/bin/python3 | sort -V | tail -1)
+          echo "go:     $("$GO" version)"
+          echo "node:   $("$NODE" --version)"
+          echo "python: $("$PY" --version)"
