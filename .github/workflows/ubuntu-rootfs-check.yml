@@ -36,3 +36,32 @@ jobs:
           echo "go:     $("$GO" version)"
           echo "node:   $("$NODE" --version)"
           echo "python: $("$PY" --version)"
+      - name: boot policy (only the runner should auto-start)
+        run: |
+          # Faithful golden installs docker/DBs but boots with them disabled so
+          # the microVM reaches an idle runner fast. docker.socket stays enabled
+          # for on-demand socket activation.
+          echo "os: $(. /etc/os-release; echo "$PRETTY_NAME") glibc $(ldd --version | head -1 | awk '{print $NF}')"
+          echo "uptime at job start: $(cut -d' ' -f1 /proc/uptime)s"
+          echo "docker.service:  $(systemctl is-active docker 2>/dev/null || true) / $(systemctl is-enabled docker 2>/dev/null || true)"
+          echo "docker.socket:   $(systemctl is-active docker.socket 2>/dev/null || true) / $(systemctl is-enabled docker.socket 2>/dev/null || true)"
+          echo "containerd:      $(systemctl is-active containerd 2>/dev/null || true) / $(systemctl is-enabled containerd 2>/dev/null || true)"
+          echo "--- masked/off noise ---"
+          for u in snapd apt-daily.timer motd-news.timer systemd-networkd-wait-online; do
+            echo "$u: $(systemctl is-enabled "$u" 2>/dev/null || echo n/a)"
+          done
+      - name: docker on demand + egress survives docker networking
+        run: |
+          set -e
+          echo "--- egress BEFORE docker starts ---"
+          before=$(curl -fsS -o /dev/null -w '%{http_code}' https://api.github.com/zen && echo OK || echo FAIL)
+          echo "api.github.com before docker: $before"
+          echo "--- start docker (socket activation) ---"
+          time docker version
+          echo "--- docker run hello-world (daemon + registry pull + container net) ---"
+          sudo docker run --rm hello-world | grep -i "hello from docker" && echo "docker run: OK"
+          echo "--- egress AFTER docker brought up iptables/docker0 ---"
+          ip -br addr show docker0 2>/dev/null || echo "(no docker0 yet)"
+          after=$(curl -fsS -o /dev/null -w '%{http_code}' https://api.github.com/zen && echo OK || echo FAIL)
+          echo "api.github.com after docker:  $after"
+          test "$after" = "OK" || { echo "REGRESSION: runner egress broke after docker networking"; exit 1; }
