@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +61,25 @@ type FirecrackerConfig struct {
 	LogDir string
 	// MaxVMs bounds concurrent microVMs and sizes the per-VM network pool.
 	MaxVMs int
+
+	// Jailer, when true, launches every microVM under the Firecracker jailer,
+	// which chroots the VMM, gives it its own PID namespace and drops it to an
+	// unprivileged uid/gid. It is opt-in: firerunner already runs non-root and
+	// Firecracker already installs seccomp filters by default, so the jailer is
+	// an incremental defence-in-depth step whose cost is that it needs a root
+	// launcher. No network namespace is used, so the host-namespace tap devices
+	// work unchanged.
+	Jailer bool
+	// JailerBin is the path to the jailer executable (must match the firecracker
+	// version). Defaults to "jailer".
+	JailerBin string
+	// ChrootBase is the jailer chroot base dir (default "/srv/jailer"). Each
+	// microVM gets <ChrootBase>/firecracker/<id>/root.
+	ChrootBase string
+	// JailUID and JailGID are the unprivileged uid/gid the jailer drops the VMM
+	// to. Required (>0) when Jailer is set.
+	JailUID int
+	JailGID int
 }
 
 // DefaultBootArgs is a minimal, quiet serial console command line. reboot=k is
@@ -108,6 +128,12 @@ func NewFirecracker(cfg FirecrackerConfig, log *slog.Logger) *Firecracker {
 	if cfg.NFTTable == "" {
 		cfg.NFTTable = natTable
 	}
+	if cfg.JailerBin == "" {
+		cfg.JailerBin = "jailer"
+	}
+	if cfg.ChrootBase == "" {
+		cfg.ChrootBase = "/srv/jailer"
+	}
 	if cfg.MaxVMs < 1 {
 		cfg.MaxVMs = 64
 	}
@@ -140,17 +166,6 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 	defer f.ipam.release(slot)
 	vnet := slotNet(slot, f.cfg.TapPrefix, f.cfg.NetBase)
 
-	jobDir := filepath.Join(f.cfg.WorkDir, name)
-	if err := os.MkdirAll(jobDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir job dir: %w", err)
-	}
-	defer os.RemoveAll(jobDir)
-
-	rootfs := filepath.Join(jobDir, "rootfs.ext4")
-	if err := f.run(ctx, "cp", "--reflink=auto", spec.RootFS, rootfs); err != nil {
-		return fmt.Errorf("reflink golden rootfs: %w", err)
-	}
-
 	if err := f.setupTap(ctx, vnet); err != nil {
 		return fmt.Errorf("setup tap %s: %w", vnet.tap, err)
 	}
@@ -162,12 +177,14 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 	}
 	defer closeConsole()
 
-	sock := filepath.Join(jobDir, "fc.sock")
-	cmd := exec.CommandContext(ctx, f.cfg.Binary, "--api-sock", sock, "--id", name)
-	cmd.Stdout = console
-	cmd.Stderr = console
+	cmd, sock, kernelPath, rootfsPath, cleanup, err := f.prepare(ctx, name, console, spec)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start firecracker: %w", err)
+		return fmt.Errorf("start %s: %w", cmd.Path, err)
 	}
 
 	if err := waitForSocket(ctx, sock, 5*time.Second); err != nil {
@@ -176,7 +193,7 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 	}
 
 	bootArgs := composeBootArgs(f.cfg.BootArgs, vnet)
-	if err := f.configure(ctx, sock, rootfs, vnet, bootArgs, jitConfig, spec); err != nil {
+	if err := f.configure(ctx, sock, kernelPath, rootfsPath, vnet, bootArgs, jitConfig, spec); err != nil {
 		_ = cmd.Process.Kill()
 		return fmt.Errorf("configure microVM: %w", err)
 	}
@@ -381,15 +398,97 @@ func buildAPISteps(kernelImage, bootArgs, rootfs, tap, guestMAC, jit string, spe
 }
 
 // configure runs the Firecracker API sequence. MMDS config and data MUST be set
-// before InstanceStart so the JIT secret is available to the guest at boot.
-func (f *Firecracker) configure(ctx context.Context, sock, rootfs string, n vmNet, bootArgs, jit string, spec core.RunnerSpec) error {
+// before InstanceStart so the JIT secret is available to the guest at boot. The
+// kernel and rootfs paths are given as Firecracker will see them (host paths for
+// a direct launch, in-jail paths such as /vmlinux under the jailer).
+func (f *Firecracker) configure(ctx context.Context, sock, kernelPath, rootfs string, n vmNet, bootArgs, jit string, spec core.RunnerSpec) error {
 	cl := newUnixClient(sock)
-	for _, s := range buildAPISteps(f.cfg.KernelImage, bootArgs, rootfs, n.tap, n.guestMAC, jit, spec) {
+	for _, s := range buildAPISteps(kernelPath, bootArgs, rootfs, n.tap, n.guestMAC, jit, spec) {
 		if err := putJSON(ctx, cl, s.path, s.body); err != nil {
 			return fmt.Errorf("PUT %s: %w", s.path, err)
 		}
 	}
 	return nil
+}
+
+// jailChrootRoot returns the host path to a microVM's jail root, where its
+// kernel, rootfs and API socket live: <base>/firecracker/<id>/root.
+func jailChrootRoot(base, id string) string {
+	return filepath.Join(base, "firecracker", id, "root")
+}
+
+// buildJailerArgs returns the jailer argv that launches one jailed Firecracker.
+// The jailer chroots into <ChrootBase>/firecracker/<id>/root, drops to
+// JailUID:JailGID and execs Firecracker (passing --id itself). Firecracker's API
+// socket defaults to /run/firecracker.socket inside the jail. No --netns is
+// passed: the jailed VMM stays in the host network namespace so the per-slot
+// host tap devices attach unchanged. cgroup-version 2 with no --cgroup means the
+// jailer creates no cgroup (systemd already scopes the service). It is a pure
+// function so the argv can be asserted in tests.
+func buildJailerArgs(cfg FirecrackerConfig, id string) []string {
+	return []string{
+		"--id", id,
+		"--exec-file", cfg.Binary,
+		"--uid", strconv.Itoa(cfg.JailUID),
+		"--gid", strconv.Itoa(cfg.JailGID),
+		"--cgroup-version", "2",
+		"--chroot-base-dir", cfg.ChrootBase,
+	}
+}
+
+// prepare stages a microVM's rootfs and returns the command to launch it, the
+// host path to its API socket, the kernel and rootfs paths as Firecracker will
+// see them, and a cleanup that removes everything staged. When Jailer is set it
+// builds the chroot and stages the kernel and rootfs inside it (owned by the
+// jail user); otherwise it uses a flat per-job work dir and launches Firecracker
+// directly.
+func (f *Firecracker) prepare(ctx context.Context, name string, console io.Writer, spec core.RunnerSpec) (cmd *exec.Cmd, sock, kernelPath, rootfsPath string, cleanup func(), err error) {
+	if f.cfg.Jailer {
+		idDir := filepath.Join(f.cfg.ChrootBase, "firecracker", name)
+		root := jailChrootRoot(f.cfg.ChrootBase, name)
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			return nil, "", "", "", nil, fmt.Errorf("mkdir jail root: %w", err)
+		}
+		cleanup = func() { _ = os.RemoveAll(idDir) }
+		kernel := filepath.Join(root, "vmlinux")
+		rootfs := filepath.Join(root, "rootfs.ext4")
+		if err := f.run(ctx, "cp", "--reflink=auto", f.cfg.KernelImage, kernel); err != nil {
+			cleanup()
+			return nil, "", "", "", nil, fmt.Errorf("stage kernel into jail: %w", err)
+		}
+		if err := f.run(ctx, "cp", "--reflink=auto", spec.RootFS, rootfs); err != nil {
+			cleanup()
+			return nil, "", "", "", nil, fmt.Errorf("reflink golden rootfs into jail: %w", err)
+		}
+		// The dropped-privilege Firecracker must own the writable rootfs and be
+		// able to read the kernel; the jailer only chowns the chroot dir and the
+		// /dev nodes it creates, not the files we stage.
+		for _, p := range []string{kernel, rootfs} {
+			if err := os.Chown(p, f.cfg.JailUID, f.cfg.JailGID); err != nil {
+				cleanup()
+				return nil, "", "", "", nil, fmt.Errorf("chown %s to jail user: %w", p, err)
+			}
+		}
+		sock = filepath.Join(root, "run", "firecracker.socket")
+		cmd = exec.CommandContext(ctx, f.cfg.JailerBin, buildJailerArgs(f.cfg, name)...)
+		cmd.Stdout, cmd.Stderr = console, console
+		return cmd, sock, "/vmlinux", "/rootfs.ext4", cleanup, nil
+	}
+
+	jobDir := filepath.Join(f.cfg.WorkDir, name)
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		return nil, "", "", "", nil, fmt.Errorf("mkdir job dir: %w", err)
+	}
+	cleanup = func() { _ = os.RemoveAll(jobDir) }
+	rootfs := filepath.Join(jobDir, "rootfs.ext4")
+	if err := f.run(ctx, "cp", "--reflink=auto", spec.RootFS, rootfs); err != nil {
+		cleanup()
+		return nil, "", "", "", nil, fmt.Errorf("reflink golden rootfs: %w", err)
+	}
+	sock = filepath.Join(jobDir, "fc.sock")
+	cmd = exec.CommandContext(ctx, f.cfg.Binary, "--api-sock", sock, "--id", name)
+	cmd.Stdout, cmd.Stderr = console, console
+	return cmd, sock, f.cfg.KernelImage, rootfs, cleanup, nil
 }
 
 // CleanupStale reclaims host resources left behind by microVMs from a previous,
@@ -423,6 +522,19 @@ func (f *Firecracker) CleanupStale(ctx context.Context) {
 			continue
 		}
 		f.log.Info("removed stale job dir", "dir", dir)
+	}
+
+	// Under the jailer each microVM leaves a chroot at <base>/firecracker/<id>;
+	// any that survive startup are stale (the process owns no microVMs yet).
+	if f.cfg.Jailer {
+		jails, _ := filepath.Glob(filepath.Join(f.cfg.ChrootBase, "firecracker", "*"))
+		for _, dir := range jails {
+			if err := os.RemoveAll(dir); err != nil {
+				f.log.Warn("remove stale jail dir", "dir", dir, "err", err)
+				continue
+			}
+			f.log.Info("removed stale jail dir", "dir", dir)
+		}
 	}
 }
 

@@ -85,6 +85,12 @@ func FromFlags(args []string) (*Config, error) {
 	fs.StringVar(&c.Firecracker.ExtIface, "ext-iface", env("FR_EXT_IFACE", ""), "host external interface for microVM egress NAT (required)")
 	fs.StringVar(&c.Firecracker.LogDir, "log-dir", env("FR_LOG_DIR", ""), "directory for per-runner console logs (off-VM log forwarding)")
 
+	fs.BoolVar(&c.Firecracker.Jailer, "jailer", envBool("FR_JAILER", false), "run each microVM under the Firecracker jailer (chroot + PID ns + privilege drop); opt-in, requires a root launcher and --jail-uid/--jail-gid")
+	fs.StringVar(&c.Firecracker.JailerBin, "jailer-bin", env("FR_JAILER_BIN", "jailer"), "path to the jailer binary (must match the firecracker version)")
+	fs.StringVar(&c.Firecracker.ChrootBase, "chroot-base", env("FR_CHROOT_BASE", "/srv/jailer"), "jailer chroot base dir")
+	fs.IntVar(&c.Firecracker.JailUID, "jail-uid", envInt("FR_JAIL_UID", 0), "uid the jailer drops Firecracker to (required with --jailer)")
+	fs.IntVar(&c.Firecracker.JailGID, "jail-gid", envInt("FR_JAIL_GID", 0), "gid the jailer drops Firecracker to (required with --jailer)")
+
 	var egress, dnsServers string
 	var metaRefresh time.Duration
 	fs.StringVar(&egress, "egress", env("FR_EGRESS", "api,actions,git,dns,packages,ntp"), "comma-separated egress allowlist: GitHub /meta categories (api,actions,git,packages) plus dns,ntp; or 'open' for no allowlist")
@@ -146,6 +152,8 @@ func (c *Config) validate() error {
 		return fmt.Errorf("--mem-mib must be >= 128")
 	case c.Token == "" && c.AppClientID == "":
 		return fmt.Errorf("provide --token or GitHub App credentials")
+	case c.Firecracker.Jailer && (c.Firecracker.JailUID < 1 || c.Firecracker.JailGID < 1):
+		return fmt.Errorf("--jail-uid and --jail-gid (>0) are required when --jailer is set")
 	}
 	return nil
 }
@@ -202,6 +210,15 @@ func envInt(key string, def int) int {
 	if v, ok := os.LookupEnv(key); ok {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+func envBool(key string, def bool) bool {
+	if v, ok := os.LookupEnv(key); ok {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
 		}
 	}
 	return def

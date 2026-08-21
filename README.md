@@ -182,6 +182,40 @@ drains in-flight microVMs before exiting (`TimeoutStopSec` bounds the wait).
 Restarts are safe: registration is idempotent and a session left behind by an
 unclean exit is retried until GitHub expires it.
 
+### Hardening: the Firecracker jailer (`--jailer`, opt-in)
+
+firerunner already runs the VMM **non-root** (a dedicated `firerunner` user with
+only `cap_net_admin`) and Firecracker installs **seccomp** filters by default, so
+the two biggest sandboxing wins are on out of the box. The
+[jailer](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md)
+adds the rest — it `chroot`s each microVM into `<chroot-base>/firecracker/<id>/root`,
+gives it a private PID namespace, creates jail-local `/dev/kvm` and `/dev/net/tun`
+nodes, and drops the VMM to an unprivileged uid/gid.
+
+It is **off by default** because it inverts the privilege model: the *launcher*
+must run as **root** (to `chroot`, `mknod` and drop privileges), whereas the
+default deployment keeps firerunner unprivileged. Enable it for multi-tenant,
+untrusted-code or shared-host deployments:
+
+```bash
+firerunner ... \
+  --jailer --jailer-bin /usr/local/bin/jailer \
+  --chroot-base /srv/jailer \
+  --jail-uid "$(id -u firerunner)" --jail-gid "$(id -g firerunner)"
+```
+
+Notes:
+
+- The `jailer` binary must be the **same version** as `firecracker` (it ships in
+  the same release tarball) and Firecracker must be the static musl build.
+- No network namespace is used (`--netns` is not passed), so the per-slot
+  host-namespace tap devices and the egress allowlist work unchanged.
+- Per-launch overhead is ~single-digit milliseconds (chroot + staging the VMM),
+  negligible against the microVM boot.
+- The systemd unit must run as `root` when the jailer is enabled (the default
+  `deploy/firerunner.service` runs as the `firerunner` user for the
+  non-jailer mode).
+
 ## License
 
 [MIT](./LICENSE)
