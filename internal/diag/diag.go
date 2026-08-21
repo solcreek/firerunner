@@ -20,6 +20,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/solcreek/firerunner/internal/cacheserver"
 	"github.com/solcreek/firerunner/internal/config"
 	"github.com/solcreek/firerunner/internal/provisioner"
 )
@@ -89,6 +90,9 @@ type CacheInfo struct {
 	Port int `json:"port,omitempty"`
 	// URL is the explicit cache-server base URL (url mode).
 	URL string `json:"url,omitempty"`
+	// Stats is a live snapshot from the cache-server's /stats endpoint, when it
+	// is reachable; nil otherwise (the cache is off, or the server is down).
+	Stats *cacheserver.Stats `json:"stats,omitempty"`
 }
 
 // NetInfo captures the host network wiring for guest egress.
@@ -208,6 +212,9 @@ func collectStatus(cfg *config.Config, version string) StatusReport {
 	case fc.CachePort != 0:
 		r.Cache = &CacheInfo{Mode: "gateway", Port: fc.CachePort}
 	}
+	if r.Cache != nil {
+		r.Cache.Stats = fetchCacheStats(fc)
+	}
 
 	// Tier catalog, when one is configured. Each tier is its own scale set with
 	// its own microVM shape and golden image, all sharing this host.
@@ -270,6 +277,14 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			fmt.Fprintf(tw, "dep cache\tself-hosted %s\n", r.Cache.URL)
 		} else {
 			fmt.Fprintf(tw, "dep cache\tself-hosted (guest gateway:%d)\n", r.Cache.Port)
+		}
+		if st := r.Cache.Stats; st != nil {
+			size := humanBytes(st.Bytes)
+			if st.MaxBytes > 0 {
+				size += " / " + humanBytes(st.MaxBytes)
+			}
+			fmt.Fprintf(tw, "\t%d entries, %s, %s hit rate (%d hit / %d miss), %d evicted\n",
+				st.Entries, size, hitRate(st.Hits, st.Misses), st.Hits, st.Misses, st.Evictions)
 		}
 	} else {
 		fmt.Fprintf(tw, "dep cache\t(none; jobs use GitHub's hosted cache)\n")
@@ -499,6 +514,47 @@ func authCheck(cfg *config.Config) Check {
 		return fail("auth", "GitHub App private key unreadable: %v", err)
 	}
 	return pass("auth", "GitHub App (client %s, installation %d)", cfg.AppClientID, cfg.AppInstallID)
+}
+
+// fetchCacheStats best-effort reads the cache-server's /stats snapshot for the
+// status report. It returns nil on any error (server down, wrong endpoint) so
+// status still renders without live numbers.
+func fetchCacheStats(fc provisioner.FirecrackerConfig) *cacheserver.Stats {
+	var base string
+	switch {
+	case fc.CacheURL != "":
+		base = strings.TrimRight(fc.CacheURL, "/")
+	case fc.CachePort != 0:
+		base = fmt.Sprintf("http://127.0.0.1:%d", fc.CachePort)
+	default:
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/stats", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var st cacheserver.Stats
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		return nil
+	}
+	return &st
+}
+
+// hitRate renders hits/(hits+misses) as a percentage, or "n/a" before any
+// lookups.
+func hitRate(hits, misses uint64) string {
+	total := hits + misses
+	if total == 0 {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.0f%%", float64(hits)/float64(total)*100)
 }
 
 // cacheCheck probes the self-hosted dependency cache when one is configured, and

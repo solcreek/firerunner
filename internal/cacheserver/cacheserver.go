@@ -89,6 +89,38 @@ type Server struct {
 	entries map[uint64]*Entry
 	nextID  uint64
 	maxSize int64 // 0 = unlimited; total completed-blob bytes to keep
+
+	// counters (under mu) for observability via /stats and /metrics.
+	hits      uint64
+	misses    uint64
+	saves     uint64
+	evictions uint64
+}
+
+// Stats is a point-in-time snapshot of the cache store, served by /stats and
+// /metrics and consumed by `firerunner status`.
+type Stats struct {
+	Entries   int    `json:"entries"`   // completed entries currently stored
+	Bytes     int64  `json:"bytes"`     // total size of completed blobs
+	MaxBytes  int64  `json:"max_bytes"` // configured cap (0 = unlimited)
+	Hits      uint64 `json:"hits"`      // download-URL lookups that matched
+	Misses    uint64 `json:"misses"`    // download-URL lookups that did not
+	Saves     uint64 `json:"saves"`     // entries finalized
+	Evictions uint64 `json:"evictions"` // entries removed by the size cap
+}
+
+// snapshot collects current stats. The caller must NOT hold s.mu.
+func (s *Server) snapshot() Stats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := Stats{MaxBytes: s.maxSize, Hits: s.hits, Misses: s.misses, Saves: s.saves, Evictions: s.evictions}
+	for _, e := range s.entries {
+		if e.Complete {
+			st.Entries++
+			st.Bytes += e.Size
+		}
+	}
+	return st
 }
 
 // SetMaxSize caps the total size of completed cache blobs kept on disk. When a
@@ -129,6 +161,8 @@ func New(dir string, log *slog.Logger) (*Server, error) {
 	s.mux.HandleFunc("PUT /upload/{id}", s.handleUpload)
 	s.mux.HandleFunc("GET /download/{id}", s.handleDownload)
 	s.mux.HandleFunc("HEAD /download/{id}", s.handleDownload)
+	s.mux.HandleFunc("GET /stats", s.handleStats)
+	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 	return s, nil
 }
 
@@ -281,6 +315,7 @@ func (s *Server) handleFinalize(w http.ResponseWriter, r *http.Request) {
 	e.Size = fi.Size()
 	e.Complete = true
 	e.UsedAt = time.Now().Unix()
+	s.saves++
 	s.evictLRU(e.ID)
 	if err := s.save(); err != nil {
 		twirpError(w, http.StatusInternalServerError, "internal", err.Error())
@@ -305,7 +340,10 @@ func (s *Server) handleGetDownloadURL(w http.ResponseWriter, r *http.Request) {
 	e := s.match(repo, strings.ToLower(req.Key), req.RestoreKeys, req.Version)
 	if e != nil {
 		e.UsedAt = time.Now().Unix()
+		s.hits++
 		_ = s.save()
+	} else {
+		s.misses++
 	}
 	s.mu.Unlock()
 
@@ -441,6 +479,32 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		s.log.Info("cache entry served", "id", e.ID, "key", e.Key, "size", e.Size, "method", r.Method)
 	}
 	http.ServeContent(w, r, strconv.FormatUint(e.ID, 10), fi.ModTime(), f)
+}
+
+// handleStats serves a JSON snapshot of the cache store for `firerunner status`.
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.snapshot())
+}
+
+// handleMetrics serves the same numbers in Prometheus text exposition format so
+// the cache-server can be scraped without any third-party client library.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	st := s.snapshot()
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	fmt.Fprintf(w, "# HELP firerunner_cache_entries Completed cache entries stored.\n")
+	fmt.Fprintf(w, "# TYPE firerunner_cache_entries gauge\nfirerunner_cache_entries %d\n", st.Entries)
+	fmt.Fprintf(w, "# HELP firerunner_cache_bytes Total size of completed cache blobs.\n")
+	fmt.Fprintf(w, "# TYPE firerunner_cache_bytes gauge\nfirerunner_cache_bytes %d\n", st.Bytes)
+	fmt.Fprintf(w, "# HELP firerunner_cache_max_bytes Configured size cap (0 = unlimited).\n")
+	fmt.Fprintf(w, "# TYPE firerunner_cache_max_bytes gauge\nfirerunner_cache_max_bytes %d\n", st.MaxBytes)
+	fmt.Fprintf(w, "# HELP firerunner_cache_hits_total Download lookups that matched an entry.\n")
+	fmt.Fprintf(w, "# TYPE firerunner_cache_hits_total counter\nfirerunner_cache_hits_total %d\n", st.Hits)
+	fmt.Fprintf(w, "# HELP firerunner_cache_misses_total Download lookups with no match.\n")
+	fmt.Fprintf(w, "# TYPE firerunner_cache_misses_total counter\nfirerunner_cache_misses_total %d\n", st.Misses)
+	fmt.Fprintf(w, "# HELP firerunner_cache_saves_total Entries finalized.\n")
+	fmt.Fprintf(w, "# TYPE firerunner_cache_saves_total counter\nfirerunner_cache_saves_total %d\n", st.Saves)
+	fmt.Fprintf(w, "# HELP firerunner_cache_evictions_total Entries removed by the size cap.\n")
+	fmt.Fprintf(w, "# TYPE firerunner_cache_evictions_total counter\nfirerunner_cache_evictions_total %d\n", st.Evictions)
 }
 
 // authEntry resolves and authorizes the {id} + ?sig= on a blob request.
@@ -591,6 +655,7 @@ func (s *Server) evictLRU(keepID uint64) {
 		_ = os.Remove(s.blobPath(victim.ID))
 		_ = os.RemoveAll(s.tmpDir(victim.ID))
 		delete(s.entries, victim.ID)
+		s.evictions++
 		s.log.Info("evicted cache entry (size cap)", "id", victim.ID, "key", victim.Key, "size", victim.Size)
 	}
 }

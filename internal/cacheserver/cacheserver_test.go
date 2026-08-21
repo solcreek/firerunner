@@ -355,6 +355,57 @@ func TestPersistenceReload(t *testing.T) {
 	}
 }
 
+// TestStatsAndMetrics checks the /stats JSON and /metrics text reflect saves,
+// hits and misses.
+func TestStatsAndMetrics(t *testing.T) {
+	s, err := New(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s.SetMaxSize(0)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	saveEntry(t, ts.URL, "1", "k1", "v1", 100)
+	if got := twirp(t, ts.URL, "GetCacheEntryDownloadURL", getReq{Metadata: meta("1"), Key: "k1", Version: "v1"}); got["ok"] != true {
+		t.Fatalf("expected hit: %v", got)
+	}
+	if got := twirp(t, ts.URL, "GetCacheEntryDownloadURL", getReq{Metadata: meta("1"), Key: "nope", Version: "v1"}); got["ok"] != false {
+		t.Fatalf("expected miss: %v", got)
+	}
+
+	resp, err := http.Get(ts.URL + "/stats")
+	if err != nil {
+		t.Fatalf("GET /stats: %v", err)
+	}
+	defer resp.Body.Close()
+	var st Stats
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		t.Fatalf("decode stats: %v", err)
+	}
+	if st.Entries != 1 || st.Bytes != 100 || st.Saves != 1 || st.Hits != 1 || st.Misses != 1 {
+		t.Fatalf("unexpected stats: %+v", st)
+	}
+
+	mresp, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer mresp.Body.Close()
+	body, _ := io.ReadAll(mresp.Body)
+	for _, want := range []string{
+		"firerunner_cache_entries 1",
+		"firerunner_cache_bytes 100",
+		"firerunner_cache_hits_total 1",
+		"firerunner_cache_misses_total 1",
+		"firerunner_cache_saves_total 1",
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("metrics missing %q in:\n%s", want, body)
+		}
+	}
+}
+
 // sanity: hex helper matches how blocks are stored (guards the reassembly path).
 func TestBlockIDEncoding(t *testing.T) {
 	if hex.EncodeToString([]byte("blk-0001")) == "" {

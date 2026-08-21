@@ -411,6 +411,11 @@ total over the cap, the least-recently-used entries are evicted until it fits
 firerunner cache-server --addr :8099 --dir /var/lib/firerunner/cache --max-size 50GB
 ```
 
+The server also exposes `GET /stats` (JSON: entry count, bytes, hits, misses,
+saves, evictions) and `GET /metrics` (Prometheus text, no client library
+needed) for scraping. `firerunner status` reads `/stats` and shows the live
+entry count, size vs. cap, and hit rate under the `dep cache` row.
+
 **Pointing microVMs at it.** Two pieces are needed because the *real* GitHub
 runner overwrites `ACTIONS_RESULTS_URL` with the value from its per-job message:
 
