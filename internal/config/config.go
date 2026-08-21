@@ -5,6 +5,7 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -354,9 +355,24 @@ func (c *Config) ResolvePrivateKey() (string, error) {
 	if strings.Contains(c.AppPrivateKey, "PRIVATE KEY") {
 		return c.AppPrivateKey, nil
 	}
+	// Anything without a PEM header is treated as a path to a PEM file. Never
+	// echo the raw value in an error: if the operator pasted key material that
+	// failed the header check above, os.ReadFile's PathError would carry the
+	// key verbatim into doctor --json (the README documents `doctor --json |
+	// jq`) and into journald. Report the failure category instead.
+	if strings.ContainsAny(c.AppPrivateKey, "\n\r") {
+		return "", errors.New(`app private key is neither valid PEM (missing "PRIVATE KEY" header) nor a file path`)
+	}
 	b, err := os.ReadFile(c.AppPrivateKey)
 	if err != nil {
-		return "", fmt.Errorf("read app private key: %w", err)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			return "", errors.New("app private key file does not exist")
+		case errors.Is(err, os.ErrPermission):
+			return "", errors.New("app private key file is not readable (permission denied)")
+		default:
+			return "", errors.New("app private key file could not be read")
+		}
 	}
 	return string(b), nil
 }

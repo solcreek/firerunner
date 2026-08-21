@@ -413,3 +413,29 @@ func TestResolvePrivateKey(t *testing.T) {
 		t.Fatal("expected error for missing key file")
 	}
 }
+
+// TestResolvePrivateKeyNeverLeaksValue verifies that key material which fails
+// the PEM-header check (so it is treated as a path) never appears in the error,
+// which would otherwise flow into `doctor --json` and journald.
+func TestResolvePrivateKeyNeverLeaksValue(t *testing.T) {
+	// Multi-line key material without the exact "PRIVATE KEY" header.
+	secret := "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj\nAgEAAoIBAQDsecretmaterial=="
+	_, err := (&Config{AppPrivateKey: secret}).ResolvePrivateKey()
+	if err == nil {
+		t.Fatal("expected error for non-PEM, non-path value")
+	}
+	if strings.Contains(err.Error(), "secretmaterial") || strings.Contains(err.Error(), secret) {
+		t.Fatalf("error leaked key material: %v", err)
+	}
+
+	// Single-line base64-looking material treated as a (missing) path must not
+	// echo the value either.
+	oneLine := "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwsecretmaterialAAAA"
+	_, err = (&Config{AppPrivateKey: oneLine}).ResolvePrivateKey()
+	if err == nil {
+		t.Fatal("expected error for missing key path")
+	}
+	if strings.Contains(err.Error(), "secretmaterial") || strings.Contains(err.Error(), oneLine) {
+		t.Fatalf("error leaked key material: %v", err)
+	}
+}
