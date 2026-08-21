@@ -88,6 +88,13 @@ type FirecrackerConfig struct {
 	// needs. The jailer never reclaims that dir, so firerunner rmdirs the empty
 	// cgroup on teardown.
 	CgroupLimits []string
+	// NetNS, when true, runs every microVM in its own network namespace: the
+	// guest tap lives inside the namespace and a veth pair links it to the host,
+	// so the tap is invisible to the host namespace and to peer microVMs. It
+	// requires Jailer (creating a netns needs CAP_SYS_ADMIN, which the default
+	// non-root deployment lacks; the jailer already runs as root and joins the
+	// namespace natively via --netns).
+	NetNS bool
 }
 
 // DefaultBootArgs is a minimal, quiet serial console command line. reboot=k is
@@ -174,10 +181,10 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 	defer f.ipam.release(slot)
 	vnet := slotNet(slot, f.cfg.TapPrefix, f.cfg.NetBase)
 
-	if err := f.setupTap(ctx, vnet); err != nil {
-		return fmt.Errorf("setup tap %s: %w", vnet.tap, err)
+	if err := f.setupNet(ctx, vnet); err != nil {
+		return fmt.Errorf("setup network for %s: %w", vnet.tap, err)
 	}
-	defer func() { _ = f.teardownTap(context.WithoutCancel(ctx), vnet.tap) }()
+	defer func() { _ = f.teardownNet(context.WithoutCancel(ctx), vnet) }()
 
 	console, closeConsole, err := f.openConsole(name)
 	if err != nil {
@@ -185,7 +192,7 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 	}
 	defer closeConsole()
 
-	cmd, sock, kernelPath, rootfsPath, cleanup, err := f.prepare(ctx, name, console, spec)
+	cmd, sock, kernelPath, rootfsPath, cleanup, err := f.prepare(ctx, name, vnet, console, spec)
 	if err != nil {
 		return err
 	}
@@ -440,14 +447,15 @@ func jailCgroupDir(binary, id string) string {
 // buildJailerArgs returns the jailer argv that launches one jailed Firecracker.
 // The jailer chroots into <ChrootBase>/firecracker/<id>/root, drops to
 // JailUID:JailGID and execs Firecracker (passing --id itself). Firecracker's API
-// socket defaults to /run/firecracker.socket inside the jail. No --netns is
-// passed: the jailed VMM stays in the host network namespace so the per-slot
-// host tap devices attach unchanged. With cgroup-version 2 and no CgroupLimits
-// the jailer creates no cgroup (systemd already scopes the service); each
-// CgroupLimit adds a --cgroup flag so the jailer places the VMM in its own
-// cgroup and applies the limit. It is a pure function so the argv can be
-// asserted in tests.
-func buildJailerArgs(cfg FirecrackerConfig, id string) []string {
+// socket defaults to /run/firecracker.socket inside the jail. When nsPath is
+// empty no --netns is passed and the jailed VMM stays in the host network
+// namespace so the per-slot host tap devices attach unchanged; when set the
+// jailer joins that named network namespace, where the per-slot tap lives. With
+// cgroup-version 2 and no CgroupLimits the jailer creates no cgroup (systemd
+// already scopes the service); each CgroupLimit adds a --cgroup flag so the
+// jailer places the VMM in its own cgroup and applies the limit. It is a pure
+// function so the argv can be asserted in tests.
+func buildJailerArgs(cfg FirecrackerConfig, id, nsPath string) []string {
 	args := []string{
 		"--id", id,
 		"--exec-file", cfg.Binary,
@@ -455,6 +463,9 @@ func buildJailerArgs(cfg FirecrackerConfig, id string) []string {
 		"--gid", strconv.Itoa(cfg.JailGID),
 		"--cgroup-version", "2",
 		"--chroot-base-dir", cfg.ChrootBase,
+	}
+	if nsPath != "" {
+		args = append(args, "--netns", nsPath)
 	}
 	for _, c := range cfg.CgroupLimits {
 		args = append(args, "--cgroup", c)
@@ -467,8 +478,9 @@ func buildJailerArgs(cfg FirecrackerConfig, id string) []string {
 // see them, and a cleanup that removes everything staged. When Jailer is set it
 // builds the chroot and stages the kernel and rootfs inside it (owned by the
 // jail user); otherwise it uses a flat per-job work dir and launches Firecracker
-// directly.
-func (f *Firecracker) prepare(ctx context.Context, name string, console io.Writer, spec core.RunnerSpec) (cmd *exec.Cmd, sock, kernelPath, rootfsPath string, cleanup func(), err error) {
+// directly. When NetNS is set (jailer only) the jailer is told to join the
+// slot's network namespace via --netns.
+func (f *Firecracker) prepare(ctx context.Context, name string, vnet vmNet, console io.Writer, spec core.RunnerSpec) (cmd *exec.Cmd, sock, kernelPath, rootfsPath string, cleanup func(), err error) {
 	if f.cfg.Jailer {
 		idDir := filepath.Join(f.cfg.ChrootBase, "firecracker", name)
 		root := jailChrootRoot(f.cfg.ChrootBase, name)
@@ -501,8 +513,12 @@ func (f *Firecracker) prepare(ctx context.Context, name string, console io.Write
 				return nil, "", "", "", nil, fmt.Errorf("chown %s to jail user: %w", p, err)
 			}
 		}
+		var nsPath string
+		if f.cfg.NetNS {
+			nsPath = slotNetNS(vnet, f.cfg.NetBase, f.cfg.TapPrefix).nsPath
+		}
 		sock = filepath.Join(root, "run", "firecracker.socket")
-		cmd = exec.CommandContext(ctx, f.cfg.JailerBin, buildJailerArgs(f.cfg, name)...)
+		cmd = exec.CommandContext(ctx, f.cfg.JailerBin, buildJailerArgs(f.cfg, name, nsPath)...)
 		cmd.Stdout, cmd.Stderr = console, console
 		return cmd, sock, "/vmlinux", "/rootfs.ext4", cleanup, nil
 	}
@@ -533,15 +549,29 @@ func (f *Firecracker) prepare(ctx context.Context, name string, console io.Write
 // and sockets whose teardown defer never ran).
 func (f *Firecracker) CleanupStale(ctx context.Context) {
 	for slot := 0; slot < f.cfg.MaxVMs; slot++ {
-		tap := fmt.Sprintf("%s%d", f.cfg.TapPrefix, slot)
-		if _, err := net.InterfaceByName(tap); err != nil {
-			continue // not present
-		}
-		if err := f.teardownTap(ctx, tap); err != nil {
-			f.log.Warn("remove stale tap", "tap", tap, "err", err)
+		vnet := slotNet(slot, f.cfg.TapPrefix, f.cfg.NetBase)
+		if f.cfg.NetNS {
+			// The tap lives inside the per-slot netns; a leftover namespace is
+			// the definitive marker of a stale slot. Deleting it cascades to the
+			// tap, the veth and the guest route.
+			if _, err := os.Stat(slotNetNS(vnet, f.cfg.NetBase, f.cfg.TapPrefix).nsPath); err != nil {
+				continue // not present
+			}
+			if err := f.teardownNet(ctx, vnet); err != nil {
+				f.log.Warn("remove stale netns", "slot", slot, "err", err)
+				continue
+			}
+			f.log.Info("removed stale netns", "slot", slot)
 			continue
 		}
-		f.log.Info("removed stale tap", "tap", tap)
+		if _, err := net.InterfaceByName(vnet.tap); err != nil {
+			continue // not present
+		}
+		if err := f.teardownNet(ctx, vnet); err != nil {
+			f.log.Warn("remove stale tap", "tap", vnet.tap, "err", err)
+			continue
+		}
+		f.log.Info("removed stale tap", "tap", vnet.tap)
 	}
 
 	// A job dir is uniquely identified by its firecracker API socket, so globbing
@@ -589,8 +619,15 @@ func (f *Firecracker) CleanupStale(ctx context.Context) {
 	}
 }
 
-func (f *Firecracker) setupTap(ctx context.Context, n vmNet) error {
-	for _, c := range tapUpCommands(n) {
+// setupNet provisions a microVM's networking: either a host-namespace tap
+// (default) or, when NetNS is set, a private per-slot network namespace holding
+// the tap with a veth uplink to the host.
+func (f *Firecracker) setupNet(ctx context.Context, n vmNet) error {
+	cmds := tapUpCommands(n)
+	if f.cfg.NetNS {
+		cmds = netnsUpCommands(n, slotNetNS(n, f.cfg.NetBase, f.cfg.TapPrefix), f.cfg.JailUID, f.cfg.JailGID)
+	}
+	for _, c := range cmds {
 		if err := f.run(ctx, c[0], c[1:]...); err != nil {
 			return err
 		}
@@ -598,8 +635,19 @@ func (f *Firecracker) setupTap(ctx context.Context, n vmNet) error {
 	return nil
 }
 
-func (f *Firecracker) teardownTap(ctx context.Context, tap string) error {
-	for _, c := range tapDownCommands(tap) {
+// teardownNet reverses setupNet. In NetNS mode deleting the namespace cascades
+// to the tap and the netns veth end (its host peer is auto-removed, taking the
+// guest route with it); the host-side link and route deletions are best-effort
+// belt-and-suspenders. Otherwise it removes the host tap.
+func (f *Firecracker) teardownNet(ctx context.Context, n vmNet) error {
+	if f.cfg.NetNS {
+		s := slotNetNS(n, f.cfg.NetBase, f.cfg.TapPrefix)
+		err := f.run(ctx, "ip", "netns", "del", s.ns)
+		_ = f.run(ctx, "ip", "link", "del", s.hostVeth)
+		_ = f.run(ctx, "ip", "route", "del", n.guestIP+"/32")
+		return err
+	}
+	for _, c := range tapDownCommands(n.tap) {
 		if err := f.run(ctx, c[0], c[1:]...); err != nil {
 			return err
 		}

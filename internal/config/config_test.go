@@ -129,6 +129,23 @@ func TestFromFlags_JailerCgroupErrors(t *testing.T) {
 	}
 }
 
+func TestFromFlags_NetNS(t *testing.T) {
+	c, err := FromFlags(append(baseArgs(),
+		"--jailer", "--jail-uid", "955", "--jail-gid", "954", "--netns"))
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	if !c.Firecracker.NetNS {
+		t.Fatal("NetNS should be true")
+	}
+}
+
+func TestFromFlags_NetNSRequiresJailer(t *testing.T) {
+	if _, err := FromFlags(append(baseArgs(), "--netns")); err == nil {
+		t.Fatal("expected error: --netns requires --jailer")
+	}
+}
+
 func TestParseLevel(t *testing.T) {
 	if parseLevel("debug").String() != "DEBUG" {
 		t.Fatal("debug")

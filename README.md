@@ -208,8 +208,25 @@ Notes:
 
 - The `jailer` binary must be the **same version** as `firecracker` (it ships in
   the same release tarball) and Firecracker must be the static musl build.
-- No network namespace is used (`--netns` is not passed), so the per-slot
-  host-namespace tap devices and the egress allowlist work unchanged.
+- By default no network namespace is used (`--netns` is not passed), so the
+  per-slot host-namespace tap devices and the egress allowlist work unchanged.
+- **Per-VM network namespace** (opt-in, jailer only): `--netns` puts each
+  microVM's tap inside its own network namespace, giving the strongest network
+  isolation — a guest cannot see the host's other taps, interfaces or routes,
+  only a point-to-point veth uplink:
+
+  ```bash
+  firerunner ... --jailer ... --netns
+  ```
+
+  The jailer joins the namespace natively via `--netns /var/run/netns/<ns>`
+  (creating/entering a namespace needs `CAP_SYS_ADMIN`, which only the root
+  jailer has — hence the jailer requirement). Each slot gets a private namespace
+  holding the guest tap (owned by the jail uid/gid so the dropped-privilege VMM
+  can still attach it) plus a veth pair on a transit `/30` to the host; the host
+  routes the guest `/32` back through the veth. Guest egress keeps its source IP
+  to the host (single NAT), so the masquerade and the guest-to-guest drop rules
+  apply unchanged. Namespaces are torn down on teardown and swept on startup.
 - **Per-VM cgroup limits** (opt-in, jailer only): `--jailer-cgroup` takes a
   semicolon-separated list of cgroup v2 `<file>=<value>` settings the jailer
   applies to each microVM's own cgroup, bounding one VM's blast radius on the

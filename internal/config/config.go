@@ -92,6 +92,7 @@ func FromFlags(args []string) (*Config, error) {
 	fs.IntVar(&c.Firecracker.JailGID, "jail-gid", envInt("FR_JAIL_GID", 0), "gid the jailer drops Firecracker to (required with --jailer)")
 	var jailerCgroup string
 	fs.StringVar(&jailerCgroup, "jailer-cgroup", env("FR_JAILER_CGROUP", ""), "semicolon-separated cgroup v2 limits applied to each microVM via the jailer, each <file>=<value> (e.g. \"memory.max=2147483648;cpu.max=200000;pids.max=512\"); requires --jailer")
+	fs.BoolVar(&c.Firecracker.NetNS, "netns", envBool("FR_NETNS", false), "run each microVM in its own network namespace (tap lives in the netns, veth uplink to the host); strongest network isolation, requires --jailer")
 
 	var egress, dnsServers string
 	var metaRefresh time.Duration
@@ -172,6 +173,8 @@ func (c *Config) validate() error {
 		return fmt.Errorf("--jail-uid and --jail-gid (>0) are required when --jailer is set")
 	case len(c.Firecracker.CgroupLimits) > 0 && !c.Firecracker.Jailer:
 		return fmt.Errorf("--jailer-cgroup requires --jailer")
+	case c.Firecracker.NetNS && !c.Firecracker.Jailer:
+		return fmt.Errorf("--netns requires --jailer")
 	}
 	for _, l := range c.Firecracker.CgroupLimits {
 		if !strings.Contains(l, "=") {

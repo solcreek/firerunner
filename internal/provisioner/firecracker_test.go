@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -168,15 +169,15 @@ func TestWaitForSocket_ContextCancel(t *testing.T) {
 	}
 }
 
-func TestSetupTap_RunsExpectedCommands(t *testing.T) {
+func TestSetupNet_RunsExpectedCommands(t *testing.T) {
 	var calls [][]string
 	f := NewFirecracker(FirecrackerConfig{}, testLogger())
 	f.run = func(ctx context.Context, name string, args ...string) error {
 		calls = append(calls, append([]string{name}, args...))
 		return nil
 	}
-	if err := f.setupTap(context.Background(), slotNet(0, "fr", 16)); err != nil {
-		t.Fatalf("setupTap: %v", err)
+	if err := f.setupNet(context.Background(), slotNet(0, "fr", 16)); err != nil {
+		t.Fatalf("setupNet: %v", err)
 	}
 	if len(calls) != 3 {
 		t.Fatalf("got %d commands, want 3: %v", len(calls), calls)
@@ -195,14 +196,14 @@ func TestName(t *testing.T) {
 	}
 }
 
-func TestTeardownTap(t *testing.T) {
+func TestTeardownNet(t *testing.T) {
 	var got []string
 	f := NewFirecracker(FirecrackerConfig{}, testLogger())
 	f.run = func(ctx context.Context, name string, args ...string) error {
 		got = append([]string{name}, args...)
 		return nil
 	}
-	if err := f.teardownTap(context.Background(), "frtap0"); err != nil {
+	if err := f.teardownNet(context.Background(), slotNet(0, "frtap", 16)); err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 4 || got[0] != "ip" || got[1] != "link" || got[2] != "del" || got[3] != "frtap0" {
@@ -259,7 +260,7 @@ func TestCleanupStaleJobDirs(t *testing.T) {
 
 func TestBuildJailerArgs(t *testing.T) {
 	cfg := FirecrackerConfig{Binary: "/usr/local/bin/firecracker", ChrootBase: "/srv/jailer", JailUID: 955, JailGID: 954}
-	got := buildJailerArgs(cfg, "firerunner-abc123")
+	got := buildJailerArgs(cfg, "firerunner-abc123", "")
 	want := []string{
 		"--id", "firerunner-abc123",
 		"--exec-file", "/usr/local/bin/firecracker",
@@ -276,12 +277,27 @@ func TestBuildJailerArgs(t *testing.T) {
 			t.Fatalf("arg %d = %q, want %q", i, got[i], want[i])
 		}
 	}
-	// No --netns: the jailed VMM must stay in the host network namespace so the
-	// per-slot host tap devices attach unchanged.
+	// No --netns when nsPath is empty: the jailed VMM stays in the host network
+	// namespace so the per-slot host tap devices attach unchanged.
 	for _, a := range got {
 		if a == "--netns" {
 			t.Fatal("buildJailerArgs must not pass --netns")
 		}
+	}
+}
+
+func TestBuildJailerArgs_NetNS(t *testing.T) {
+	cfg := FirecrackerConfig{Binary: "/usr/local/bin/firecracker", ChrootBase: "/srv/jailer", JailUID: 955, JailGID: 954}
+	got := buildJailerArgs(cfg, "firerunner-abc123", "/var/run/netns/frns0")
+	found := false
+	for i := 0; i+1 < len(got); i++ {
+		if got[i] == "--netns" && got[i+1] == "/var/run/netns/frns0" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("buildJailerArgs must pass --netns /var/run/netns/frns0, got %v", got)
 	}
 }
 
@@ -290,7 +306,7 @@ func TestBuildJailerArgs_CgroupLimits(t *testing.T) {
 		Binary: "/usr/local/bin/firecracker", ChrootBase: "/srv/jailer", JailUID: 955, JailGID: 954,
 		CgroupLimits: []string{"memory.max=2147483648", "cpu.max=200000", "pids.max=512"},
 	}
-	got := buildJailerArgs(cfg, "firerunner-abc123")
+	got := buildJailerArgs(cfg, "firerunner-abc123", "")
 	// Each limit must appear as a separate --cgroup <file>=<value> pair.
 	for _, want := range cfg.CgroupLimits {
 		found := false
@@ -408,6 +424,115 @@ func TestCleanupStale_CgroupDirs(t *testing.T) {
 	}
 }
 
+func TestSlotNetNS(t *testing.T) {
+	s := slotNetNS(slotNet(3, "fn", 17), 17, "fn")
+	if s.ns != "fnns3" {
+		t.Errorf("ns = %q, want fnns3", s.ns)
+	}
+	if s.hostVeth != "fnv3h" || s.nsVeth != "fnv3g" {
+		t.Errorf("veths = %q/%q, want fnv3h/fnv3g", s.hostVeth, s.nsVeth)
+	}
+	if len(s.hostVeth) > 15 || len(s.nsVeth) > 15 {
+		t.Errorf("veth name exceeds IFNAMSIZ: %q/%q", s.hostVeth, s.nsVeth)
+	}
+	if s.hostVIP != "172.17.3.5" || s.nsVIP != "172.17.3.6" {
+		t.Errorf("transit IPs = %q/%q, want .5/.6", s.hostVIP, s.nsVIP)
+	}
+	if s.nsPath != "/var/run/netns/fnns3" {
+		t.Errorf("nsPath = %q", s.nsPath)
+	}
+}
+
+func TestNetnsUpCommands(t *testing.T) {
+	n := slotNet(0, "fn", 17)
+	s := slotNetNS(n, 17, "fn")
+	cmds := netnsUpCommands(n, s, 955, 954)
+	if cmds[0][2] != "add" || cmds[0][3] != s.ns {
+		t.Fatalf("first command must add the netns, got %v", cmds[0])
+	}
+	joined := make([]string, len(cmds))
+	for i, c := range cmds {
+		joined[i] = strings.Join(c, " ")
+	}
+	all := strings.Join(joined, "\n")
+	wantContains := []string{
+		"ip tuntap add dev " + n.tap + " mode tap user 955 group 954",
+		"ip link add " + s.hostVeth + " type veth peer name " + s.nsVeth,
+		"ip link set " + s.nsVeth + " netns " + s.ns,
+		"ip netns exec " + s.ns + " ip route add default via " + s.hostVIP,
+		"ip netns exec " + s.ns + " sysctl -q -w net.ipv4.ip_forward=1",
+		"ip route add " + n.guestIP + "/32 via " + s.nsVIP,
+	}
+	for _, w := range wantContains {
+		if !strings.Contains(all, w) {
+			t.Errorf("netnsUpCommands missing %q\ngot:\n%s", w, all)
+		}
+	}
+	// The tap must be created inside the namespace, not on the host.
+	if !strings.Contains(all, "ip netns exec "+s.ns+" ip tuntap add dev "+n.tap) {
+		t.Errorf("tap must be created inside the netns")
+	}
+}
+
+func TestSetupNet_NetNSBranch(t *testing.T) {
+	var calls [][]string
+	f := NewFirecracker(FirecrackerConfig{NetNS: true, NetBase: 17, TapPrefix: "fn", JailUID: 955, JailGID: 954}, testLogger())
+	f.run = func(ctx context.Context, name string, args ...string) error {
+		calls = append(calls, append([]string{name}, args...))
+		return nil
+	}
+	if err := f.setupNet(context.Background(), slotNet(0, "fn", 17)); err != nil {
+		t.Fatalf("setupNet: %v", err)
+	}
+	if len(calls) == 0 || calls[0][1] != "netns" || calls[0][2] != "add" {
+		t.Fatalf("NetNS setup must start with ip netns add, got %v", calls)
+	}
+}
+
+func TestTeardownNet_NetNSBranch(t *testing.T) {
+	var calls [][]string
+	f := NewFirecracker(FirecrackerConfig{NetNS: true, NetBase: 17, TapPrefix: "fn"}, testLogger())
+	f.run = func(ctx context.Context, name string, args ...string) error {
+		calls = append(calls, append([]string{name}, args...))
+		return nil
+	}
+	if err := f.teardownNet(context.Background(), slotNet(0, "fn", 17)); err != nil {
+		t.Fatalf("teardownNet: %v", err)
+	}
+	if len(calls) == 0 || calls[0][1] != "netns" || calls[0][2] != "del" {
+		t.Fatalf("NetNS teardown must start with ip netns del, got %v", calls)
+	}
+}
+
+func TestCleanupStale_NetNS(t *testing.T) {
+	// Redirect the named-netns dir so the stale sweep is testable off /var/run.
+	dir := t.TempDir()
+	orig := netnsRunDir
+	netnsRunDir = dir
+	defer func() { netnsRunDir = orig }()
+
+	// A stale slot-0 netns marker; slot 1 has none.
+	if err := os.WriteFile(filepath.Join(dir, "fnns0"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var deleted []string
+	f := NewFirecracker(FirecrackerConfig{
+		Binary: "/usr/local/bin/firecracker", WorkDir: t.TempDir(), ChrootBase: t.TempDir(),
+		Jailer: true, NetNS: true, NetBase: 17, TapPrefix: "fn", MaxVMs: 2,
+	}, testLogger())
+	f.run = func(ctx context.Context, name string, args ...string) error {
+		if name == "ip" && len(args) >= 3 && args[0] == "netns" && args[1] == "del" {
+			deleted = append(deleted, args[2])
+		}
+		return nil
+	}
+	f.CleanupStale(context.Background())
+
+	if len(deleted) != 1 || deleted[0] != "fnns0" {
+		t.Fatalf("expected the stale netns fnns0 deleted exactly once, got %v", deleted)
+	}
+}
+
 func TestPrepare_DirectLaunch(t *testing.T) {
 	work := t.TempDir()
 	var calls [][]string
@@ -416,7 +541,7 @@ func TestPrepare_DirectLaunch(t *testing.T) {
 		calls = append(calls, append([]string{name}, args...))
 		return nil
 	}
-	cmd, sock, kernel, rootfs, cleanup, err := f.prepare(context.Background(), "job1", io.Discard, core.RunnerSpec{RootFS: "/golden.ext4"})
+	cmd, sock, kernel, rootfs, cleanup, err := f.prepare(context.Background(), "job1", slotNet(0, "fr", 16), io.Discard, core.RunnerSpec{RootFS: "/golden.ext4"})
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
@@ -457,7 +582,7 @@ func TestPrepare_Jailer(t *testing.T) {
 		}
 		return nil
 	}
-	cmd, sock, kernel, rootfs, cleanup, err := f.prepare(context.Background(), "job2", io.Discard, core.RunnerSpec{RootFS: "/golden.ext4"})
+	cmd, sock, kernel, rootfs, cleanup, err := f.prepare(context.Background(), "job2", slotNet(0, "fr", 16), io.Discard, core.RunnerSpec{RootFS: "/golden.ext4"})
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}

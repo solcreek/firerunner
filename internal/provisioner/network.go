@@ -64,6 +64,72 @@ func tapDownCommands(tap string) [][]string {
 	return [][]string{{"ip", "link", "del", tap}}
 }
 
+// netnsName is the per-slot network namespace name, keyed by tap prefix so
+// firerunner instances sharing a host never collide.
+func netnsName(slot int, tapPrefix string) string {
+	return fmt.Sprintf("%sns%d", tapPrefix, slot)
+}
+
+// netnsSpec is the per-slot netns network identity. The guest tap lives inside
+// the namespace (its address is the guest's gateway); a veth pair on a distinct
+// transit /30 links the namespace to the host, which routes the guest /32 back
+// through it. Reusing the slot's own /24 (guest .0/30, transit .4/30) means no
+// extra address base is needed.
+type netnsSpec struct {
+	ns       string // network namespace name
+	hostVeth string // veth end in the host namespace
+	nsVeth   string // veth end inside the netns
+	hostVIP  string // host veth address (transit .5)
+	nsVIP    string // netns veth address (transit .6, the netns default gw)
+	nsPath   string // filesystem path to the named netns (jailer --netns)
+}
+
+// netnsRunDir is the iproute2 named-netns directory. A var (not const) so tests
+// can redirect the stale-sweep away from the real /var/run/netns.
+var netnsRunDir = "/var/run/netns"
+
+// slotNetNS derives the netns network identity for a slot. It is pure so the
+// setup/teardown command lists can be unit-tested.
+func slotNetNS(n vmNet, netBase int, tapPrefix string) netnsSpec {
+	return netnsSpec{
+		ns:       netnsName(n.slot, tapPrefix),
+		hostVeth: fmt.Sprintf("%sv%dh", tapPrefix, n.slot),
+		nsVeth:   fmt.Sprintf("%sv%dg", tapPrefix, n.slot),
+		hostVIP:  fmt.Sprintf("172.%d.%d.5", netBase, n.slot),
+		nsVIP:    fmt.Sprintf("172.%d.%d.6", netBase, n.slot),
+		nsPath:   netnsRunDir + "/" + netnsName(n.slot, tapPrefix),
+	}
+}
+
+// netnsUpCommands builds the per-slot netns: a private namespace holding the
+// guest tap (owned by uid:gid so the dropped-privilege VMM can attach it), a
+// veth pair to the host on the transit /30, intra-netns forwarding, and a host
+// route back to the guest so return traffic reaches it. uid/gid are the jail
+// user's; the guest gateway is n.hostIP inside the namespace.
+func netnsUpCommands(n vmNet, s netnsSpec, uid, gid int) [][]string {
+	u, g := fmt.Sprintf("%d", uid), fmt.Sprintf("%d", gid)
+	return [][]string{
+		{"ip", "netns", "add", s.ns},
+		{"ip", "netns", "exec", s.ns, "ip", "link", "set", "lo", "up"},
+		// Guest tap inside the netns; its address is the guest's gateway.
+		{"ip", "netns", "exec", s.ns, "ip", "tuntap", "add", "dev", n.tap, "mode", "tap", "user", u, "group", g},
+		{"ip", "netns", "exec", s.ns, "ip", "addr", "add", n.hostIP + "/30", "dev", n.tap},
+		{"ip", "netns", "exec", s.ns, "ip", "link", "set", n.tap, "up"},
+		// veth pair linking the netns to the host on the transit /30.
+		{"ip", "link", "add", s.hostVeth, "type", "veth", "peer", "name", s.nsVeth},
+		{"ip", "link", "set", s.nsVeth, "netns", s.ns},
+		{"ip", "addr", "add", s.hostVIP + "/30", "dev", s.hostVeth},
+		{"ip", "link", "set", s.hostVeth, "up"},
+		{"ip", "netns", "exec", s.ns, "ip", "addr", "add", s.nsVIP + "/30", "dev", s.nsVeth},
+		{"ip", "netns", "exec", s.ns, "ip", "link", "set", s.nsVeth, "up"},
+		// Route guest egress out of the netns and forward tap<->veth.
+		{"ip", "netns", "exec", s.ns, "ip", "route", "add", "default", "via", s.hostVIP},
+		{"ip", "netns", "exec", s.ns, "sysctl", "-q", "-w", "net.ipv4.ip_forward=1"},
+		// Host route so un-NATed return traffic reaches the guest via the netns.
+		{"ip", "route", "add", n.guestIP + "/32", "via", s.nsVIP},
+	}
+}
+
 // ipam hands out and reclaims network slots, bounding concurrent microVMs and
 // guaranteeing non-overlapping per-VM subnets.
 type ipam struct {
