@@ -229,15 +229,22 @@ DOCKERFILE
 # so binary offsets are preserved and the runner keeps working. This golden MUST
 # be paired with a firerunner --cache-port/--cache-url deployment; on its own it
 # only changes which env var name holds GitHub's URL (caching still works).
+#
+# The string lives in the .NET assembly's user-string heap as UTF-16LE (a null
+# byte after each character), so we patch that encoding (with an ASCII fallback
+# for future layouts). perl is used because it handles NUL bytes cleanly; it is
+# an Essential package on Ubuntu, so it is always present in the build image.
 if [[ "$CACHE_REDIRECT" == "1" ]]; then
 cat >> "$CTX/Dockerfile" <<'DOCKERFILE'
 
 RUN set -eu; \
     dll="$(find /opt/runner -name Runner.Worker.dll -print -quit)"; \
     [ -n "$dll" ] || { echo "cache-redirect: Runner.Worker.dll not found" >&2; exit 1; }; \
-    grep -q "ACTIONS_RESULTS_URL" "$dll" || { echo "cache-redirect: marker string absent (runner layout changed?)" >&2; exit 1; }; \
-    LC_ALL=C sed -i 's/ACTIONS_RESULTS_URL/ACTIONS_RESULTS_ORL/g' "$dll"; \
-    grep -q "ACTIONS_RESULTS_ORL" "$dll" || { echo "cache-redirect: patch did not take" >&2; exit 1; }; \
+    perl -0777 -ne 'my $w=join("",map{$_."\x00"}split//,"ACTIONS_RESULTS_URL"); exit((index($_,$w)>=0||index($_,"ACTIONS_RESULTS_URL")>=0)?0:1)' "$dll" \
+      || { echo "cache-redirect: marker ACTIONS_RESULTS_URL absent (runner layout changed?)" >&2; exit 1; }; \
+    perl -0777 -i -pe 'my $a=join("",map{$_."\x00"}split//,"ACTIONS_RESULTS_URL"); my $b=join("",map{$_."\x00"}split//,"ACTIONS_RESULTS_ORL"); s/\Q$a\E/$b/g; s/ACTIONS_RESULTS_URL/ACTIONS_RESULTS_ORL/g' "$dll"; \
+    perl -0777 -ne 'my $w=join("",map{$_."\x00"}split//,"ACTIONS_RESULTS_ORL"); exit((index($_,$w)>=0||index($_,"ACTIONS_RESULTS_ORL")>=0)?0:1)' "$dll" \
+      || { echo "cache-redirect: patch did not take" >&2; exit 1; }; \
     echo "firerunner: cache-redirect patch applied to $dll"
 DOCKERFILE
 fi
