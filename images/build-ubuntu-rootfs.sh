@@ -19,6 +19,9 @@
 #                               # full = base + actions/runner-images toolcache
 #                               #        + curated docker-safe installer subset
 #                               #        (Azure/GUI/snap/services excluded)
+#     [--cache-redirect]        # patch the runner agent so firerunner can point
+#                               #        actions/cache at a self-hosted cache-
+#                               #        server; pair with firerunner --cache-port
 #
 set -euo pipefail
 
@@ -41,6 +44,10 @@ FREE_MB=12288           # absolute writable free space to guarantee for job
                         # leave only a percentage of its own small size free,
                         # which is far too little for real CI jobs.
 IMAGE_TAG="firerunner-ubuntu-rootfs:latest"
+CACHE_REDIRECT=0        # when 1, patch the runner agent so it cannot override
+                        # ACTIONS_RESULTS_URL, letting firerunner point
+                        # actions/cache at a self-hosted cache-server (see the
+                        # dependency-cache section in README.md).
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -55,6 +62,7 @@ while [[ $# -gt 0 ]]; do
     --dns-servers)    DNS_SERVERS="${2//,/ }"; shift 2 ;;
     --size-mb)        SIZE_MB="$2"; shift 2 ;;
     --free-mb)        FREE_MB="$2"; shift 2 ;;
+    --cache-redirect) CACHE_REDIRECT=1; shift ;;
     *) die "unknown flag: $1" ;;
   esac
 done
@@ -74,6 +82,7 @@ fi
 
 echo ">> toolset=$TOOLSET ubuntu=$UBUNTU_TAG runner=$RUNNER_VERSION out=$OUT"
 [[ "$TOOLSET" == "full" ]] && echo ">> runner-images ref=$RI_REF"
+[[ "$CACHE_REDIRECT" == "1" ]] && echo ">> cache-redirect: runner will be patched for self-hosted actions/cache"
 
 WORK="$(mktemp -d)"
 CTX="$WORK/ctx"
@@ -208,6 +217,30 @@ RUN install -d /opt/runner \\
     && /opt/runner/bin/installdependencies.sh \\
     && rm -rf /var/lib/apt/lists/*
 DOCKERFILE
+
+# ---- Optional: cache-redirect patch ----------------------------------------
+# firerunner runs the REAL GitHub runner, which overwrites ACTIONS_RESULTS_URL
+# with the value from GitHub's per-job message — so simply exporting our own URL
+# in the boot script is not enough to redirect actions/cache. We rename the
+# ACTIONS_RESULTS_URL string inside the runner worker to the (dead) name
+# ACTIONS_RESULTS_ORL: the runner then writes GitHub's URL into that dead name,
+# while actions/cache (a separate Node process) still reads the real
+# ACTIONS_RESULTS_URL that firerunner-run.sh exported. The rename is same-length,
+# so binary offsets are preserved and the runner keeps working. This golden MUST
+# be paired with a firerunner --cache-port/--cache-url deployment; on its own it
+# only changes which env var name holds GitHub's URL (caching still works).
+if [[ "$CACHE_REDIRECT" == "1" ]]; then
+cat >> "$CTX/Dockerfile" <<'DOCKERFILE'
+
+RUN set -eu; \
+    dll="$(find /opt/runner -name Runner.Worker.dll -print -quit)"; \
+    [ -n "$dll" ] || { echo "cache-redirect: Runner.Worker.dll not found" >&2; exit 1; }; \
+    grep -q "ACTIONS_RESULTS_URL" "$dll" || { echo "cache-redirect: marker string absent (runner layout changed?)" >&2; exit 1; }; \
+    LC_ALL=C sed -i 's/ACTIONS_RESULTS_URL/ACTIONS_RESULTS_ORL/g' "$dll"; \
+    grep -q "ACTIONS_RESULTS_ORL" "$dll" || { echo "cache-redirect: patch did not take" >&2; exit 1; }; \
+    echo "firerunner: cache-redirect patch applied to $dll"
+DOCKERFILE
+fi
 
 # ---- Stage 2 full: layer runner-images toolcache + curated installers ------
 if [[ "$TOOLSET" == "full" ]]; then
