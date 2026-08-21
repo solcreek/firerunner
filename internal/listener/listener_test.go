@@ -36,13 +36,36 @@ func TestScalerHandleDesiredRunnerCount(t *testing.T) {
 	}
 }
 
-func TestScalerJobCallbacksAreNoOps(t *testing.T) {
-	a := &scaler{minRunners: 0, log: testLogger(), onDesired: func(context.Context, int) int { return 0 }}
+func TestScalerJobCallbacks(t *testing.T) {
+	var busy []string
+	a := &scaler{
+		minRunners: 0,
+		log:        testLogger(),
+		onDesired:  func(context.Context, int) int { return 0 },
+		onBusy:     func(name string) { busy = append(busy, name) },
+	}
 	if err := a.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: "r"}); err != nil {
 		t.Fatal(err)
 	}
+	if len(busy) != 1 || busy[0] != "r" {
+		t.Fatalf("HandleJobStarted should mark runner busy: got %v", busy)
+	}
+	// A nameless JobStarted must not mark anything busy.
+	if err := a.HandleJobStarted(context.Background(), &scaleset.JobStarted{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(busy) != 1 {
+		t.Fatalf("nameless JobStarted should not mark busy: got %v", busy)
+	}
 	if err := a.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: "r", Result: "succeeded"}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestScalerJobStartedNilBusyFunc(t *testing.T) {
+	a := &scaler{minRunners: 0, log: testLogger(), onDesired: func(context.Context, int) int { return 0 }}
+	if err := a.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: "r"}); err != nil {
+		t.Fatalf("HandleJobStarted with nil onBusy must not panic: %v", err)
 	}
 }
 

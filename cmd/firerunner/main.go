@@ -335,10 +335,11 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			sched.Reconcile(runCtx, desired)
 			return sched.Running()
 		}
+		onBusy := func(name string) { sched.MarkBusy(name) }
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := lis.Run(runCtx, onDesired); err != nil && runCtx.Err() == nil {
+			if err := lis.Run(runCtx, onDesired, onBusy); err != nil && runCtx.Err() == nil {
 				errCh <- err
 				cancel()
 			}

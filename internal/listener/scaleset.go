@@ -159,7 +159,7 @@ func (s *ScaleSet) JIT() *JITSource {
 }
 
 // Run implements Listener: long-poll GitHub and drive onDesired.
-func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc) error {
+func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFunc) error {
 	l, err := sslistener.New(s.session, sslistener.Config{
 		ScaleSetID: s.scaleSetID,
 		MaxRunners: s.cfg.MaxRunners,
@@ -168,7 +168,7 @@ func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc) error {
 	if err != nil {
 		return fmt.Errorf("create scaleset listener: %w", err)
 	}
-	return l.Run(ctx, &scaler{onDesired: onDesired, minRunners: s.cfg.MinRunners, log: s.log})
+	return l.Run(ctx, &scaler{onDesired: onDesired, onBusy: onBusy, minRunners: s.cfg.MinRunners, log: s.log})
 }
 
 // Close deregisters the scale set and closes the message session. It deletes the
@@ -190,12 +190,15 @@ func (s *ScaleSet) Close(ctx context.Context) error {
 
 // scaler adapts GitHub's scale-set callbacks onto firerunner's DesiredFunc.
 // Because every microVM is ephemeral and self-terminating, job start/completion
-// need no action beyond logging. (Busy/idle state for the shutdown drain is
-// derived from the guest console in the provisioner, not from these callbacks:
-// the scale-set protocol delivers JobStarted batched at completion, too late to
-// protect an in-flight VM.)
+// need no action beyond logging and marking the VM busy for the shutdown drain.
+// JobStarted is a second, independent busy signal alongside the guest console
+// marker the provisioner watches: the console marker fires the instant the guest
+// dequeues a job (the primary, earliest source), while the scale-set protocol's
+// JobStarted can arrive later, but OR-ing them is strictly safe — a busy flag
+// only ever makes the drain wait for a real job, never cancels one early.
 type scaler struct {
 	onDesired  DesiredFunc
+	onBusy     BusyFunc
 	minRunners int
 	log        *slog.Logger
 }
@@ -210,6 +213,9 @@ func (a *scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 
 func (a *scaler) HandleJobStarted(_ context.Context, j *scaleset.JobStarted) error {
 	a.log.Info("job started", "runner", j.RunnerName, "runnerRequestId", j.RunnerRequestID)
+	if a.onBusy != nil && j.RunnerName != "" {
+		a.onBusy(j.RunnerName)
+	}
 	return nil
 }
 
