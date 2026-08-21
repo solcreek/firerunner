@@ -1,0 +1,69 @@
+[Unit]
+Description=firerunner (%i tier, jailer) - jailed ephemeral Firecracker microVM GitHub Actions runners
+After=network-online.target
+Wants=network-online.target
+
+# Root, jailer-enabled variant of firerunner@.service. Use this unit (instead of
+# firerunner@.service) when running with FR_JAILER=true: the Firecracker jailer
+# must chroot, mknod jail-local /dev nodes and drop privileges, which requires a
+# ROOT launcher — the opposite of the non-jailer unit that runs as the
+# unprivileged `firerunner` user. That privilege inversion is exactly why the
+# jailer is opt-in. Everything else (per-tier env file, per-instance network
+# identity, graceful drain) matches firerunner@.service.
+#
+# The instance env file (/etc/firerunner/%i.env) MUST set FR_JAIL_UID and
+# FR_JAIL_GID (the unprivileged uid/gid the jailer drops Firecracker to, e.g.
+# the `firerunner` user) and MAY set FR_JAILER_CGROUP for per-VM cgroup limits.
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/firerunner/%i.env
+# Pin the per-instance dirs the sandbox grants write access to; the env file's
+# FR_WORKDIR/FR_LOG_DIR must match these paths.
+Environment=FR_WORKDIR=/var/tmp/firerunner-%i
+Environment=FR_LOG_DIR=/var/log/firerunner-%i
+# This unit is the jailer unit: force it on so a misconfigured env file cannot
+# silently fall back to the non-jailer (in-process, non-root) launch path.
+Environment=FR_JAILER=true
+Environment=FR_CHROOT_BASE=/srv/jailer
+ExecStart=/usr/local/bin/firerunner
+Restart=on-failure
+RestartSec=5
+
+# Graceful shutdown: firerunner cancels its context on SIGTERM, stops accepting
+# work, and drains in-flight microVMs before exiting. Give it long enough to let
+# a running job finish; otherwise systemd's default stop timeout SIGKILLs the
+# listener mid-job and orphans firecracker children (which leak tap devices).
+# Tune to your longest expected job.
+KillSignal=SIGTERM
+TimeoutStopSec=1h
+
+# Runs as root: the jailer needs to chroot (CAP_SYS_CHROOT), create a PID
+# namespace (CAP_SYS_ADMIN), mknod jail-local /dev/kvm and /dev/net/tun
+# (CAP_MKNOD), chown the chroot and those nodes (CAP_CHOWN/CAP_FOWNER/
+# CAP_DAC_OVERRIDE), set cgroup/rlimits (CAP_SYS_RESOURCE), manage the host tap
+# devices (CAP_NET_ADMIN) and finally drop to FR_JAIL_UID:FR_JAIL_GID
+# (CAP_SETUID/CAP_SETGID). The bounding set is trimmed to that closure.
+SupplementaryGroups=kvm
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_RESOURCE CAP_MKNOD CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID CAP_NET_ADMIN CAP_KILL
+
+# Hardening. NoNewPrivileges is intentionally NOT set: the jailer relies on a
+# privileged root launcher and only ever drops privileges. ProtectControlGroups
+# is off because the jailer creates each microVM's cgroup under
+# /sys/fs/cgroup/firecracker/<id> when FR_JAILER_CGROUP is used.
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/tmp/firerunner-%i /var/log/firerunner-%i /srv/jailer
+# ip_forward must be writable to enable microVM egress; firerunner sets it at
+# startup, so kernel tunables cannot be fully protected.
+ProtectKernelTunables=false
+ProtectControlGroups=false
+RestrictSUIDSGID=true
+LockPersonality=true
+# PrivateTmp is intentionally disabled: the work dir must sit on a reflink-
+# capable filesystem (btrfs/XFS), not the tmpfs that PrivateTmp would provide.
+# PrivateDevices must stay off too: the jailer reads host /dev/kvm and
+# /dev/net/tun to replicate them inside the chroot.
+
+[Install]
+WantedBy=multi-user.target
