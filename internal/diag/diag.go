@@ -726,7 +726,10 @@ func ifaceStateStr(name string, up bool) string {
 
 func egressDesc(cats []string) string {
 	if len(cats) == 0 {
-		return "open"
+		// An empty category list is not "open": buildNFTRuleset emits an empty
+		// @allowed set, so every new guest connection is dropped. Report it as
+		// the deny-all it actually is rather than the opposite.
+		return "none (deny-all)"
 	}
 	return strings.Join(cats, "+")
 }

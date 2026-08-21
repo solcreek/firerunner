@@ -50,6 +50,21 @@ func TestFirstLine(t *testing.T) {
 	}
 }
 
+func TestEgressDesc(t *testing.T) {
+	if got := egressDesc(nil); got != "none (deny-all)" {
+		t.Errorf("egressDesc(nil) = %q, want deny-all (empty list drops all new egress)", got)
+	}
+	if got := egressDesc([]string{}); got != "none (deny-all)" {
+		t.Errorf("egressDesc([]) = %q, want deny-all", got)
+	}
+	if got := egressDesc([]string{"open"}); got != "open" {
+		t.Errorf("egressDesc(open) = %q", got)
+	}
+	if got := egressDesc([]string{"api", "git"}); got != "api+git" {
+		t.Errorf("egressDesc(api,git) = %q", got)
+	}
+}
+
 func TestFileCheck(t *testing.T) {
 	dir := t.TempDir()
 	big := filepath.Join(dir, "big.bin")
