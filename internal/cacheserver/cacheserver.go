@@ -422,6 +422,12 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// A restore issues one getProperties (HEAD) then many ranged GETs; log the
+	// HEAD and any un-ranged GET at INFO so a restore shows up once, and leave
+	// the per-range chatter out of the default log.
+	if r.Method == http.MethodHead || r.Header.Get("Range") == "" {
+		s.log.Info("cache entry served", "id", e.ID, "key", e.Key, "size", e.Size, "method", r.Method)
+	}
 	http.ServeContent(w, r, strconv.FormatUint(e.ID, 10), fi.ModTime(), f)
 }
 
