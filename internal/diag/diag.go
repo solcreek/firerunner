@@ -240,7 +240,7 @@ func collectStatus(cfg *config.Config, version string) StatusReport {
 	vms := activeVMs(fc)
 	r.MicroVMs = VMSummary{
 		Active:           len(vms),
-		FirecrackerProcs: firecrackerProcs(),
+		FirecrackerProcs: firecrackerProcs(fc),
 		Taps:             countTaps(fc.TapPrefix),
 		Max:              cfg.MaxRunners,
 	}
@@ -656,8 +656,13 @@ func activeVMs(fc provisioner.FirecrackerConfig) []vmInfo {
 	return out
 }
 
-// firecrackerProcs counts running firecracker processes via /proc/*/comm.
-func firecrackerProcs() int {
+// firecrackerProcs counts running firecracker processes that belong to THIS
+// firerunner instance, so a peer instance sharing the host (e.g. a second
+// scale set) does not inflate the count. Ownership is decided from each VMM's
+// /proc entry: in direct mode its cmdline carries the instance work dir
+// (--api-sock <WorkDir>/<id>/fc.sock); in jailer mode it is chrooted under the
+// instance's ChrootBase.
+func firecrackerProcs(fc provisioner.FirecrackerConfig) int {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return -1
@@ -667,11 +672,39 @@ func firecrackerProcs() int {
 		if !e.IsDir() || !isPID(e.Name()) {
 			continue
 		}
-		if strings.TrimSpace(readFile(filepath.Join("/proc", e.Name(), "comm"))) == "firecracker" {
+		if strings.TrimSpace(readFile(filepath.Join("/proc", e.Name(), "comm"))) != "firecracker" {
+			continue
+		}
+		if procBelongsToInstance(e.Name(), fc) {
 			n++
 		}
 	}
 	return n
+}
+
+// procBelongsToInstance reports whether the firecracker process /proc/<pid>
+// was launched by this firerunner instance.
+func procBelongsToInstance(pid string, fc provisioner.FirecrackerConfig) bool {
+	cmdline := strings.ReplaceAll(readFile(filepath.Join("/proc", pid, "cmdline")), "\x00", " ")
+	// os.Readlink fails (and returns "") for a peer instance's chroot owned by
+	// a different jail uid, which correctly excludes it.
+	rootLink, _ := os.Readlink(filepath.Join("/proc", pid, "root"))
+	return procMatchesInstance(cmdline, rootLink, fc)
+}
+
+// procMatchesInstance is the pure ownership test split out for testing.
+//   - Direct mode: --api-sock <WorkDir>/<id>/fc.sock embeds the work dir in the
+//     firecracker cmdline.
+//   - Jailer mode: the VMM is chrooted under <ChrootBase>/firecracker/<id>/root,
+//     so its root symlink resolves inside ChrootBase.
+func procMatchesInstance(cmdline, rootLink string, fc provisioner.FirecrackerConfig) bool {
+	if fc.WorkDir != "" && strings.Contains(cmdline, fc.WorkDir) {
+		return true
+	}
+	if fc.ChrootBase != "" && rootLink != "" && strings.HasPrefix(rootLink, fc.ChrootBase) {
+		return true
+	}
+	return false
 }
 
 func countTaps(prefix string) int {

@@ -65,6 +65,27 @@ func TestEgressDesc(t *testing.T) {
 	}
 }
 
+func TestProcMatchesInstance(t *testing.T) {
+	direct := provisioner.FirecrackerConfig{WorkDir: "/var/tmp/firerunner"}
+	jail := provisioner.FirecrackerConfig{WorkDir: "/var/tmp/firerunner", Jailer: true, ChrootBase: "/srv/jailer"}
+
+	// Direct mode: this instance's VMM carries the work dir in its cmdline.
+	if !procMatchesInstance("/usr/bin/firecracker --api-sock /var/tmp/firerunner/fr-abc/fc.sock --id fr-abc", "/", direct) {
+		t.Error("own direct-mode VMM not matched")
+	}
+	// A peer instance with a different work dir must not match.
+	if procMatchesInstance("/usr/bin/firecracker --api-sock /var/tmp/other/fk-xyz/fc.sock --id fk-xyz", "/", direct) {
+		t.Error("peer direct-mode VMM wrongly matched")
+	}
+	// Jailer mode: the chrooted VMM's root resolves under ChrootBase.
+	if !procMatchesInstance("/usr/bin/firecracker --api-sock /run/firecracker.socket --id fr-abc", "/srv/jailer/firecracker/fr-abc/root", jail) {
+		t.Error("own jailer-mode VMM not matched")
+	}
+	if procMatchesInstance("/usr/bin/firecracker --api-sock /run/firecracker.socket --id fk-xyz", "/srv/other/firecracker/fk-xyz/root", jail) {
+		t.Error("peer jailer-mode VMM wrongly matched")
+	}
+}
+
 func TestFileCheck(t *testing.T) {
 	dir := t.TempDir()
 	big := filepath.Join(dir, "big.bin")
