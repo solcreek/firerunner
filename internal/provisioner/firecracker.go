@@ -487,8 +487,18 @@ func (f *Firecracker) ensureHostCacheInput(ctx context.Context) error {
 // dequeues its job — the only real-time, per-VM busy signal available (the
 // scale-set control plane delivers JobStarted batched at completion).
 func (f *Firecracker) openConsole(name string, onBusy func()) (io.Writer, func(), error) {
-	slogWriter := &logWriter{log: f.log, runner: name, stream: "console"}
-	writers := []io.Writer{slogWriter}
+	// The busy detector goes first and never returns an error; the slog writer
+	// never errors either. The per-runner log file is wrapped so a write error
+	// (ENOSPC, read-only /var) is swallowed rather than propagated: io.MultiWriter
+	// aborts on the first error, and os/exec then stops copying the console
+	// entirely, which would silently kill busy detection and make the next
+	// SIGTERM reap a busy VM as if it were idle. Losing a log line is acceptable;
+	// losing the busy signal is not.
+	var writers []io.Writer
+	if onBusy != nil {
+		writers = append(writers, newBusyDetector(onBusy))
+	}
+	writers = append(writers, &logWriter{log: f.log, runner: name, stream: "console"})
 	closeFn := func() {}
 	if f.cfg.LogDir != "" {
 		if err := os.MkdirAll(f.cfg.LogDir, 0o755); err != nil {
@@ -498,16 +508,25 @@ func (f *Firecracker) openConsole(name string, onBusy func()) (io.Writer, func()
 		if err != nil {
 			return nil, nil, err
 		}
-		writers = append([]io.Writer{file}, writers...)
+		writers = append(writers, tolerantWriter{w: file})
 		closeFn = func() { _ = file.Close() }
-	}
-	if onBusy != nil {
-		writers = append(writers, newBusyDetector(onBusy))
 	}
 	if len(writers) == 1 {
 		return writers[0], closeFn, nil
 	}
 	return io.MultiWriter(writers...), closeFn, nil
+}
+
+// tolerantWriter wraps a writer so a failed Write is swallowed and reported as a
+// full, successful write. It shields an io.MultiWriter (and the os/exec copier
+// draining the guest console) from a best-effort sink — the per-runner log
+// file — whose failure must not tear down the console stream that also carries
+// the busy-detection signal.
+type tolerantWriter struct{ w io.Writer }
+
+func (t tolerantWriter) Write(p []byte) (int, error) {
+	_, _ = t.w.Write(p)
+	return len(p), nil
 }
 
 // busyMarker is printed by the in-guest Actions runner to the serial console

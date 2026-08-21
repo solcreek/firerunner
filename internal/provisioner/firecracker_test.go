@@ -781,6 +781,31 @@ func TestBusyDetectorReportsFullWrite(t *testing.T) {
 	}
 }
 
+// TestConsoleBusyDetectionSurvivesLogWriteError models openConsole's writer
+// stack: a failing log file (full/read-only disk) wrapped in tolerantWriter
+// must not abort the io.MultiWriter, so the busy detector still fires. Without
+// the tolerant wrapper the file error would stop the whole console pipe and the
+// next SIGTERM would reap a busy VM as if it were idle.
+func TestConsoleBusyDetectionSurvivesLogWriteError(t *testing.T) {
+	var fired int
+	detector := newBusyDetector(func() { fired++ })
+	badFile := tolerantWriter{w: errWriter{}}
+	mw := io.MultiWriter(detector, badFile)
+	if _, err := mw.Write([]byte("Listening for Jobs\n")); err != nil {
+		t.Fatalf("MultiWriter aborted on log error: %v", err)
+	}
+	if _, err := mw.Write([]byte("Running job: build\n")); err != nil {
+		t.Fatalf("MultiWriter aborted on log error: %v", err)
+	}
+	if fired != 1 {
+		t.Fatalf("busy detector fired %d times, want 1 (log error broke detection)", fired)
+	}
+}
+
+type errWriter struct{}
+
+func (errWriter) Write(p []byte) (int, error) { return 0, io.ErrShortWrite }
+
 func TestSanitizedEnv_ExcludesSecrets(t *testing.T) {
 	t.Setenv("FR_TOKEN", "ghp_secret")
 	t.Setenv("FR_APP_PRIVATE_KEY", "-----BEGIN RSA PRIVATE KEY-----")
