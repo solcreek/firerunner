@@ -582,3 +582,39 @@ func TestConcurrentReservationIsRejected(t *testing.T) {
 		t.Fatalf("restored %q, want GOOD", got)
 	}
 }
+
+// TestRepositoryPinIgnoresClientMetadata proves that pinning the server to one
+// tenant defeats the blank/forged repository_id cross-repo leak: a victim stores
+// under its real id, and an attacker uploading with a blank repository_id and a
+// blank restore key cannot see or match the victim's entry, because the server
+// forces every request into the single pinned tenant.
+func TestRepositoryPinIgnoresClientMetadata(t *testing.T) {
+	s, err := New(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s.SetRepository("owner/pinned")
+	ts := httptest.NewServer(s)
+	t.Cleanup(ts.Close)
+	base := ts.URL
+
+	// Victim publishes an entry, sending its own (now ignored) repository_id.
+	create := twirp(t, base, "CreateCacheEntry", createReq{Metadata: meta("owner/victim"), Key: "secret-key", Version: "v1"})
+	putBlob(t, create["signed_upload_url"].(string), []byte("PRIVATE"))
+	twirp(t, base, "FinalizeCacheEntryUpload", finalizeReq{Metadata: meta("owner/victim"), Key: "secret-key", Version: "v1", SizeBytes: "7"})
+
+	// Attacker probes with a blank repository_id and a blank restore key
+	// (HasPrefix("") matches any key) but a different version: it must miss,
+	// because it lands in the same pinned tenant yet the version differs.
+	miss := twirp(t, base, "GetCacheEntryDownloadURL", getReq{Metadata: meta(""), Key: "anything", RestoreKeys: []string{""}, Version: "attacker-version"})
+	if ok, _ := miss["ok"].(bool); ok {
+		t.Fatalf("attacker with blank repo/version should miss, got %v", miss)
+	}
+
+	// The pinned tenant can still read its own entry with the right version,
+	// regardless of which client repository_id it claims.
+	hit := twirp(t, base, "GetCacheEntryDownloadURL", getReq{Metadata: meta("whatever"), Key: "secret-key", Version: "v1"})
+	if ok, _ := hit["ok"].(bool); !ok {
+		t.Fatalf("pinned tenant should hit its own entry, got %v", hit)
+	}
+}

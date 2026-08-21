@@ -113,6 +113,7 @@ func cacheServe(args []string) error {
 	dir := fs.String("dir", "/var/lib/firerunner/cache", "cache storage directory")
 	maxSize := fs.String("max-size", "50GB", "evict least-recently-used entries above this total size (e.g. 50GB, 0 for unlimited)")
 	maxEntry := fs.String("max-entry-size", "10GB", "refuse any single cache entry larger than this (e.g. 10GB, 0 for unlimited)")
+	repo := fs.String("repository", "", "pin every entry to this tenant, ignoring the unauthenticated client repository_id; set it (e.g. owner/name) so one server safely serves a single repository")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -133,6 +134,10 @@ func cacheServe(args []string) error {
 	}
 	srv.SetMaxSize(maxBytes)
 	srv.SetMaxEntrySize(maxEntryBytes)
+	srv.SetRepository(*repo)
+	if *repo == "" {
+		log.Warn("cache server not pinned to a repository; the unauthenticated client repository_id is trusted and caches are not isolated across repositories — pass --repository to serve a single repo safely")
+	}
 	stopJanitor := srv.StartJanitor()
 	defer stopJanitor()
 
@@ -222,6 +227,9 @@ cache-server flags:
   --dir string       cache storage directory (default "/var/lib/firerunner/cache")
   --max-size string  evict LRU entries above this total size (default "50GB"; 0 = unlimited)
   --max-entry-size string  refuse any single entry larger than this (default "10GB"; 0 = unlimited)
+  --repository string  pin every entry to this tenant, ignoring the
+                     unauthenticated client repository_id; set it (e.g.
+                     owner/name) so one server safely serves a single repository
 `)
 }
 

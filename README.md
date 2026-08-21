@@ -419,8 +419,9 @@ firerunner cache-server --dir /var/lib/firerunner/cache
 It implements the three Twirp methods plus the Azure block-blob upload
 (single-shot and staged `comp=block`/`comp=blocklist`) and ranged downloads,
 tags each blob URL with a per-entry token, and persists an index so caches
-survive restarts. It performs **no authentication** and enforces **no tenant
-isolation** — see the security model below before deploying it.
+survive restarts. It performs **no authentication** and cannot cryptographically
+isolate repositories — run one per repository and pin it with `--repository`;
+see the security model below before deploying it.
 
 It binds `127.0.0.1:8099` by default. Because each microVM slot reaches the host
 on its own per-slot gateway IP (`172.16.<slot>.1`), serving guests means binding
@@ -467,7 +468,8 @@ sudo images/build-ubuntu-rootfs.sh --toolset minimal --cache-redirect \
 # 2. run the cache-server bound to the guest-facing address, then point
 #    firerunner at it (0.0.0.0 serves every per-slot gateway; keep it firewalled
 #    off any LAN/WAN interface):
-firerunner cache-server --addr 0.0.0.0:8099 --dir /var/lib/firerunner/cache &
+firerunner cache-server --addr 0.0.0.0:8099 --repository owner/name \
+  --dir /var/lib/firerunner/cache &
 firerunner ... --golden /var/lib/firerunner/ubuntu-rootfs-minimal.ext4 --cache-port 8099
 ```
 
@@ -475,24 +477,33 @@ firerunner ... --golden /var/lib/firerunner/ubuntu-rootfs-minimal.ext4 --cache-p
 cache-server for reachability; both note that the cache is off by default and
 that jobs fall back to GitHub's hosted cache when it is not configured.
 
-**Security model.** This server performs **no authentication** and enforces
-**no tenant isolation**. The only tenant key is the caller-supplied
-`repository_id`, which is unauthenticated (any guest can send any value) and
-which the `@actions/cache` toolkit does not actually send — so in practice all
-entries share **one global namespace**. Any caller can read another entry with a
-blank restore key (`restore-keys: ['']` prefix-matches everything), and the
-per-entry blob token is the **same for download and upload**, so anyone who can
-read an entry can also overwrite it. Uploads are unbounded.
+**Security model.** This server performs **no authentication** and cannot
+cryptographically isolate repositories: the `ACTIONS_RUNTIME_TOKEN` a runner
+presents is signed by an internal GitHub key with no public JWKS, so a
+self-hosted server can neither verify it nor trust the `repository_id` a guest
+supplies (the `@actions/cache` toolkit does not even send it). Without
+`--repository`, all entries share **one global namespace**: any caller can read
+another entry with a blank restore key (`restore-keys: ['']` prefix-matches
+everything), and the per-entry blob token is the **same for download and
+upload**, so anyone who can read an entry can also overwrite it.
 
-Treat the store as a **shared, unauthenticated, guest-writable cache**:
+Because per-repository isolation cannot be authenticated, enforce it
+structurally by running **one cache-server per repository** and pinning it:
 
-- Run **one cache-server per single trust boundary** — ideally one repository.
-  Never share one store across repositories or across trust levels.
+- Pass **`--repository owner/name`**. The server then ignores the
+  unauthenticated client `repository_id` and forces every entry into that single
+  tenant, so a blank or forged `repository_id` cannot create or match another
+  repo's entries. This is the enforceable form of "one server per repo"; without
+  it the server logs a warning at startup.
 - Keep the listen address reachable **only from its own microVMs**. The default
-  `--addr :8099` binds all interfaces; firewall it, or bind it to the host's
-  guest-facing gateway IP, so no LAN/WAN client can reach it.
-- Assume any job that can reach it can read and overwrite every entry (a fork-PR
-  job can poison a cache a later trusted job restores).
+  `--addr 127.0.0.1:8099` is loopback-only; to serve guests bind the host's
+  guest-facing gateway IP (or `--addr 0.0.0.0:8099`) and firewall it so no
+  LAN/WAN client can reach it.
+- Assume any job that can reach it can read and overwrite every entry within its
+  tenant (a fork-PR job can poison a cache a later trusted job restores).
+
+Uploads are bounded per-entry (`--max-entry-size`, default 10GB) and in total
+(`--max-size`), and finalized entries are immutable.
 
 The cache is a pure accelerator — every job still passes with caching disabled,
 so when in doubt, leave it off.

@@ -27,22 +27,25 @@
 //
 // # Isolation and trust model
 //
-// This server performs NO authentication and enforces NO tenant isolation.
-// The only tenant key is the caller-supplied repository_id in the RPC metadata,
-// which is unauthenticated (any guest can send any value) and which the real
-// @actions/cache toolkit does not send at all — so in practice every entry
-// shares one global namespace. A caller can also read another entry via a blank
-// restore key (restore_keys:[""] prefix-matches everything), and the per-entry
-// blob token is the SAME for upload and download, so anyone who can read an
-// entry can also overwrite it. Uploads are unbounded and written straight to
-// disk.
+// This server performs NO authentication and cannot cryptographically isolate
+// repositories: a runner's ACTIONS_RUNTIME_TOKEN is signed by an internal GitHub
+// key with no public JWKS, so a self-hosted server can neither verify it nor
+// trust the repository_id a guest supplies (the real @actions/cache toolkit does
+// not even send it). Without SetRepository every entry shares one global
+// namespace: a caller can read another entry via a blank restore key
+// (restore_keys:[""] prefix-matches everything), and the per-entry blob token is
+// the SAME for upload and download, so anyone who can read an entry can also
+// overwrite it.
 //
-// Treat the store as a shared, unauthenticated, guest-writable cache. Run ONE
-// server per single trust boundary (ideally one repository), keep it reachable
-// only from its own microVMs (do not expose the listen address on any LAN/WAN
-// NIC), and never share it across repositories or trust levels. It remains a
-// pure accelerator: every job still passes with caching disabled. See the
-// README security notes.
+// Because per-repository isolation cannot be authenticated, enforce it
+// structurally: run ONE server per repository and pin it with SetRepository, so
+// the server ignores the unauthenticated client repository_id and forces every
+// entry into one tenant (a blank or forged repository_id can then neither create
+// nor match another repo's entries). Keep the listen address reachable only from
+// its own microVMs (do not expose it on any LAN/WAN NIC). Finalized entries are
+// immutable and uploads are size-bounded, but within a tenant any reachable job
+// can still read and overwrite entries. It remains a pure accelerator: every job
+// still passes with caching disabled. See the README security notes.
 package cacheserver
 
 import (
@@ -102,6 +105,7 @@ type Server struct {
 	maxSize  int64            // 0 = unlimited; total completed-blob bytes to keep
 	maxEntry int64            // 0 = unlimited; hard cap on a single entry's blob
 	staged   map[uint64]int64 // bytes written so far for a not-yet-finalized entry
+	repo     string           // "" = trust client repository_id; else pin every entry here
 
 	// counters (under mu) for observability via /stats and /metrics.
 	hits      uint64
@@ -161,6 +165,21 @@ func (s *Server) entryCap() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.maxEntry
+}
+
+// SetRepository pins every entry to a single tenant, ignoring the client-supplied
+// repository_id in the RPC metadata. The v2 cache toolkit never sends metadata
+// (so client repository_id is almost always blank) and never authenticates the
+// value even when it does, which collapses every cache into one global namespace
+// where a blank restore key leaks across repositories. Pinning is the enforceable
+// form of the "run one cache server per repository" model: with a fixed tenant a
+// forged or blank repository_id cannot create or match another repo's entries.
+// An empty value keeps the (documented, insecure) client-supplied behaviour. Call
+// before serving.
+func (s *Server) SetRepository(repo string) {
+	s.mu.Lock()
+	s.repo = repo
+	s.mu.Unlock()
 }
 
 // New opens (creating if needed) a cache store rooted at dir and returns a
@@ -268,7 +287,17 @@ type getResp struct {
 	Message           string `json:"message,omitempty"`
 }
 
-func repoOf(m *cacheMetadata) string {
+// repoOf returns the tenant key for a request. When the server is pinned to a
+// single repository (SetRepository) that value always wins, so an unauthenticated
+// or forged client repository_id cannot cross tenants; otherwise the (insecure)
+// client-supplied value is used.
+func (s *Server) repoOf(m *cacheMetadata) string {
+	s.mu.Lock()
+	pinned := s.repo
+	s.mu.Unlock()
+	if pinned != "" {
+		return pinned
+	}
 	if m == nil {
 		return ""
 	}
@@ -290,7 +319,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		twirpError(w, http.StatusBadRequest, "invalid_argument", "key and version are required")
 		return
 	}
-	repo := repoOf(req.Metadata)
+	repo := s.repoOf(req.Metadata)
 	key := strings.ToLower(req.Key)
 
 	s.mu.Lock()
@@ -352,7 +381,7 @@ func (s *Server) handleFinalize(w http.ResponseWriter, r *http.Request) {
 		twirpError(w, http.StatusBadRequest, "malformed", err.Error())
 		return
 	}
-	repo := repoOf(req.Metadata)
+	repo := s.repoOf(req.Metadata)
 	key := strings.ToLower(req.Key)
 
 	s.mu.Lock()
@@ -394,7 +423,7 @@ func (s *Server) handleGetDownloadURL(w http.ResponseWriter, r *http.Request) {
 		twirpError(w, http.StatusBadRequest, "malformed", err.Error())
 		return
 	}
-	repo := repoOf(req.Metadata)
+	repo := s.repoOf(req.Metadata)
 
 	s.mu.Lock()
 	e := s.match(repo, strings.ToLower(req.Key), req.RestoreKeys, req.Version)
