@@ -105,9 +105,11 @@ func fetchMetaCIDRs(ctx context.Context, cl *http.Client, url string, categories
 
 // buildNFTRuleset returns a complete nftables ruleset for the firerunner table.
 // It atomically replaces the table (add/delete/define idiom) so it is idempotent
-// across runs and refreshes. When open, guests get blanket egress; otherwise a
-// forward filter drops any guest traffic not matching the allowlist. It is pure
-// so the generated policy can be asserted in tests.
+// across runs and refreshes. When open, guests get blanket egress to everything
+// except each other (a forward chain drops intra-CIDR guest-to-guest traffic);
+// otherwise a forward filter drops any guest traffic not matching the allowlist
+// (which also blocks guest-to-guest). It is pure so the generated policy can be
+// asserted in tests.
 func buildNFTRuleset(cfg egressRuleset) string {
 	table := cfg.Table
 	if table == "" {
@@ -141,6 +143,15 @@ func buildNFTRuleset(cfg egressRuleset) string {
 			fmt.Fprintf(&b, "\t\tip saddr %s udp dport 123 accept\n", cfg.VMCidr)
 		}
 		fmt.Fprintf(&b, "\t\tip saddr %s drop\n", cfg.VMCidr)
+		b.WriteString("\t}\n")
+	} else {
+		// Even with unrestricted egress, guests must not reach each other: a
+		// per-VM /30 tap already blocks L2 peers, but in open mode the host would
+		// otherwise route L3 traffic between guests on the same instance. Drop
+		// intra-CIDR traffic while leaving all other forwarding (guest->internet)
+		// to the accept policy.
+		b.WriteString("\tchain forward {\n\t\ttype filter hook forward priority 0; policy accept;\n")
+		fmt.Fprintf(&b, "\t\tip saddr %s ip daddr %s drop\n", cfg.VMCidr, cfg.VMCidr)
 		b.WriteString("\t}\n")
 	}
 

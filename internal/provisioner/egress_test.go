@@ -141,11 +141,16 @@ func TestBuildNFTRulesetAllowlist(t *testing.T) {
 
 func TestBuildNFTRulesetOpen(t *testing.T) {
 	out := buildNFTRuleset(egressRuleset{ExtIface: "eth0", VMCidr: vmCIDR, Open: true})
-	if strings.Contains(out, "chain forward") {
-		t.Errorf("open mode must not install a forward filter:\n%s", out)
+	// Open mode has no allowlist, but must still block guest-to-guest traffic.
+	if strings.Contains(out, "@allowed") {
+		t.Errorf("open mode must not have an allowlist:\n%s", out)
 	}
-	if strings.Contains(out, "@allowed") || strings.Contains(out, "drop") {
-		t.Errorf("open mode must not have allowlist/drop:\n%s", out)
+	wantDrop := "ip saddr " + vmCIDR + " ip daddr " + vmCIDR + " drop"
+	if !strings.Contains(out, wantDrop) {
+		t.Errorf("open mode must drop intra-CIDR guest-to-guest traffic (%q):\n%s", wantDrop, out)
+	}
+	if !strings.Contains(out, "policy accept") {
+		t.Errorf("open mode forward chain must default-accept guest->internet:\n%s", out)
 	}
 	if !strings.Contains(out, "masquerade") {
 		t.Errorf("open mode still needs masquerade:\n%s", out)
