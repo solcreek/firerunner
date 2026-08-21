@@ -137,11 +137,11 @@ func TestMaintainsMinimumAfterExit(t *testing.T) {
 	}
 }
 
-// TestInFlightVMOutlivesCancel is the core of the graceful-drain fix: a SIGTERM
-// (modelled here by cancelling the parent context) must not cancel the context
-// of a microVM that is already running its job, or the provisioner's
-// exec.CommandContext would SIGKILL Firecracker mid-job.
-func TestInFlightVMOutlivesCancel(t *testing.T) {
+// TestBusyVMOutlivesCancel is the core of the graceful-drain fix: a SIGTERM
+// (modelled by cancelling the parent context) must not cancel the context of a
+// microVM that is running its job, or the provisioner's exec.CommandContext
+// would SIGKILL Firecracker mid-job.
+func TestBusyVMOutlivesCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -163,16 +163,53 @@ func TestInFlightVMOutlivesCancel(t *testing.T) {
 		t.Fatal("launch never started")
 	}
 
-	cancel() // simulate SIGTERM while the job is in flight
+	s.MarkBusy("runner") // GitHub assigned a job to this runner
+	cancel()             // simulate SIGTERM while the job is in flight
 
 	select {
 	case <-vmCtx.Done():
-		t.Fatal("in-flight microVM context was cancelled by shutdown; the job would be killed mid-run")
+		t.Fatal("busy microVM context was cancelled by shutdown; the job would be killed mid-run")
 	case <-time.After(50 * time.Millisecond):
 	}
 
 	close(release)
 	s.Drain()
+	if got := s.Running(); got != 0 {
+		t.Fatalf("running=%d want 0 after drain", got)
+	}
+}
+
+// TestIdleVMCancelledOnShutdown verifies the other half: an idle warm-pool VM
+// (no job assigned) is cancelled at once on shutdown so it never blocks the
+// drain waiting for a job that will never come.
+func TestIdleVMCancelledOnShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{}, 1)
+	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec) error {
+		entered <- struct{}{}
+		<-vmCtx.Done() // stays "running" until cancelled
+		return nil
+	})
+	s := New(Options{Max: 1, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 1)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("launch never started")
+	}
+
+	cancel() // shutdown with an idle warm VM in the pool
+
+	done := make(chan struct{})
+	go func() { s.Drain(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("idle warm VM was not cancelled on shutdown; drain hung")
+	}
 	if got := s.Running(); got != 0 {
 		t.Fatalf("running=%d want 0 after drain", got)
 	}

@@ -43,7 +43,15 @@ type ScaleSet struct {
 	client     *scaleset.Client
 	session    *scaleset.MessageSessionClient
 	scaleSetID int
+	// onJobStarted, when set, is called with the runner name each time GitHub
+	// assigns it a job. The scheduler uses it to mark a VM busy so a shutdown
+	// drain lets it finish. nil means the signal is only logged.
+	onJobStarted func(runnerName string)
 }
+
+// OnJobStarted registers a callback fired when GitHub assigns a job to one of
+// this scale set's runners. It must be set before Run.
+func (s *ScaleSet) OnJobStarted(fn func(runnerName string)) { s.onJobStarted = fn }
 
 // New builds a scaleset client, registers the runner scale set, and opens a
 // message session. Call Close to deregister.
@@ -164,7 +172,7 @@ func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc) error {
 	if err != nil {
 		return fmt.Errorf("create scaleset listener: %w", err)
 	}
-	return l.Run(ctx, &scaler{onDesired: onDesired, minRunners: s.cfg.MinRunners, log: s.log})
+	return l.Run(ctx, &scaler{onDesired: onDesired, onJobStarted: s.onJobStarted, minRunners: s.cfg.MinRunners, log: s.log})
 }
 
 // Close deregisters the scale set and closes the message session.
@@ -178,12 +186,14 @@ func (s *ScaleSet) Close(ctx context.Context) error {
 }
 
 // scaler adapts GitHub's scale-set callbacks onto firerunner's DesiredFunc.
-// Because every microVM is ephemeral and self-terminating, job start/completion
-// need no action beyond logging.
+// Job completion needs no action beyond logging (each microVM is ephemeral and
+// self-terminating); job start is forwarded to onJobStarted so the scheduler can
+// protect a running VM from the shutdown drain.
 type scaler struct {
-	onDesired  DesiredFunc
-	minRunners int
-	log        *slog.Logger
+	onDesired    DesiredFunc
+	onJobStarted func(runnerName string)
+	minRunners   int
+	log          *slog.Logger
 }
 
 var _ sslistener.Scaler = (*scaler)(nil)
@@ -196,6 +206,9 @@ func (a *scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 
 func (a *scaler) HandleJobStarted(_ context.Context, j *scaleset.JobStarted) error {
 	a.log.Info("job started", "runner", j.RunnerName, "runnerRequestId", j.RunnerRequestID)
+	if a.onJobStarted != nil {
+		a.onJobStarted(j.RunnerName)
+	}
 	return nil
 }
 

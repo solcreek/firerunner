@@ -303,6 +303,9 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	errCh := make(chan error, len(listeners))
 	for i := range listeners {
 		lis, sched := listeners[i], scheds[i]
+		// Tell the scheduler which VM GitHub has assigned a job, so a shutdown
+		// drain lets busy VMs finish while cancelling idle warm-pool ones.
+		lis.OnJobStarted(sched.MarkBusy)
 		onDesired := func(_ context.Context, desired int) int {
 			sched.Reconcile(runCtx, desired)
 			return sched.Running()

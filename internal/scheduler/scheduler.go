@@ -34,10 +34,22 @@ type Scheduler struct {
 	mu      sync.Mutex
 	running int
 	wg      sync.WaitGroup
+	// active tracks in-flight microVMs by runner name so a shutdown drain can
+	// tell an idle warm-pool VM (cancel it immediately) from one running a job
+	// (let it finish). MarkBusy flips a VM to busy when GitHub assigns it a job.
+	active map[string]*vmHandle
+}
+
+// vmHandle is the shutdown-relevant state of one in-flight microVM.
+type vmHandle struct {
+	cancel context.CancelFunc
+	busy   bool
 }
 
 // New returns a Scheduler.
-func New(o Options) *Scheduler { return &Scheduler{opts: o} }
+func New(o Options) *Scheduler {
+	return &Scheduler{opts: o, active: make(map[string]*vmHandle)}
+}
 
 // plan returns how many new runners to launch given the desired count reported
 // by GitHub, the number already running, and the capacity limit. It never
@@ -94,24 +106,82 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 		return
 	}
 
-	// Detach the microVM's lifetime from ctx: once a runner is booting or running
-	// its single job we must let it finish rather than kill it mid-job. The
-	// provisioner boots Firecracker via exec.CommandContext, which SIGKILLs the
-	// VMM the instant its context is cancelled — so if we passed ctx straight
-	// through, a SIGTERM would abort every in-flight job. ctx still gates whether
-	// we accept *new* work (the guard above and maintainMinimum below); the VM
-	// itself runs under a cancellation-free context and is reaped by Drain when
-	// its job completes. systemd's TimeoutStopSec (with KillMode=mixed) is the
-	// backstop that SIGKILLs a VM whose job overruns the stop timeout.
-	vmCtx := context.WithoutCancel(ctx)
-
-	name, jit, err := s.opts.JIT.Generate(vmCtx, s.opts.Spec)
+	name, jit, err := s.opts.JIT.Generate(context.WithoutCancel(ctx), s.opts.Spec)
 	if err != nil {
 		s.opts.Logger.Error("generate JIT config", "err", err)
 		return
 	}
+
+	// Detach the microVM's lifetime from ctx: once a runner is booting or running
+	// its single job we must let it finish rather than kill it mid-job. The
+	// provisioner boots Firecracker via exec.CommandContext, which SIGKILLs the
+	// VMM the instant its context is cancelled — so if we passed ctx straight
+	// through, a SIGTERM would abort every in-flight job.
+	//
+	// A watcher still cancels the VM on shutdown, but ONLY while it is idle (no
+	// job assigned yet): an idle warm-pool VM has nothing to lose and must not
+	// block the drain, whereas a busy VM (MarkBusy flipped it when GitHub started
+	// its job) is left to finish and is reaped by Drain when it self-destructs.
+	// systemd's TimeoutStopSec (with KillMode=mixed) is the final backstop for a
+	// job that overruns the stop timeout.
+	vmCtx, vmCancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer vmCancel()
+	s.track(name, vmCancel)
+	defer s.untrack(name)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			s.cancelIfIdle(name)
+		case <-vmCtx.Done():
+		}
+	}()
+
 	if err := s.opts.Provisioner.Launch(vmCtx, name, jit, s.opts.Spec); err != nil {
 		s.opts.Logger.Error("launch microVM", "runner", name, "err", err)
+	}
+}
+
+// track registers an in-flight microVM so a shutdown drain can find and, if it
+// is still idle, cancel it. It starts life idle (busy=false).
+func (s *Scheduler) track(name string, cancel context.CancelFunc) {
+	s.mu.Lock()
+	s.active[name] = &vmHandle{cancel: cancel}
+	s.mu.Unlock()
+}
+
+// untrack removes a microVM from the registry once it has exited.
+func (s *Scheduler) untrack(name string) {
+	s.mu.Lock()
+	delete(s.active, name)
+	s.mu.Unlock()
+}
+
+// MarkBusy records that GitHub has assigned a job to the named runner, so a
+// shutdown drain lets it finish instead of cancelling it as an idle warm-pool
+// VM. It is driven by the listener's job-started signal and no-ops for a runner
+// that has already exited (or belongs to another tier's scheduler).
+func (s *Scheduler) MarkBusy(name string) {
+	s.mu.Lock()
+	if h := s.active[name]; h != nil {
+		h.busy = true
+	}
+	s.mu.Unlock()
+}
+
+// cancelIfIdle cancels the named microVM's context only if no job has been
+// assigned to it, so shutdown reaps idle warm-pool VMs at once while leaving
+// busy VMs to finish their job.
+func (s *Scheduler) cancelIfIdle(name string) {
+	s.mu.Lock()
+	h := s.active[name]
+	var cancel context.CancelFunc
+	if h != nil && !h.busy {
+		cancel = h.cancel
+	}
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 

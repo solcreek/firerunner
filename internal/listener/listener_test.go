@@ -36,12 +36,26 @@ func TestScalerHandleDesiredRunnerCount(t *testing.T) {
 	}
 }
 
-func TestScalerJobCallbacksAreNoOps(t *testing.T) {
-	a := &scaler{minRunners: 0, log: testLogger(), onDesired: func(context.Context, int) int { return 0 }}
+func TestScalerJobStartedInvokesCallback(t *testing.T) {
+	var got string
+	a := &scaler{
+		minRunners:   0,
+		log:          testLogger(),
+		onDesired:    func(context.Context, int) int { return 0 },
+		onJobStarted: func(name string) { got = name },
+	}
 	if err := a.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: "r"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: "r", Result: "succeeded"}); err != nil {
+	if got != "r" {
+		t.Fatalf("onJobStarted got %q, want %q", got, "r")
+	}
+	// A nil onJobStarted must not panic; completion stays a pure log.
+	b := &scaler{minRunners: 0, log: testLogger(), onDesired: func(context.Context, int) int { return 0 }}
+	if err := b.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: "r"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: "r", Result: "succeeded"}); err != nil {
 		t.Fatal(err)
 	}
 }
