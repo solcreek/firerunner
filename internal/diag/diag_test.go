@@ -81,8 +81,19 @@ func TestProcMatchesInstance(t *testing.T) {
 	if !procMatchesInstance("/usr/bin/firecracker --api-sock /run/firecracker.socket --id fr-abc", "/srv/jailer/firecracker/fr-abc/root", jail) {
 		t.Error("own jailer-mode VMM not matched")
 	}
-	if procMatchesInstance("/usr/bin/firecracker --api-sock /run/firecracker.socket --id fk-xyz", "/srv/other/firecracker/fk-xyz/root", jail) {
+	if procMatchesInstance("/usr/bin/firecracker --api-sock /srv/other/firecracker/fk-xyz/root", "/srv/other/firecracker/fk-xyz/root", jail) {
 		t.Error("peer jailer-mode VMM wrongly matched")
+	}
+
+	// Prefix-collision: a peer work dir that shares a string prefix with this
+	// instance's (/var/tmp/firerunner vs /var/tmp/firerunner-kaikhq) must not be
+	// counted. This is the exact case that inflated the live count.
+	if procMatchesInstance("/usr/bin/firecracker --api-sock /var/tmp/firerunner-kaikhq/fk-xyz/fc.sock --id fk-xyz", "/", direct) {
+		t.Error("peer work dir sharing a prefix wrongly matched")
+	}
+	peerBase := provisioner.FirecrackerConfig{Jailer: true, ChrootBase: "/srv/jailer"}
+	if procMatchesInstance("/usr/bin/firecracker --api-sock /run/firecracker.socket", "/srv/jailer2/firecracker/fk-xyz/root", peerBase) {
+		t.Error("peer chroot base sharing a prefix wrongly matched")
 	}
 }
 

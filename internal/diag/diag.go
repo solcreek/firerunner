@@ -709,11 +709,15 @@ func procBelongsToInstance(pid string, fc provisioner.FirecrackerConfig) bool {
 //     firecracker cmdline.
 //   - Jailer mode: the VMM is chrooted under <ChrootBase>/firecracker/<id>/root,
 //     so its root symlink resolves inside ChrootBase.
+//
+// Both markers are matched at a path boundary (a trailing separator) so a peer
+// instance whose WorkDir/ChrootBase merely shares a string prefix — e.g.
+// /var/tmp/firerunner vs /var/tmp/firerunner-kaikhq — is not miscounted.
 func procMatchesInstance(cmdline, rootLink string, fc provisioner.FirecrackerConfig) bool {
-	if fc.WorkDir != "" && strings.Contains(cmdline, fc.WorkDir) {
+	if fc.WorkDir != "" && strings.Contains(cmdline, filepath.Clean(fc.WorkDir)+"/") {
 		return true
 	}
-	if fc.ChrootBase != "" && rootLink != "" && strings.HasPrefix(rootLink, fc.ChrootBase) {
+	if fc.ChrootBase != "" && rootLink != "" && strings.HasPrefix(rootLink, filepath.Clean(fc.ChrootBase)+"/") {
 		return true
 	}
 	return false
