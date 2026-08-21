@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -235,4 +236,127 @@ func TestReconcileAfterShutdownLaunchesNothing(t *testing.T) {
 	if got := s.Running(); got != 0 {
 		t.Fatalf("running=%d want 0", got)
 	}
+}
+
+// jitSeq hands out a unique runner name per call so each microVM gets its own
+// entry in the scheduler's active registry (the shared-name jitStub would
+// collide for multi-VM scenarios).
+type jitSeq struct{ n atomic.Int64 }
+
+func (j *jitSeq) Generate(context.Context, core.RunnerSpec) (string, string, error) {
+	return "runner-" + strconv.FormatInt(j.n.Add(1), 10), "jit", nil
+}
+
+func waitRunning(t *testing.T, s *Scheduler, want int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		if got := s.Running(); got == want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("running=%d want %d", s.Running(), want)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// TestScaleDownCancelsIdle verifies that when demand drops below the number
+// running, the surplus idle VMs are cancelled rather than left squatting slots.
+func TestScaleDownCancelsIdle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{}, 8)
+	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		entered <- struct{}{}
+		<-vmCtx.Done() // idle VM stays running until cancelled
+		return nil
+	})
+	s := New(Options{Max: 4, Min: 0, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 3)
+	for i := 0; i < 3; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("launch never started")
+		}
+	}
+	waitRunning(t, s, 3)
+
+	s.Reconcile(ctx, 1) // demand falls to 1; two idle VMs must be cancelled
+	waitRunning(t, s, 1)
+}
+
+// TestScaleDownLeavesBusy verifies a busy VM (running a job) is never cancelled
+// by scale-down; only idle VMs are reaped.
+func TestScaleDownLeavesBusy(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	busyCh := make(chan func(), 8)
+	release := make(chan struct{})
+	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		busyCh <- onBusy
+		select {
+		case <-vmCtx.Done():
+		case <-release:
+		}
+		return nil
+	})
+	s := New(Options{Max: 4, Min: 0, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 2)
+	var onBusy1 func()
+	select {
+	case onBusy1 = <-busyCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first launch never started")
+	}
+	select {
+	case <-busyCh: // second VM's onBusy (unused)
+	case <-time.After(2 * time.Second):
+		t.Fatal("second launch never started")
+	}
+	waitRunning(t, s, 2)
+
+	onBusy1()            // one VM dequeues a job
+	s.Reconcile(ctx, 0)  // demand drops to 0: only the idle VM may be cancelled
+	waitRunning(t, s, 1) // the busy VM survives
+
+	close(release)
+	s.Drain()
+	if got := s.Running(); got != 0 {
+		t.Fatalf("running=%d want 0 after drain", got)
+	}
+}
+
+// TestScaleDownPreservesMin verifies scale-to-zero still keeps the warm-pool
+// floor (Min) of pre-booted VMs.
+func TestScaleDownPreservesMin(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{}, 8)
+	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		entered <- struct{}{}
+		<-vmCtx.Done()
+		return nil
+	})
+	s := New(Options{Max: 4, Min: 1, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 3)
+	for i := 0; i < 3; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("launch never started")
+		}
+	}
+	waitRunning(t, s, 3)
+
+	s.Reconcile(ctx, 0) // demand 0, but Min=1 keeps one warm
+	waitRunning(t, s, 1)
 }

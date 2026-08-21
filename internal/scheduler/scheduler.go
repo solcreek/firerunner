@@ -44,6 +44,10 @@ type Scheduler struct {
 type vmHandle struct {
 	cancel context.CancelFunc
 	busy   bool
+	// cancelled guards against a scale-down (or shutdown) cancelling the same
+	// idle VM twice across rapid Reconcile calls before its launch goroutine has
+	// removed it from the registry.
+	cancelled bool
 }
 
 // New returns a Scheduler.
@@ -52,9 +56,10 @@ func New(o Options) *Scheduler {
 }
 
 // plan returns how many new runners to launch given the desired count reported
-// by GitHub, the number already running, and the capacity limit. It never
-// returns negative (we rely on ephemeral runners self-terminating) and never
-// exceeds available capacity.
+// by GitHub, the number already running, and the capacity limit. It returns only
+// the scale-up amount (never negative) bounded by available capacity; scaling
+// down when desired drops is handled separately by scaleDown, which cancels
+// idle VMs rather than relying solely on them self-terminating.
 func plan(desired, running, max int) int {
 	want := desired - running
 	if want < 0 {
@@ -69,23 +74,64 @@ func plan(desired, running, max int) int {
 	return want
 }
 
-// Reconcile launches microVMs to meet the desired count, bounded by capacity.
-// It is safe for concurrent use; each launched runner handles exactly one job.
+// Reconcile launches microVMs to meet the desired count, bounded by capacity,
+// and cancels idle VMs when desired drops below the number running. It is safe
+// for concurrent use; each launched runner handles exactly one job.
 func (s *Scheduler) Reconcile(ctx context.Context, desired int) {
 	s.mu.Lock()
 	n := plan(desired, s.running, s.opts.Max)
 	s.running += n
 	running := s.running
+	stopped := 0
+	if n == 0 {
+		stopped = s.scaleDown(desired)
+	}
 	s.mu.Unlock()
 
-	if n == 0 {
+	if n > 0 {
+		s.opts.Logger.Info("scaling up", "desired", desired, "launching", n, "running", running, "max", s.opts.Max)
+		for i := 0; i < n; i++ {
+			s.wg.Add(1)
+			go s.launchOne(ctx)
+		}
 		return
 	}
-	s.opts.Logger.Info("scaling up", "desired", desired, "launching", n, "running", running, "max", s.opts.Max)
-	for i := 0; i < n; i++ {
-		s.wg.Add(1)
-		go s.launchOne(ctx)
+	if stopped > 0 {
+		s.opts.Logger.Info("scaling down", "desired", desired, "cancelling", stopped, "running", running, "min", s.opts.Min)
 	}
+}
+
+// scaleDown cancels idle (non-busy, not already cancelling) microVMs so the total
+// running count converges toward max(desired, Min), returning how many it
+// cancelled. Callers must hold s.mu; the cancel is invoked under the lock (a
+// context.CancelFunc is non-blocking and re-enters the scheduler only
+// asynchronously) so a MarkBusy cannot slip between the busy check and the
+// cancel. Busy VMs are never cancelled — they are running a job and left to
+// finish and self-terminate; the warm-pool floor (Min) is always preserved so a
+// scale-to-zero still keeps pre-booted capacity.
+func (s *Scheduler) scaleDown(desired int) int {
+	floor := desired
+	if floor < s.opts.Min {
+		floor = s.opts.Min
+	}
+	excess := s.running - floor
+	if excess <= 0 {
+		return 0
+	}
+	cancelled := 0
+	for _, h := range s.active {
+		if excess <= 0 {
+			break
+		}
+		if h.busy || h.cancelled {
+			continue
+		}
+		h.cancelled = true
+		h.cancel()
+		cancelled++
+		excess--
+	}
+	return cancelled
 }
 
 func (s *Scheduler) launchOne(ctx context.Context) {
@@ -190,13 +236,28 @@ func (s *Scheduler) cancelIfIdle(name string) {
 // only pushes a desired-count message when job demand changes, so without this a
 // burst that drains the pool would leave it below Min until the next job arrives —
 // exactly when the following burst is most likely and the warm-pool latency win
-// matters most. It no-ops during shutdown (ctx cancelled) so it never relaunches
-// VMs that Drain is trying to reap.
+// matters most. It only ever launches (never cancels): it must not trigger the
+// scale-down path, or every VM exit during a scale-down would keep collapsing the
+// pool toward Min instead of the listener's actual desired count. It no-ops
+// during shutdown (ctx cancelled) so it never relaunches VMs that Drain is
+// trying to reap.
 func (s *Scheduler) maintainMinimum(ctx context.Context) {
 	if s.opts.Min <= 0 || ctx.Err() != nil {
 		return
 	}
-	s.Reconcile(ctx, s.opts.Min)
+	s.mu.Lock()
+	n := plan(s.opts.Min, s.running, s.opts.Max)
+	s.running += n
+	running := s.running
+	s.mu.Unlock()
+	if n == 0 {
+		return
+	}
+	s.opts.Logger.Info("replenishing warm pool", "min", s.opts.Min, "launching", n, "running", running)
+	for i := 0; i < n; i++ {
+		s.wg.Add(1)
+		go s.launchOne(ctx)
+	}
 }
 
 // Running returns the current number of in-flight microVMs.
