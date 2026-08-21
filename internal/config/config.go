@@ -278,6 +278,8 @@ func (c *Config) validate() error {
 		return fmt.Errorf("--jailer-cgroup requires --jailer")
 	case c.Firecracker.NetNS && !c.Firecracker.Jailer:
 		return fmt.Errorf("--netns requires --jailer")
+	case c.Firecracker.NetNS && c.Firecracker.CachePort != 0 && c.Firecracker.CacheURL == "":
+		return fmt.Errorf("--cache-port cannot be reached from inside --netns (the guest gateway lives in the namespace, not the host); use --cache-url with a routable address instead")
 	}
 	if len(c.Tiers) > 0 {
 		if err := c.validateTiers(); err != nil {

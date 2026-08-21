@@ -237,6 +237,17 @@ func TestFromFlags_NetNSRequiresJailer(t *testing.T) {
 	}
 }
 
+func TestFromFlags_NetNSCachePortRejected(t *testing.T) {
+	jail := []string{"--jailer", "--jail-uid", "955", "--jail-gid", "954", "--netns"}
+	if _, err := FromFlags(append(append(baseArgs(), jail...), "--cache-port", "8099")); err == nil {
+		t.Fatal("expected error: --cache-port is unreachable from inside --netns")
+	}
+	// --cache-url stays valid with --netns (routable address, not the in-ns gateway).
+	if _, err := FromFlags(append(append(baseArgs(), jail...), "--cache-url", "http://cache.internal:8099")); err != nil {
+		t.Fatalf("--netns with --cache-url should be valid: %v", err)
+	}
+}
+
 func TestFromFlags_ToolCache(t *testing.T) {
 	img := filepath.Join(t.TempDir(), "toolcache-go.ext4")
 	if err := os.WriteFile(img, []byte("x"), 0o644); err != nil {
