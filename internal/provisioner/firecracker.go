@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/solcreek/firerunner/internal/core"
@@ -118,6 +119,14 @@ type FirecrackerConfig struct {
 	// CachePort for deployments where the cache-server is not on the microVM's
 	// host gateway. Opt-in and off by default.
 	CacheURL string
+
+	// MaxVMLifetime, when non-zero, is a host-side backstop on how long a single
+	// microVM may run before firerunner kills its VMM to reclaim the network
+	// slot and running-count it holds. A microVM normally self-destructs the
+	// instant its one job ends, so this only fires on a genuinely stuck VMM
+	// (hung guest, wedged job). It is deliberately generous — larger than any
+	// legitimate job — so it never truncates real work; zero disables it.
+	MaxVMLifetime time.Duration
 }
 
 // DefaultBootArgs is a minimal, quiet serial console command line. reboot=k is
@@ -240,8 +249,30 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 
 	f.log.Info("microVM started", "runner", name, "slot", slot, "guestIP", vnet.guestIP, "vcpu", spec.VCPU, "memMiB", spec.MemMiB)
 	bootedAt := time.Now()
+
+	// Host-side lifetime backstop: a healthy microVM self-destructs the instant
+	// its one job ends, so a VM still alive after MaxVMLifetime is stuck and is
+	// holding its slot and running-count hostage. Kill the VMM to reclaim them.
+	var lifetimeKill atomic.Bool
+	if f.cfg.MaxVMLifetime > 0 {
+		timer := time.AfterFunc(f.cfg.MaxVMLifetime, func() {
+			lifetimeKill.Store(true)
+			f.log.Warn("microVM exceeded max lifetime; killing to reclaim its slot", "runner", name, "maxLifetime", f.cfg.MaxVMLifetime)
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+		})
+		defer timer.Stop()
+	}
+
 	err = cmd.Wait() // returns when the guest reboots (self-destruct) or dies
 	ranFor := time.Since(bootedAt)
+	if lifetimeKill.Load() {
+		// A backstop kill is an intentional reclaim, not a boot failure: report
+		// success so the scheduler simply replenishes the warm pool.
+		f.log.Warn("microVM killed after exceeding max lifetime", "runner", name, "ranFor", ranFor.Round(time.Second))
+		return nil
+	}
 	if failErr := classifyLaunchExit(err, ctx.Err(), ranFor, minBootRuntime); failErr != nil {
 		f.log.Error("microVM wait failed", "runner", name, "err", failErr, "ranFor", ranFor.Round(time.Millisecond))
 		return fmt.Errorf("wait for microVM %s: %w", name, failErr)

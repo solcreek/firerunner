@@ -169,6 +169,7 @@ func Parse(args []string) (*Config, error) {
 	fs.StringVar(&c.Firecracker.ToolCacheImage, "toolcache", env("FR_TOOLCACHE", ""), "path to a read-only ext4 image (labelled \"hostedtoolcache\", mirroring GitHub's tool-cache layout) attached to every microVM so setup-* actions hit a pre-seeded cache instead of downloading; opt-in accelerator, jobs fall back to downloading when unset")
 	fs.IntVar(&c.Firecracker.CachePort, "cache-port", er.int("FR_CACHE_PORT", 0), "TCP port of a firerunner cache-server reachable on each microVM's host gateway; when set, microVMs use it for actions/cache (dependency caching) instead of GitHub's hosted cache. Opt-in and off by default; the guest builds the URL from its default gateway and this port")
 	fs.StringVar(&c.Firecracker.CacheURL, "cache-url", env("FR_CACHE_URL", ""), "explicit base URL of a firerunner cache-server (e.g. http://cache.internal:8099); overrides --cache-port for deployments where the cache-server is not on the microVM's host gateway. Opt-in and off by default")
+	fs.DurationVar(&c.Firecracker.MaxVMLifetime, "max-vm-lifetime", er.duration("FR_MAX_VM_LIFETIME", 6*time.Hour), "host-side backstop: kill a microVM still running after this long to reclaim its slot (a healthy VM self-destructs when its job ends, so this only fires on a stuck VM). Keep it larger than any real job; 0 disables it")
 
 	var egress, dnsServers string
 	var metaRefresh time.Duration
@@ -290,6 +291,9 @@ func (c *Config) validate() error {
 	}
 	if c.Firecracker.CachePort != 0 && (c.Firecracker.CachePort < 1 || c.Firecracker.CachePort > 65535) {
 		return fmt.Errorf("--cache-port %d out of range (1-65535)", c.Firecracker.CachePort)
+	}
+	if c.Firecracker.MaxVMLifetime != 0 && c.Firecracker.MaxVMLifetime < time.Minute {
+		return fmt.Errorf("--max-vm-lifetime %s is too small; use 0 to disable or a value >= 1m so real jobs are never truncated", c.Firecracker.MaxVMLifetime)
 	}
 	if c.Firecracker.CacheURL != "" {
 		u, err := url.Parse(c.Firecracker.CacheURL)

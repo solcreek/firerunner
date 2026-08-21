@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // baseArgs is a minimal valid flag set; individual tests mutate a copy.
@@ -74,6 +75,31 @@ func TestFromFlags_CacheConfigInvalid(t *testing.T) {
 				t.Fatalf("expected error for %q", name)
 			}
 		})
+	}
+}
+
+func TestFromFlags_MaxVMLifetime(t *testing.T) {
+	// Defaults to a generous 6h backstop.
+	c, err := FromFlags(baseArgs())
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	if c.Firecracker.MaxVMLifetime != 6*time.Hour {
+		t.Fatalf("default max-vm-lifetime = %s, want 6h", c.Firecracker.MaxVMLifetime)
+	}
+
+	// 0 disables it.
+	c, err = FromFlags(append(baseArgs(), "--max-vm-lifetime", "0"))
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	if c.Firecracker.MaxVMLifetime != 0 {
+		t.Fatalf("max-vm-lifetime = %s, want 0 (disabled)", c.Firecracker.MaxVMLifetime)
+	}
+
+	// A too-small non-zero value is rejected so a real job is never truncated.
+	if _, err := FromFlags(append(baseArgs(), "--max-vm-lifetime", "5s")); err == nil {
+		t.Fatal("expected error for --max-vm-lifetime below 1m")
 	}
 }
 
