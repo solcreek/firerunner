@@ -161,8 +161,15 @@ account tied to the runners). Set one up once per org (or repo):
    | `https://github.com/ORG/REPO` (single repo) | **Repository → Administration: Read & write** |
 
 2. **Generate a private key** — on the App page, *Generate a private key*. This
-   downloads a `.pem`; store it where firerunner can read it (e.g.
-   `/etc/firerunner/app-key.pem`, mode `0600`, owned by the `firerunner` user).
+   downloads a `.pem`. Install it where **only** the `firerunner` user can read
+   it — `install` sets the mode directly instead of inheriting your umask like a
+   plain `cp` would:
+
+   ```bash
+   sudo install -d -m0750 -o root -g firerunner /etc/firerunner
+   sudo install -m0600 -o firerunner -g firerunner \
+     ~/Downloads/your-app.*.private-key.pem /etc/firerunner/app-key.pem
+   ```
 
 3. **Install the App** — *Install App* → choose the org/account and grant it
    access to the repositories that will use the runners (or *All repositories*
@@ -467,8 +474,13 @@ user, least-privilege capabilities). To install:
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin firerunner
 sudo usermod -aG kvm firerunner
 sudo install -m0755 firerunner /usr/local/bin/firerunner
-sudo mkdir -p /etc/firerunner
-sudo cp config.example.env /etc/firerunner/firerunner.env   # then edit
+# /etc/firerunner holds secrets (the env file and the App private key). Keep the
+# directory traversable by the firerunner user only, never world-readable.
+sudo install -d -m0750 -o root -g firerunner /etc/firerunner
+# The env file carries FR_TOKEN / App credentials, so install it 0640 (systemd
+# reads it as root; the firerunner group may read it) instead of letting cp
+# inherit your umask and leave it world-readable.
+sudo install -m0640 -o root -g firerunner config.example.env /etc/firerunner/firerunner.env   # then edit
 sudo install -m0644 deploy/firerunner.service /etc/systemd/system/
 sudo systemctl enable --now firerunner
 ```
