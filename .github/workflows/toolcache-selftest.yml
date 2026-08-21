@@ -1,0 +1,22 @@
+name: toolcache-selftest
+
+# Manual measurement for the pre-seeded tool-cache drive: dispatch this against a
+# live firerunner-node listener and compare the "setup-go (measured)" step
+# duration with the tool cache attached (cache hit) vs. detached (download).
+on:
+  workflow_dispatch:
+
+jobs:
+  go:
+    runs-on: firerunner-node
+    steps:
+      - uses: actions/checkout@v4
+      - name: setup-go (measured)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: report
+        run: |
+          go version
+          echo "RUNNER_TOOL_CACHE=${RUNNER_TOOL_CACHE:-unset}"
