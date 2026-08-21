@@ -174,6 +174,66 @@ func TestBuildNFTRulesetNoDNSNoNTP(t *testing.T) {
 	}
 }
 
+// TestBuildNFTRulesetHostHardening covers the guest->host protections: an input
+// chain that drops guest-originated traffic (except the cache port), interface-
+// keyed anti-spoof on both input and forward, and an ip6 drop table. All are
+// keyed on the guest interface prefix so the host's own traffic is untouched.
+func TestBuildNFTRulesetHostHardening(t *testing.T) {
+	out := buildNFTRuleset(egressRuleset{
+		ExtIface:    "eth0",
+		IfacePrefix: "fr",
+		VMCidr:      vmCIDR,
+		CachePort:   8099,
+		Allowed:     []string{"140.82.112.0/20"},
+	})
+	for _, want := range []string{
+		// input chain, policy accept (never black-holes host input).
+		"chain input {",
+		"hook input priority 0; policy accept;",
+		// anti-spoof on guest interfaces, in both input and forward.
+		`iifname "fr*" ip saddr != ` + vmCIDR + " drop",
+		// cache port reachable on the gateway despite the input drop.
+		`iifname "fr*" ip daddr ` + vmCIDR + " tcp dport 8099 accept",
+		// default guest->host drop.
+		`iifname "fr*" drop`,
+		// ip6 defense-in-depth table.
+		"add table ip6 firerunner",
+		"table ip6 firerunner {",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("hardened ruleset missing %q in:\n%s", want, out)
+		}
+	}
+	// The anti-spoof rule must appear in the forward chain too (not only input).
+	if n := strings.Count(out, `iifname "fr*" ip saddr != `+vmCIDR+" drop"); n < 2 {
+		t.Errorf("anti-spoof should be in both input and forward chains, found %d", n)
+	}
+}
+
+// TestBuildNFTRulesetNoIfacePrefix guards the empty-prefix fallback: without a
+// known guest interface the interface-keyed rules must be omitted entirely
+// rather than globbing every host interface with "*".
+func TestBuildNFTRulesetNoIfacePrefix(t *testing.T) {
+	out := buildNFTRuleset(egressRuleset{ExtIface: "eth0", VMCidr: vmCIDR, Allowed: []string{"140.82.112.0/20"}})
+	for _, absent := range []string{"chain input {", "table ip6", `iifname "*"`, "saddr != "} {
+		if strings.Contains(out, absent) {
+			t.Errorf("empty IfacePrefix must not emit %q:\n%s", absent, out)
+		}
+	}
+}
+
+// TestBuildNFTRulesetOpenHardened confirms host protection applies even in open
+// egress mode: guests still must not reach host services except the cache.
+func TestBuildNFTRulesetOpenHardened(t *testing.T) {
+	out := buildNFTRuleset(egressRuleset{ExtIface: "eth0", IfacePrefix: "fr", VMCidr: vmCIDR, Open: true})
+	if !strings.Contains(out, "chain input {") || !strings.Contains(out, `iifname "fr*" drop`) {
+		t.Errorf("open mode must still protect the host with an input drop:\n%s", out)
+	}
+	if !strings.Contains(out, "table ip6 firerunner") {
+		t.Errorf("open mode must still drop guest IPv6:\n%s", out)
+	}
+}
+
 func TestEgressConfigHelpers(t *testing.T) {
 	e := EgressConfig{Categories: []string{"api", "Actions", "dns", "open"}}
 	if !e.open() {

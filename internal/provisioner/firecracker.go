@@ -280,13 +280,15 @@ func (f *Firecracker) applyNetwork(ctx context.Context) error {
 	}
 
 	rs := egressRuleset{
-		Table:      f.cfg.NFTTable,
-		ExtIface:   f.cfg.ExtIface,
-		VMCidr:     vmCIDRFor(f.cfg.NetBase),
-		DNSServers: f.cfg.Egress.DNSServers,
-		AllowDNS:   f.cfg.Egress.has("dns"),
-		AllowNTP:   f.cfg.Egress.has("ntp"),
-		Open:       f.cfg.Egress.open(),
+		Table:       f.cfg.NFTTable,
+		IfacePrefix: f.cfg.TapPrefix,
+		ExtIface:    f.cfg.ExtIface,
+		VMCidr:      vmCIDRFor(f.cfg.NetBase),
+		CachePort:   f.cfg.CachePort,
+		DNSServers:  f.cfg.Egress.DNSServers,
+		AllowDNS:    f.cfg.Egress.has("dns"),
+		AllowNTP:    f.cfg.Egress.has("ntp"),
+		Open:        f.cfg.Egress.open(),
 	}
 	if !rs.Open {
 		cidrs, err := fetchMetaCIDRs(ctx, f.http, metaURL, f.cfg.Egress.metaCats())

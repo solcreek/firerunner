@@ -74,6 +74,14 @@ GitHub categories are `api`, `actions`, `git`, `packages`, and `dns`/`ntp` are
 pseudo-categories. Pass `--egress open` to disable the allowlist and fall back to
 blanket NAT.
 
+The same table also protects the **host itself**: an `input` chain drops
+guest→host traffic (so a guest cannot reach host-local services), allowing only
+the optional cache-server port on its gateway; interface-keyed **anti-spoof**
+drops any guest packet whose source is outside the VM range; and a companion
+`ip6` table black-holes all guest-originated IPv6 (guests are IPv4-only). All of
+these are scoped to firerunner's own tap/veth interfaces, so the host's other
+traffic is untouched. This protection applies even in `--egress open` mode.
+
 ### Logs
 
 Because the microVM is destroyed after its one job, its serial console (which

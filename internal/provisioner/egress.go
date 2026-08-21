@@ -105,15 +105,33 @@ func fetchMetaCIDRs(ctx context.Context, cl *http.Client, url string, categories
 
 // buildNFTRuleset returns a complete nftables ruleset for the firerunner table.
 // It atomically replaces the table (add/delete/define idiom) so it is idempotent
-// across runs and refreshes. When open, guests get blanket egress to everything
-// except each other (a forward chain drops intra-CIDR guest-to-guest traffic);
-// otherwise a forward filter drops any guest traffic not matching the allowlist
-// (which also blocks guest-to-guest). It is pure so the generated policy can be
-// asserted in tests.
+// across runs and refreshes.
+//
+// The ip table carries four concerns, all scoped to firerunner's own guest
+// interfaces (IfacePrefix) so nothing here touches the host's other traffic:
+//   - input: drop guest->host traffic so a guest cannot reach host-local
+//     services, except the optional cache-server port on its gateway. The chain
+//     uses policy accept and matches only guest interfaces, because a base-chain
+//     drop is terminal for EVERY packet at the input hook (it would black-hole
+//     the host's own SSH etc.).
+//   - anti-spoof: on guest interfaces, drop any packet whose source is not a VM
+//     address, so a guest cannot forge the host's or another network's IP.
+//   - forward: the egress allowlist (or blanket NAT when open), which also
+//     blocks guest-to-guest traffic.
+//   - postrouting: masquerade guest egress out the external interface.
+//
+// A companion ip6 table drops all guest-originated IPv6 (guests are IPv4-only),
+// as defense-in-depth. Both interface-keyed features are emitted only when
+// IfacePrefix is set; an empty prefix would glob every host interface.
+// It is pure so the generated policy can be asserted in tests.
 func buildNFTRuleset(cfg egressRuleset) string {
 	table := cfg.Table
 	if table == "" {
 		table = natTable
+	}
+	var iface string
+	if cfg.IfacePrefix != "" {
+		iface = cfg.IfacePrefix + "*"
 	}
 	var b strings.Builder
 	// Atomic replace: ensure the table exists, delete it, recreate fresh.
@@ -131,8 +149,25 @@ func buildNFTRuleset(cfg egressRuleset) string {
 		if cfg.AllowDNS && len(cfg.DNSServers) > 0 {
 			fmt.Fprintf(&b, "\tset dns {\n\t\ttype ipv4_addr\n\t\telements = { %s }\n\t}\n", strings.Join(cfg.DNSServers, ", "))
 		}
+	}
 
-		b.WriteString("\tchain forward {\n\t\ttype filter hook forward priority 0; policy accept;\n")
+	// input: protect the host itself from guest-originated traffic.
+	if iface != "" {
+		b.WriteString("\tchain input {\n\t\ttype filter hook input priority 0; policy accept;\n")
+		fmt.Fprintf(&b, "\t\tiifname \"%s\" ip saddr != %s drop\n", iface, cfg.VMCidr)
+		fmt.Fprintf(&b, "\t\tiifname \"%s\" ct state established,related accept\n", iface)
+		if cfg.CachePort > 0 {
+			fmt.Fprintf(&b, "\t\tiifname \"%s\" ip daddr %s tcp dport %d accept\n", iface, cfg.VMCidr, cfg.CachePort)
+		}
+		fmt.Fprintf(&b, "\t\tiifname \"%s\" drop\n", iface)
+		b.WriteString("\t}\n")
+	}
+
+	b.WriteString("\tchain forward {\n\t\ttype filter hook forward priority 0; policy accept;\n")
+	if iface != "" {
+		fmt.Fprintf(&b, "\t\tiifname \"%s\" ip saddr != %s drop\n", iface, cfg.VMCidr)
+	}
+	if !cfg.Open {
 		fmt.Fprintf(&b, "\t\tip saddr %s ct state established,related accept\n", cfg.VMCidr)
 		fmt.Fprintf(&b, "\t\tip saddr %s ip daddr @allowed accept\n", cfg.VMCidr)
 		if cfg.AllowDNS && len(cfg.DNSServers) > 0 {
@@ -143,21 +178,31 @@ func buildNFTRuleset(cfg egressRuleset) string {
 			fmt.Fprintf(&b, "\t\tip saddr %s udp dport 123 accept\n", cfg.VMCidr)
 		}
 		fmt.Fprintf(&b, "\t\tip saddr %s drop\n", cfg.VMCidr)
-		b.WriteString("\t}\n")
 	} else {
 		// Even with unrestricted egress, guests must not reach each other: a
 		// per-VM /30 tap already blocks L2 peers, but in open mode the host would
 		// otherwise route L3 traffic between guests on the same instance. Drop
 		// intra-CIDR traffic while leaving all other forwarding (guest->internet)
 		// to the accept policy.
-		b.WriteString("\tchain forward {\n\t\ttype filter hook forward priority 0; policy accept;\n")
 		fmt.Fprintf(&b, "\t\tip saddr %s ip daddr %s drop\n", cfg.VMCidr, cfg.VMCidr)
-		b.WriteString("\t}\n")
 	}
+	b.WriteString("\t}\n")
 
 	b.WriteString("\tchain postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n")
 	fmt.Fprintf(&b, "\t\tip saddr %s oifname \"%s\" masquerade\n", cfg.VMCidr, cfg.ExtIface)
 	b.WriteString("\t}\n}\n")
+
+	// ip6: guests are IPv4-only, so black-hole any IPv6 they emit (to the host
+	// or forwarded) rather than relying on the absence of a v6 address. Keyed on
+	// the guest interfaces with policy accept so host IPv6 is untouched.
+	if iface != "" {
+		fmt.Fprintf(&b, "add table ip6 %s\n", table)
+		fmt.Fprintf(&b, "delete table ip6 %s\n", table)
+		fmt.Fprintf(&b, "table ip6 %s {\n", table)
+		fmt.Fprintf(&b, "\tchain input {\n\t\ttype filter hook input priority 0; policy accept;\n\t\tiifname \"%s\" drop\n\t}\n", iface)
+		fmt.Fprintf(&b, "\tchain forward {\n\t\ttype filter hook forward priority 0; policy accept;\n\t\tiifname \"%s\" drop\n\t}\n", iface)
+		b.WriteString("}\n")
+	}
 	return b.String()
 }
 
@@ -165,12 +210,20 @@ func buildNFTRuleset(cfg egressRuleset) string {
 type egressRuleset struct {
 	// Table is the nftables table name to manage. Empty falls back to natTable
 	// so a second firerunner instance can own an isolated table.
-	Table      string
-	ExtIface   string
-	VMCidr     string
-	Allowed    []string
-	DNSServers []string
-	AllowDNS   bool
-	AllowNTP   bool
-	Open       bool
+	Table string
+	// IfacePrefix is the guest interface (tap/veth) name prefix. When set it
+	// enables the input host-protection chain, interface-keyed anti-spoof, and
+	// the ip6 drop table. Empty disables all interface-keyed rules (which would
+	// otherwise glob every host interface).
+	IfacePrefix string
+	ExtIface    string
+	VMCidr      string
+	Allowed     []string
+	DNSServers  []string
+	// CachePort, when >0 and IfacePrefix is set, lets guests reach the host
+	// cache-server on this TCP port via their gateway despite the input drop.
+	CachePort int
+	AllowDNS  bool
+	AllowNTP  bool
+	Open      bool
 }
