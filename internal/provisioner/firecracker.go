@@ -192,7 +192,7 @@ func (f *Firecracker) Name() string { return "firecracker" }
 // per-VM network slot, create a tap, boot the microVM with the JIT config
 // delivered via MMDS v2, then block until the guest self-destructs (reboot -f)
 // and reap everything.
-func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec core.RunnerSpec) error {
+func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec core.RunnerSpec, onBusy func()) error {
 	if err := f.SetupNetwork(ctx); err != nil {
 		return fmt.Errorf("setup network: %w", err)
 	}
@@ -209,7 +209,7 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 	}
 	defer func() { _ = f.teardownNet(context.WithoutCancel(ctx), vnet) }()
 
-	console, closeConsole, err := f.openConsole(name)
+	console, closeConsole, err := f.openConsole(name, onBusy)
 	if err != nil {
 		return fmt.Errorf("open console log: %w", err)
 	}
@@ -434,19 +434,67 @@ func (f *Firecracker) ensureHostCacheInput(ctx context.Context) error {
 
 // openConsole returns the writer for the guest serial console. When LogDir is
 // set the console is teed to a per-runner file so logs survive the microVM.
-func (f *Firecracker) openConsole(name string) (io.Writer, func(), error) {
+// When onBusy is non-nil the stream is also scanned for the runner's
+// "Running job:" marker, which fires onBusy exactly once the instant the guest
+// dequeues its job — the only real-time, per-VM busy signal available (the
+// scale-set control plane delivers JobStarted batched at completion).
+func (f *Firecracker) openConsole(name string, onBusy func()) (io.Writer, func(), error) {
 	slogWriter := &logWriter{log: f.log, runner: name, stream: "console"}
-	if f.cfg.LogDir == "" {
-		return slogWriter, func() {}, nil
+	writers := []io.Writer{slogWriter}
+	closeFn := func() {}
+	if f.cfg.LogDir != "" {
+		if err := os.MkdirAll(f.cfg.LogDir, 0o755); err != nil {
+			return nil, nil, err
+		}
+		file, err := os.Create(filepath.Join(f.cfg.LogDir, name+".log"))
+		if err != nil {
+			return nil, nil, err
+		}
+		writers = append([]io.Writer{file}, writers...)
+		closeFn = func() { _ = file.Close() }
 	}
-	if err := os.MkdirAll(f.cfg.LogDir, 0o755); err != nil {
-		return nil, nil, err
+	if onBusy != nil {
+		writers = append(writers, newBusyDetector(onBusy))
 	}
-	file, err := os.Create(filepath.Join(f.cfg.LogDir, name+".log"))
-	if err != nil {
-		return nil, nil, err
+	if len(writers) == 1 {
+		return writers[0], closeFn, nil
 	}
-	return io.MultiWriter(file, slogWriter), func() { _ = file.Close() }, nil
+	return io.MultiWriter(writers...), closeFn, nil
+}
+
+// busyMarker is printed by the in-guest Actions runner to the serial console
+// the instant it dequeues a job (e.g. "Running job: build").
+const busyMarker = "Running job:"
+
+// busyDetector is an io.Writer that scans the guest console stream for
+// busyMarker and calls onBusy exactly once when it appears. It keeps a small
+// carryover tail so a marker split across two Writes is still matched, and
+// always reports the full write as consumed so it never breaks the enclosing
+// io.MultiWriter. exec.Cmd funnels the guest's stdout and stderr through a
+// single fd when both point at the same writer, so Writes here are serialized
+// and need no additional locking.
+type busyDetector struct {
+	onBusy func()
+	fired  bool
+	tail   []byte
+}
+
+func newBusyDetector(onBusy func()) *busyDetector { return &busyDetector{onBusy: onBusy} }
+
+func (d *busyDetector) Write(p []byte) (int, error) {
+	if !d.fired {
+		buf := append(d.tail, p...)
+		if bytes.Contains(buf, []byte(busyMarker)) {
+			d.fired = true
+			d.tail = nil
+			d.onBusy()
+		} else if n := len(busyMarker) - 1; n > 0 && len(buf) > n {
+			d.tail = append(d.tail[:0], buf[len(buf)-n:]...)
+		} else {
+			d.tail = append(d.tail[:0], buf...)
+		}
+	}
+	return len(p), nil
 }
 
 // apiStep is a single Firecracker configuration API call.

@@ -18,8 +18,11 @@ import (
 // context was cancelled.
 type Provisioner interface {
 	// Launch boots a microVM for the given runner name and JIT config and
-	// blocks until the VM exits or ctx is cancelled.
-	Launch(ctx context.Context, name, jitConfig string, spec core.RunnerSpec) error
+	// blocks until the VM exits or ctx is cancelled. onBusy, if non-nil, is
+	// called once the guest runner dequeues its job (detected from the serial
+	// console); the scheduler uses it to protect an in-flight VM from the
+	// shutdown drain. onBusy may be called at most once and may be nil.
+	Launch(ctx context.Context, name, jitConfig string, spec core.RunnerSpec, onBusy func()) error
 	// Name returns the provisioner implementation name (for logging).
 	Name() string
 }

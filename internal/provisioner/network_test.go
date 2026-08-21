@@ -200,7 +200,7 @@ func TestEnsureHostForward(t *testing.T) {
 
 func TestOpenConsole_NoLogDir(t *testing.T) {
 	f := NewFirecracker(FirecrackerConfig{}, testLogger())
-	w, closeFn, err := f.openConsole("runner-x")
+	w, closeFn, err := f.openConsole("runner-x", nil)
 	if err != nil || w == nil {
 		t.Fatalf("openConsole: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestOpenConsole_NoLogDir(t *testing.T) {
 func TestOpenConsole_WritesFile(t *testing.T) {
 	dir := t.TempDir()
 	f := NewFirecracker(FirecrackerConfig{LogDir: dir}, testLogger())
-	w, closeFn, err := f.openConsole("runner-y")
+	w, closeFn, err := f.openConsole("runner-y", nil)
 	if err != nil {
 		t.Fatalf("openConsole: %v", err)
 	}

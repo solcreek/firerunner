@@ -719,3 +719,62 @@ func TestPrepare_Jailer(t *testing.T) {
 		t.Errorf("expected 2 cp calls (kernel + rootfs), got %v", calls)
 	}
 }
+
+func TestBusyDetectorFiresOnceOnMarker(t *testing.T) {
+	var n int
+	d := newBusyDetector(func() { n++ })
+	if _, err := d.Write([]byte("√ Connected to GitHub\nListening for Jobs\n")); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("fired %d times before marker, want 0", n)
+	}
+	if _, err := d.Write([]byte("2024-01-01 Running job: build\n")); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("fired %d times, want 1", n)
+	}
+	// Further output must not fire again.
+	if _, err := d.Write([]byte("Running job: another\nJob build completed\n")); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("fired %d times after first, want 1", n)
+	}
+}
+
+func TestBusyDetectorMatchesMarkerSplitAcrossWrites(t *testing.T) {
+	var n int
+	d := newBusyDetector(func() { n++ })
+	for _, b := range []byte("noise Running job: build") {
+		if _, err := d.Write([]byte{b}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n != 1 {
+		t.Fatalf("fired %d times for byte-split marker, want 1", n)
+	}
+}
+
+func TestBusyDetectorIdleStreamNeverFires(t *testing.T) {
+	var n int
+	d := newBusyDetector(func() { n++ })
+	for i := 0; i < 100; i++ {
+		if _, err := d.Write([]byte("Listening for Jobs\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n != 0 {
+		t.Fatalf("idle stream fired %d times, want 0", n)
+	}
+}
+
+func TestBusyDetectorReportsFullWrite(t *testing.T) {
+	d := newBusyDetector(func() {})
+	p := []byte("some console output")
+	n, err := d.Write(p)
+	if err != nil || n != len(p) {
+		t.Fatalf("Write = %d,%v want %d,nil", n, err, len(p))
+	}
+}

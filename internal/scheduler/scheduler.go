@@ -36,7 +36,7 @@ type Scheduler struct {
 	wg      sync.WaitGroup
 	// active tracks in-flight microVMs by runner name so a shutdown drain can
 	// tell an idle warm-pool VM (cancel it immediately) from one running a job
-	// (let it finish). MarkBusy flips a VM to busy when GitHub assigns it a job.
+	// (let it finish). MarkBusy flips a VM to busy when its guest dequeues a job.
 	active map[string]*vmHandle
 }
 
@@ -120,8 +120,9 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 	//
 	// A watcher still cancels the VM on shutdown, but ONLY while it is idle (no
 	// job assigned yet): an idle warm-pool VM has nothing to lose and must not
-	// block the drain, whereas a busy VM (MarkBusy flipped it when GitHub started
-	// its job) is left to finish and is reaped by Drain when it self-destructs.
+	// block the drain, whereas a busy VM (MarkBusy flipped it when the guest
+	// dequeued its job) is left to finish and is reaped by Drain when it
+	// self-destructs.
 	// systemd's TimeoutStopSec (with KillMode=mixed) is the final backstop for a
 	// job that overruns the stop timeout.
 	vmCtx, vmCancel := context.WithCancel(context.WithoutCancel(ctx))
@@ -137,7 +138,7 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 		}
 	}()
 
-	if err := s.opts.Provisioner.Launch(vmCtx, name, jit, s.opts.Spec); err != nil {
+	if err := s.opts.Provisioner.Launch(vmCtx, name, jit, s.opts.Spec, func() { s.MarkBusy(name) }); err != nil {
 		s.opts.Logger.Error("launch microVM", "runner", name, "err", err)
 	}
 }
@@ -157,10 +158,10 @@ func (s *Scheduler) untrack(name string) {
 	s.mu.Unlock()
 }
 
-// MarkBusy records that GitHub has assigned a job to the named runner, so a
-// shutdown drain lets it finish instead of cancelling it as an idle warm-pool
-// VM. It is driven by the listener's job-started signal and no-ops for a runner
-// that has already exited (or belongs to another tier's scheduler).
+// MarkBusy records that the named runner has dequeued a job, so a shutdown
+// drain lets it finish instead of cancelling it as an idle warm-pool VM. It is
+// driven by the guest console "Running job:" marker (see the provisioner) and
+// no-ops for a runner that has already exited.
 func (s *Scheduler) MarkBusy(name string) {
 	s.mu.Lock()
 	if h := s.active[name]; h != nil {

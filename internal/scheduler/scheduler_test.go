@@ -15,10 +15,10 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-type provFunc func(ctx context.Context, name, jit string, spec core.RunnerSpec) error
+type provFunc func(ctx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error
 
-func (p provFunc) Launch(ctx context.Context, name, jit string, spec core.RunnerSpec) error {
-	return p(ctx, name, jit, spec)
+func (p provFunc) Launch(ctx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+	return p(ctx, name, jit, spec, onBusy)
 }
 func (provFunc) Name() string { return "fake" }
 
@@ -54,7 +54,7 @@ func TestPlan(t *testing.T) {
 func TestReconcileRespectsMaxAndDrains(t *testing.T) {
 	release := make(chan struct{})
 	entered := make(chan string, 16)
-	prov := provFunc(func(ctx context.Context, name, jit string, spec core.RunnerSpec) error {
+	prov := provFunc(func(ctx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
 		entered <- name
 		<-release
 		return nil
@@ -86,7 +86,7 @@ func TestReconcileRespectsMaxAndDrains(t *testing.T) {
 }
 
 func TestReconcileZeroDoesNothing(t *testing.T) {
-	prov := provFunc(func(context.Context, string, string, core.RunnerSpec) error {
+	prov := provFunc(func(context.Context, string, string, core.RunnerSpec, func()) error {
 		t.Fatal("Launch should not be called for desired=0")
 		return nil
 	})
@@ -105,7 +105,7 @@ func TestMaintainsMinimumAfterExit(t *testing.T) {
 	launched := make(chan string, 32)
 	block := make(chan struct{})
 	var count int32
-	prov := provFunc(func(ctx context.Context, name, jit string, spec core.RunnerSpec) error {
+	prov := provFunc(func(ctx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
 		launched <- name
 		if atomic.AddInt32(&count, 1) == 1 {
 			return nil // first microVM finishes its job and exits immediately
@@ -146,9 +146,11 @@ func TestBusyVMOutlivesCancel(t *testing.T) {
 	defer cancel()
 
 	entered := make(chan context.Context, 1)
+	busyCh := make(chan func(), 1)
 	release := make(chan struct{})
-	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec) error {
+	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
 		entered <- vmCtx
+		busyCh <- onBusy
 		<-release
 		return nil
 	})
@@ -163,8 +165,8 @@ func TestBusyVMOutlivesCancel(t *testing.T) {
 		t.Fatal("launch never started")
 	}
 
-	s.MarkBusy("runner") // GitHub assigned a job to this runner
-	cancel()             // simulate SIGTERM while the job is in flight
+	(<-busyCh)() // guest console reported "Running job:" — mark the VM busy
+	cancel()     // simulate SIGTERM while the job is in flight
 
 	select {
 	case <-vmCtx.Done():
@@ -187,7 +189,7 @@ func TestIdleVMCancelledOnShutdown(t *testing.T) {
 	defer cancel()
 
 	entered := make(chan struct{}, 1)
-	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec) error {
+	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
 		entered <- struct{}{}
 		<-vmCtx.Done() // stays "running" until cancelled
 		return nil
@@ -222,7 +224,7 @@ func TestReconcileAfterShutdownLaunchesNothing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	prov := provFunc(func(context.Context, string, string, core.RunnerSpec) error {
+	prov := provFunc(func(context.Context, string, string, core.RunnerSpec, func()) error {
 		t.Fatal("Launch must not run once shutdown has begun")
 		return nil
 	})

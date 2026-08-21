@@ -56,7 +56,7 @@ func TestLaunchBootsAndSelfDestructs(t *testing.T) {
 	defer cancel()
 
 	spec := core.RunnerSpec{VCPU: 2, MemMiB: 1024, RootFS: golden}
-	if err := f.Launch(ctx, "e2e-smoke", "", spec); err != nil {
+	if err := f.Launch(ctx, "e2e-smoke", "", spec, nil); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 }
