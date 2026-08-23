@@ -271,6 +271,23 @@ DOCKERFILE
 fi
 
 # ---- Dockerfile finalize: boot service + init -----------------------------
+# Container jobs (a workflow job with `container:` and/or `services:`) run
+# `docker version` at job PICKUP -- before any step -- to create the job and
+# service containers. So dockerd must be READY the moment the runner accepts a
+# job. Socket-activation alone (docker.socket, dockerd off) races that: under a
+# concurrent matrix some legs accept a job before docker.socket is up and fail
+# setup with "dial unix /var/run/docker.sock: no such file". For toolsets that
+# ship docker (base/full) we therefore start dockerd at boot and gate the runner
+# behind it with Requires= + After= on docker.service (Type=notify): the runner
+# starts only once dockerd is active, and not at all if Docker fails -- instead
+# of accepting a container job with no daemon. The minimal toolset has no docker,
+# so it keeps docker.service disabled.
+if [[ "$TOOLSET" == "minimal" ]]; then
+  DOCKER_BOOT='for u in docker.service containerd.service postgresql.service mysql.service apache2.service nginx.service; do systemctl disable "$u" 2>/dev/null || true; done'
+else
+  DOCKER_BOOT='systemctl enable docker.service && mkdir -p /etc/systemd/system/firerunner-runner.service.d && printf "[Unit]\nAfter=docker.service\nRequires=docker.service\n" > /etc/systemd/system/firerunner-runner.service.d/10-docker.conf && for u in postgresql.service mysql.service apache2.service nginx.service; do systemctl disable "$u" 2>/dev/null || true; done'
+fi
+
 cat >> "$CTX/Dockerfile" <<DOCKERFILE
 
 # firerunner MMDS-JIT boot service (fetch jitconfig -> run one job -> reboot -f).
@@ -278,19 +295,17 @@ COPY firerunner-run.sh /usr/local/bin/firerunner-run.sh
 COPY firerunner-runner.service /etc/systemd/system/firerunner-runner.service
 COPY resolv.conf /etc/resolv.conf
 
-# Ephemeral microVM boot policy: ONLY the runner starts at boot. On-demand
-# services (docker, DBs, web servers) stay installed but disabled, so a throwaway
-# VM reaches an idle runner inside GitHub's 60s pickup deadline instead of
-# spending minutes bringing up daemons it may never use -- and so a mid-boot
-# docker/iptables reconfigure cannot break the runner's connect to GitHub.
-# docker.socket is left enabled so 'docker ...' in a job socket-activates the
-# daemon on first use, matching ubuntu-latest (where docker is up and the DBs
-# ship disabled). Snap, apt timers, networkd-wait-online and other noise are
-# masked outright.
+# Ephemeral microVM boot policy: the runner always starts at boot; DBs and web
+# servers stay installed but disabled (a throwaway VM shouldn't spend minutes
+# bringing up daemons it may never use). Docker is per-toolset: base/full start
+# dockerd at boot and gate the runner behind it (Requires=+After=, see
+# DOCKER_BOOT above) so a container job never races an un-started daemon; minimal
+# has no docker and keeps docker.service disabled. Snap, apt timers,
+# networkd-wait-online and other noise are masked outright.
 RUN chmod 0755 /usr/local/bin/firerunner-run.sh \\
     && ln -sf /lib/systemd/systemd /sbin/init \\
     && systemctl enable firerunner-runner.service \\
-    && for u in docker.service containerd.service postgresql.service mysql.service apache2.service nginx.service; do systemctl disable "\$u" 2>/dev/null || true; done \\
+    && ${DOCKER_BOOT} \\
     && for u in snapd.service snapd.socket snapd.seeded.service apt-daily.timer apt-daily-upgrade.timer motd-news.timer motd-news.service e2scrub_all.timer e2scrub_reap.service dpkg-db-backup.timer man-db.timer unattended-upgrades.service systemd-networkd-wait-online.service serial-getty@ttyS0.service; do systemctl mask "\$u" 2>/dev/null || true; done
 DOCKERFILE
 
