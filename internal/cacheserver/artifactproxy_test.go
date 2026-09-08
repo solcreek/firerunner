@@ -517,6 +517,7 @@ func TestSetArtifactUpstreamValidation(t *testing.T) {
 		"results-receiver.actions.githubusercontent.com/hunter2", // no scheme
 		"ftp://hunter2@example.com/",                             // wrong scheme
 		"https://?x=hunter2",                                     // no host
+		"http://:8080/hunter2",                                   // port-only authority, no host to dial
 		"https://example.com/?token=hunter2",                     // query
 		"https://example.com/#hunter2",                           // fragment
 		"https://user:hunter2@example.com/",                      // userinfo
@@ -812,5 +813,34 @@ func TestArtifactProxyDeadlineIsRouteLocal(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("slow cache upload -> %d, want 201 (artifact deadline leaked into cache path?)", resp.StatusCode)
+	}
+}
+
+// TestArtifactProxyTransportTimeoutIs502 checks that a timeout inside the
+// upstream hop while the RPC's own deadline is still live — here the
+// transport's response-header timeout — is reported as an upstream fault
+// (502 unavailable), not as the caller's deadline (504).
+func TestArtifactProxyTransportTimeoutIs502(t *testing.T) {
+	release := make(chan struct{})
+	upTS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { close(release); upTS.Close() })
+	s, front := newArtifactServer(t, upTS.URL)
+	// Make the hop's header timeout fire well before the 2-minute RPC deadline.
+	s.artifactProxy.Load().Transport = &http.Transport{ResponseHeaderTimeout: 100 * time.Millisecond}
+
+	resp, raw := artifactRPC(t, front.URL, "ListArtifacts", `{}`)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 for an upstream-hop timeout: %s", resp.StatusCode, raw)
+	}
+	if code, msg := decodeTwirpErr(t, raw); code != "unavailable" || msg != "artifact upstream unavailable" {
+		t.Fatalf("envelope = %s", raw)
+	}
+	if s.artifactErrors.Load() != 1 {
+		t.Fatalf("artifact_errors = %d, want 1", s.artifactErrors.Load())
 	}
 }

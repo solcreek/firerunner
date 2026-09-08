@@ -73,8 +73,11 @@ func (s *Server) SetArtifactUpstream(raw string) error {
 	if err != nil {
 		return errors.New("artifact upstream: not a valid URL")
 	}
-	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return errors.New("artifact upstream: must be an absolute http(s) URL")
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		// Hostname(), not Host: a port-only authority like http://:8080 has a
+		// non-empty Host but no host to dial, and should fail here rather than
+		// on the first artifact RPC.
+		return errors.New("artifact upstream: must be an absolute http(s) URL with a host")
 	}
 	if u.RawQuery != "" || u.Fragment != "" {
 		return errors.New("artifact upstream: must not carry a query or fragment")
@@ -199,18 +202,15 @@ func (s *Server) artifactProxyError(w http.ResponseWriter, r *http.Request, err 
 	}
 	code, twirpCode, msg := http.StatusBadGateway, "unavailable", "artifact upstream unavailable"
 	var mbe *http.MaxBytesError
-	var ne net.Error
 	switch {
 	case errors.As(err, &mbe):
 		code, twirpCode, msg = http.StatusRequestEntityTooLarge, "invalid_argument", "artifact rpc body too large"
-	case errors.Is(r.Context().Err(), context.DeadlineExceeded),
-		rec != nil && rec.bodyTimedOut.Load(),
-		errors.Is(err, context.DeadlineExceeded),
-		errors.As(err, &ne) && ne.Timeout():
-		// The RPC deadline expired, or the client-socket read deadline tripped
-		// while relaying a stalled request body (observed via the body wrapper,
-		// since the transport flattens that error). Both are the caller's
-		// timeout, not an upstream fault.
+	case errors.Is(r.Context().Err(), context.DeadlineExceeded), rec != nil && rec.bodyTimedOut.Load():
+		// Only the RPC's own deadlines count as a timeout: the request context
+		// expiring, or the client-socket read deadline tripping on a stalled
+		// request body (observed via the body wrapper, since the transport
+		// flattens that error). A transport dial/TLS/response-header timeout
+		// while the context is still live is an upstream fault and stays 502.
 		code, twirpCode, msg = http.StatusGatewayTimeout, "deadline_exceeded", "artifact rpc timed out"
 	}
 	s.log.Warn("artifact rpc failed", "method", r.PathValue("method"), "err", err)
