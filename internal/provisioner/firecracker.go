@@ -127,6 +127,17 @@ type FirecrackerConfig struct {
 	// (hung guest, wedged job). It is deliberately generous — larger than any
 	// legitimate job — so it never truncates real work; zero disables it.
 	MaxVMLifetime time.Duration
+
+	// ConnectTimeout, when non-zero, bounds how long a freshly booted microVM
+	// may take to register with GitHub (the runner's "Listening for Jobs" on
+	// the console) before firerunner kills it and frees its slot. A VM that
+	// never connects — no route or DNS to GitHub, a rejected JIT config, a
+	// broken golden — would otherwise sit idle holding a slot for the whole
+	// MaxVMLifetime while the scheduler saw a healthy running VM. The kill is
+	// reported as a boot failure so replenishment backs off instead of
+	// hot-looping, and recovers on its own once the cause clears. Zero
+	// disables it.
+	ConnectTimeout time.Duration
 }
 
 // DefaultBootArgs is a minimal, quiet serial console command line. reboot=k is
@@ -218,7 +229,8 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 	}
 	defer func() { _ = f.teardownNet(context.WithoutCancel(ctx), vnet) }()
 
-	console, closeConsole, err := f.openConsole(name, onBusy)
+	var connect connectWatchdog
+	console, closeConsole, err := f.openConsole(name, onBusy, connect.markConnected)
 	if err != nil {
 		return fmt.Errorf("open console log: %w", err)
 	}
@@ -265,8 +277,23 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 		defer timer.Stop()
 	}
 
+	// Connect watchdog: a VM that boots but never registers with GitHub holds
+	// its slot while looking healthy to the scheduler. Kill it at the deadline
+	// and report a failure so replenishment backs off (see errNeverConnected).
+	connect.arm(f.cfg.ConnectTimeout, func() {
+		f.log.Warn("microVM never registered with GitHub; killing to reclaim its slot — check guest DNS/egress and the JIT config",
+			"runner", name, "connectTimeout", f.cfg.ConnectTimeout)
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	})
+	defer connect.stop()
+
 	err = cmd.Wait() // returns when the guest reboots (self-destruct) or dies
 	ranFor := time.Since(bootedAt)
+	if connect.didKill() {
+		return wrapNeverConnected(name, f.cfg.ConnectTimeout)
+	}
 	if lifetimeKill.Load() {
 		// A backstop kill is an intentional reclaim, not a boot failure: report
 		// success so the scheduler simply replenishes the warm pool.
@@ -575,7 +602,7 @@ func parseNFTHandle(line string) string {
 // "Running job:" marker, which fires onBusy exactly once the instant the guest
 // dequeues its job — the only real-time, per-VM busy signal available (the
 // scale-set control plane delivers JobStarted batched at completion).
-func (f *Firecracker) openConsole(name string, onBusy func()) (io.Writer, func(), error) {
+func (f *Firecracker) openConsole(name string, onBusy, onConnected func()) (io.Writer, func(), error) {
 	// The busy detector goes first and never returns an error; the slog writer
 	// never errors either. The per-runner log file is wrapped so a write error
 	// (ENOSPC, read-only /var) is swallowed rather than propagated: io.MultiWriter
@@ -586,6 +613,9 @@ func (f *Firecracker) openConsole(name string, onBusy func()) (io.Writer, func()
 	var writers []io.Writer
 	if onBusy != nil {
 		writers = append(writers, newBusyDetector(onBusy))
+	}
+	if onConnected != nil {
+		writers = append(writers, newConnectDetector(onConnected))
 	}
 	writers = append(writers, &logWriter{log: f.log, runner: name, stream: "console"})
 	closeFn := func() {}
@@ -622,35 +652,133 @@ func (t tolerantWriter) Write(p []byte) (int, error) {
 // the instant it dequeues a job (e.g. "Running job: build").
 const busyMarker = "Running job:"
 
-// busyDetector is an io.Writer that scans the guest console stream for
-// busyMarker and calls onBusy exactly once when it appears. It keeps a small
-// carryover tail so a marker split across two Writes is still matched, and
-// always reports the full write as consumed so it never breaks the enclosing
-// io.MultiWriter. exec.Cmd funnels the guest's stdout and stderr through a
-// single fd when both point at the same writer, so Writes here are serialized
-// and need no additional locking.
-type busyDetector struct {
-	onBusy func()
-	fired  bool
-	tail   []byte
+// connectedMarker is printed by the runner once it has registered with GitHub
+// and is waiting for work. A job can in principle be dequeued so fast that the
+// listener's idle line never appears, so busyMarker also counts as connected.
+const connectedMarker = "Listening for Jobs"
+
+// markerDetector is an io.Writer that scans the guest console stream for any
+// of its markers and calls onHit exactly once when one appears. It keeps a
+// small carryover tail so a marker split across two Writes is still matched,
+// and always reports the full write as consumed so it never breaks the
+// enclosing io.MultiWriter. exec.Cmd funnels the guest's stdout and stderr
+// through a single fd when both point at the same writer, so Writes here are
+// serialized and need no additional locking.
+type markerDetector struct {
+	markers [][]byte
+	onHit   func()
+	fired   bool
+	tail    []byte
+	keep    int // longest marker length - 1: the tail needed to bridge a split
 }
 
-func newBusyDetector(onBusy func()) *busyDetector { return &busyDetector{onBusy: onBusy} }
+func newMarkerDetector(onHit func(), markers ...string) *markerDetector {
+	d := &markerDetector{onHit: onHit}
+	for _, m := range markers {
+		d.markers = append(d.markers, []byte(m))
+		if n := len(m) - 1; n > d.keep {
+			d.keep = n
+		}
+	}
+	return d
+}
 
-func (d *busyDetector) Write(p []byte) (int, error) {
+// newBusyDetector fires once when the guest runner dequeues a job.
+func newBusyDetector(onBusy func()) *markerDetector { return newMarkerDetector(onBusy, busyMarker) }
+
+// newConnectDetector fires once when the guest runner has registered with
+// GitHub (or gone straight to running a job).
+func newConnectDetector(onConnected func()) *markerDetector {
+	return newMarkerDetector(onConnected, connectedMarker, busyMarker)
+}
+
+func (d *markerDetector) Write(p []byte) (int, error) {
 	if !d.fired {
 		buf := append(d.tail, p...)
-		if bytes.Contains(buf, []byte(busyMarker)) {
-			d.fired = true
-			d.tail = nil
-			d.onBusy()
-		} else if n := len(busyMarker) - 1; n > 0 && len(buf) > n {
-			d.tail = append(d.tail[:0], buf[len(buf)-n:]...)
+		for _, m := range d.markers {
+			if bytes.Contains(buf, m) {
+				d.fired = true
+				d.tail = nil
+				d.onHit()
+				return len(p), nil
+			}
+		}
+		if d.keep > 0 && len(buf) > d.keep {
+			d.tail = append(d.tail[:0], buf[len(buf)-d.keep:]...)
 		} else {
 			d.tail = append(d.tail[:0], buf...)
 		}
 	}
 	return len(p), nil
+}
+
+// connectWatchdog kills a microVM whose runner has not registered with GitHub
+// within a deadline. It is created before the VMM exists (the console detector
+// that reports the connect is wired first) and armed once the VM is booted;
+// markConnected before arm simply leaves it inert. All three entry points run
+// on different goroutines (console copier, Launch, timer), hence the mutex.
+type connectWatchdog struct {
+	mu        sync.Mutex
+	timer     *time.Timer
+	connected bool
+	killed    bool
+}
+
+// arm starts the deadline; kill runs (once, on the timer goroutine) if the
+// runner has not connected by then. A non-positive timeout disables it.
+func (w *connectWatchdog) arm(timeout time.Duration, kill func()) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if timeout <= 0 || w.connected || w.timer != nil {
+		return
+	}
+	w.timer = time.AfterFunc(timeout, func() {
+		w.mu.Lock()
+		if w.connected {
+			w.mu.Unlock()
+			return
+		}
+		w.killed = true
+		w.mu.Unlock()
+		kill()
+	})
+}
+
+// markConnected records that the runner registered and disarms the deadline.
+func (w *connectWatchdog) markConnected() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.connected = true
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+}
+
+// stop disarms the deadline without recording a connect (Launch is returning).
+func (w *connectWatchdog) stop() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+}
+
+// didKill reports whether the deadline fired and the VMM was killed for never
+// connecting.
+func (w *connectWatchdog) didKill() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.killed
+}
+
+// errNeverConnected is returned by Launch when the connect watchdog killed the
+// VM. It is a Launch failure on purpose: the scheduler then backs off before
+// replenishing, so a host-wide cause (no DNS, no egress) yields a paced retry
+// loop with a clear error instead of every slot silently re-wedging at once.
+var errNeverConnected = errors.New("runner never registered with GitHub")
+
+func wrapNeverConnected(name string, timeout time.Duration) error {
+	return fmt.Errorf("microVM %s: %w within %s", name, errNeverConnected, timeout)
 }
 
 // apiStep is a single Firecracker configuration API call.

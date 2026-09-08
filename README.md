@@ -317,6 +317,24 @@ Warm runners are still single-use and ephemeral: a pre-booted VM that has not
 run a job is discarded like any other once it does. Size the pool to your peak
 concurrency — `--max-runners` still caps the total.
 
+**Stuck-VM backstops.** A healthy microVM self-destructs the instant its one job
+ends, so a VM that is still alive when it should not be is holding a slot
+hostage. Two host-side deadlines reclaim it:
+
+- `--vm-connect-timeout` (env `FR_VM_CONNECT_TIMEOUT`, default `5m`) kills a
+  booted VM whose runner has not registered with GitHub — the console never
+  shows `Listening for Jobs` (or `Running job:`). This is the fast path for a
+  VM wedged by lost DNS or egress, a rejected JIT config, or a broken golden:
+  without it every slot fills with idle VMs that look healthy to the scheduler,
+  and stays that way until the lifetime backstop. The kill is reported as a
+  boot failure, so the scheduler backs off before relaunching instead of
+  re-wedging all slots at once, and recovers by itself once the cause clears.
+- `--max-vm-lifetime` (env `FR_MAX_VM_LIFETIME`, default `6h`) kills any VM
+  still running after this long, however it got there (hung guest, wedged job).
+  Keep it longer than your longest real job.
+
+Both are `0` to disable; the connect timeout must be shorter than the lifetime.
+
 ### Pre-seeded tool cache (`--toolcache`, opt-in)
 
 On GitHub-hosted `ubuntu-latest`, `setup-go` / `setup-node` / `setup-python`
