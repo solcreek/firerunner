@@ -94,6 +94,7 @@ trap cleanup EXIT
 # Boot assets go into the build context.
 cp "$ASSETS/firerunner-run.sh" "$CTX/firerunner-run.sh"
 cp "$ASSETS/firerunner-runner.service" "$CTX/firerunner-runner.service"
+cp "$ASSETS/docker-shim.sh" "$CTX/docker-shim.sh"
 
 # resolv.conf matching the egress allowlist's resolvers.
 { for ns in $DNS_SERVERS; do echo "nameserver $ns"; done; } > "$CTX/resolv.conf"
@@ -288,12 +289,22 @@ else
   DOCKER_BOOT='systemctl enable docker.service && mkdir -p /etc/systemd/system/firerunner-runner.service.d && printf "[Unit]\nAfter=docker.service\nRequires=docker.service\n" > /etc/systemd/system/firerunner-runner.service.d/10-docker.conf && for u in postgresql.service mysql.service apache2.service nginx.service; do systemctl disable "$u" 2>/dev/null || true; done'
 fi
 
+# Docker toolsets also get the docker shim ahead of /usr/bin/docker on PATH so
+# a cache-redirect golden's ACTIONS_RESULTS_URL reaches steps inside `container:`
+# jobs (see assets/docker-shim.sh). It is inert unless that variable is set.
+DOCKER_SHIM=""
+if [[ "$TOOLSET" != "minimal" ]]; then
+  DOCKER_SHIM='COPY docker-shim.sh /usr/local/bin/docker
+RUN chmod 0755 /usr/local/bin/docker'
+fi
+
 cat >> "$CTX/Dockerfile" <<DOCKERFILE
 
 # firerunner MMDS-JIT boot service (fetch jitconfig -> run one job -> reboot -f).
 COPY firerunner-run.sh /usr/local/bin/firerunner-run.sh
 COPY firerunner-runner.service /etc/systemd/system/firerunner-runner.service
 COPY resolv.conf /etc/resolv.conf
+$DOCKER_SHIM
 
 # Ephemeral microVM boot policy: the runner always starts at boot; DBs and web
 # servers stay installed but disabled (a throwaway VM shouldn't spend minutes

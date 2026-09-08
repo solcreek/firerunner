@@ -26,6 +26,8 @@ jobs:
         run: go vet ./...
       - name: Test with race detector and coverage gate
         run: make cover-check
+      - name: Test golden docker shim
+        run: images/test-docker-shim.sh
 
   # End-to-end boot of a real Firecracker microVM. Requires a KVM-capable
   # self-hosted runner; runs only when manually dispatched so it never blocks PRs.
