@@ -292,6 +292,10 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 
 	err = cmd.Wait() // returns when the guest reboots (self-destruct) or dies
 	ranFor := time.Since(bootedAt)
+	// Disarm before reading didKill: a deadline landing in the gap between
+	// Wait returning and the deferred stop would otherwise record a kill of an
+	// already-exited VMM and misreport its real exit as never-connected.
+	connect.stop()
 	if connect.didKill() {
 		return wrapNeverConnected(name, f.cfg.ConnectTimeout)
 	}
