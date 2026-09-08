@@ -541,9 +541,11 @@ which (on a cache-redirect golden) holds only the renamed, dead
 `ACTIONS_RESULTS_URL` the boot script exported would never enter the container,
 so cache would silently miss and `upload-artifact` would fail. Docker-toolset
 goldens (`base`/`full`) therefore install a small shim ahead of `/usr/bin/docker`
-on `PATH` that adds `-e ACTIONS_RESULTS_URL=…` to the runner's own `docker
-create` — the job container's create-time environment is inherited by every
-later `docker exec`. The shim acts only when the variable is set, only for
+on `PATH` that adds `-e ACTIONS_RESULTS_URL=…` and `-e ACTIONS_CACHE_SERVICE_V2=…`
+(forwarding the runner's value, else `true`, so `actions/cache` speaks the v2
+protocol the cache-server implements) to the runner's own `docker create` — the
+job container's create-time environment is inherited by every later `docker
+exec`. The shim acts only when the variable is set, only for
 `create`, and only when the caller is `Runner.Worker`; a job's own `docker`
 commands pass through untouched, and on a non-redirect golden it is inert.
 
