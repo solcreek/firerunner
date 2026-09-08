@@ -170,6 +170,7 @@ func Parse(args []string) (*Config, error) {
 	fs.IntVar(&c.Firecracker.CachePort, "cache-port", er.int("FR_CACHE_PORT", 0), "TCP port of a firerunner cache-server reachable on each microVM's host gateway; when set, microVMs use it for actions/cache (dependency caching) instead of GitHub's hosted cache. Opt-in and off by default; the guest builds the URL from its default gateway and this port")
 	fs.StringVar(&c.Firecracker.CacheURL, "cache-url", env("FR_CACHE_URL", ""), "explicit base URL of a firerunner cache-server (e.g. http://cache.internal:8099); overrides --cache-port for deployments where the cache-server is not on the microVM's host gateway. Opt-in and off by default")
 	fs.DurationVar(&c.Firecracker.MaxVMLifetime, "max-vm-lifetime", er.duration("FR_MAX_VM_LIFETIME", 6*time.Hour), "host-side backstop: kill a microVM still running after this long to reclaim its slot (a healthy VM self-destructs when its job ends, so this only fires on a stuck VM). Keep it larger than any real job; 0 disables it")
+	fs.DurationVar(&c.Firecracker.ConnectTimeout, "vm-connect-timeout", er.duration("FR_VM_CONNECT_TIMEOUT", 5*time.Minute), "kill a booted microVM whose runner has not registered with GitHub (console shows neither \"Listening for Jobs\" nor \"Running job:\") within this long, freeing its slot and backing off replenishment; catches VMs wedged by lost DNS/egress or a rejected JIT config that would otherwise hold a slot until --max-vm-lifetime. 0 disables it")
 
 	var egress, dnsServers string
 	var metaRefresh time.Duration
@@ -310,6 +311,12 @@ func (c *Config) validate() error {
 	}
 	if c.Firecracker.MaxVMLifetime != 0 && c.Firecracker.MaxVMLifetime < time.Minute {
 		return fmt.Errorf("--max-vm-lifetime %s is too small; use 0 to disable or a value >= 1m so real jobs are never truncated", c.Firecracker.MaxVMLifetime)
+	}
+	if c.Firecracker.ConnectTimeout != 0 && c.Firecracker.ConnectTimeout < 30*time.Second {
+		return fmt.Errorf("--vm-connect-timeout %s is too small; use 0 to disable or a value >= 30s so a slow but healthy boot is never killed", c.Firecracker.ConnectTimeout)
+	}
+	if c.Firecracker.ConnectTimeout != 0 && c.Firecracker.MaxVMLifetime != 0 && c.Firecracker.ConnectTimeout >= c.Firecracker.MaxVMLifetime {
+		return fmt.Errorf("--vm-connect-timeout %s must be shorter than --max-vm-lifetime %s", c.Firecracker.ConnectTimeout, c.Firecracker.MaxVMLifetime)
 	}
 	if c.Firecracker.CacheURL != "" {
 		u, err := url.Parse(c.Firecracker.CacheURL)

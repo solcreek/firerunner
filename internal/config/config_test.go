@@ -495,3 +495,48 @@ func TestResolvePrivateKeyNeverLeaksValue(t *testing.T) {
 		t.Fatalf("error leaked key material: %v", err)
 	}
 }
+
+func TestFromFlags_VMConnectTimeout(t *testing.T) {
+	// Defaults to 5m: generous for a slow boot + registration, short enough
+	// that a wedged VM frees its slot well before the 6h lifetime backstop.
+	c, err := FromFlags(baseArgs())
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	if c.Firecracker.ConnectTimeout != 5*time.Minute {
+		t.Fatalf("default vm-connect-timeout = %s, want 5m", c.Firecracker.ConnectTimeout)
+	}
+
+	// 0 disables it.
+	c, err = FromFlags(append(baseArgs(), "--vm-connect-timeout", "0"))
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	if c.Firecracker.ConnectTimeout != 0 {
+		t.Fatalf("vm-connect-timeout = %s, want 0 (disabled)", c.Firecracker.ConnectTimeout)
+	}
+
+	// Env var is honoured.
+	t.Setenv("FR_VM_CONNECT_TIMEOUT", "90s")
+	c, err = FromFlags(baseArgs())
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	if c.Firecracker.ConnectTimeout != 90*time.Second {
+		t.Fatalf("vm-connect-timeout from env = %s, want 90s", c.Firecracker.ConnectTimeout)
+	}
+
+	// Too small is rejected so a slow but healthy boot is never killed.
+	if _, err := FromFlags(append(baseArgs(), "--vm-connect-timeout", "5s")); err == nil {
+		t.Fatal("expected error for --vm-connect-timeout below 30s")
+	}
+
+	// It must be shorter than the lifetime backstop, or it could never fire first.
+	if _, err := FromFlags(append(baseArgs(), "--vm-connect-timeout", "2h", "--max-vm-lifetime", "1h")); err == nil {
+		t.Fatal("expected error for --vm-connect-timeout >= --max-vm-lifetime")
+	}
+	// ...unless the lifetime backstop is disabled.
+	if _, err := FromFlags(append(baseArgs(), "--vm-connect-timeout", "2h", "--max-vm-lifetime", "0")); err != nil {
+		t.Fatalf("connect timeout with lifetime disabled: %v", err)
+	}
+}
