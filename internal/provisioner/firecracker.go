@@ -703,7 +703,10 @@ func (d *markerDetector) Write(p []byte) (int, error) {
 				return len(p), nil
 			}
 		}
-		if d.keep > 0 && len(buf) > d.keep {
+		// Carry over exactly the bytes a marker could straddle — and nothing when
+		// no marker can straddle a boundary (keep == 0), so an idle stream never
+		// accumulates.
+		if len(buf) > d.keep {
 			d.tail = append(d.tail[:0], buf[len(buf)-d.keep:]...)
 		} else {
 			d.tail = append(d.tail[:0], buf...)
@@ -721,6 +724,7 @@ type connectWatchdog struct {
 	mu        sync.Mutex
 	timer     *time.Timer
 	connected bool
+	stopped   bool
 	killed    bool
 }
 
@@ -729,12 +733,16 @@ type connectWatchdog struct {
 func (w *connectWatchdog) arm(timeout time.Duration, kill func()) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if timeout <= 0 || w.connected || w.timer != nil {
+	if timeout <= 0 || w.connected || w.stopped || w.timer != nil {
 		return
 	}
 	w.timer = time.AfterFunc(timeout, func() {
+		// timer.Stop can return false with this callback already scheduled, so
+		// the flags — not Stop's result — are what make markConnected and stop
+		// authoritative. Once Launch is unwinding (stopped), the VMM has been
+		// waited on; a kill here would target a reaped, possibly recycled PID.
 		w.mu.Lock()
-		if w.connected {
+		if w.connected || w.stopped {
 			w.mu.Unlock()
 			return
 		}
@@ -755,9 +763,12 @@ func (w *connectWatchdog) markConnected() {
 }
 
 // stop disarms the deadline without recording a connect (Launch is returning).
+// After it returns the kill path can no longer run, even if the timer had
+// already fired and its callback is waiting on the mutex.
 func (w *connectWatchdog) stop() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.stopped = true
 	if w.timer != nil {
 		w.timer.Stop()
 	}

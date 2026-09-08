@@ -285,3 +285,59 @@ func TestConnectWatchdogTimerLosesRaceToConnect(t *testing.T) {
 		t.Fatalf("timer callback killed a VM that had connected (kills=%d didKill=%v)", kills.Load(), w.didKill())
 	}
 }
+
+// TestConnectWatchdogTimerLosesRaceToStop covers the other side of the timer
+// race: Launch's deferred stop can run after the timer has fired but before its
+// callback takes the lock (timer.Stop returns false). The callback must then see
+// stopped and not kill — cmd.Wait has already returned by then, so a kill would
+// hit a reaped and possibly recycled PID. Simulated by recording the stop
+// without stopping the timer.
+func TestConnectWatchdogTimerLosesRaceToStop(t *testing.T) {
+	var w connectWatchdog
+	var kills atomic.Int32
+	w.arm(20*time.Millisecond, func() { kills.Add(1) })
+	w.mu.Lock()
+	w.stopped = true // as stop would, minus the (lost) timer.Stop
+	w.mu.Unlock()
+	time.Sleep(80 * time.Millisecond)
+	if kills.Load() != 0 || w.didKill() {
+		t.Fatalf("timer callback killed after stop (kills=%d didKill=%v)", kills.Load(), w.didKill())
+	}
+	// And arm after stop stays inert, so a late arm cannot resurrect it either.
+	w.arm(time.Millisecond, func() { kills.Add(1) })
+	time.Sleep(20 * time.Millisecond)
+	if kills.Load() != 0 {
+		t.Fatal("arm after stop started a timer")
+	}
+}
+
+// TestMarkerDetectorTailStaysBoundedOnIdleStream checks the carry-over never
+// grows past the longest marker minus one — including the degenerate
+// single-byte-marker case, where nothing can straddle a write boundary and the
+// tail must stay empty rather than retaining the whole stream.
+func TestMarkerDetectorTailStaysBoundedOnIdleStream(t *testing.T) {
+	cases := map[string][]string{
+		"single byte": {"X"},
+		"mixed":       {"ab", "a-much-longer-marker"},
+		"connect":     {connectedMarker, busyMarker},
+	}
+	for name, markers := range cases {
+		d := newMarkerDetector(func() {}, markers...)
+		for i := 0; i < 10_000; i++ {
+			if _, err := d.Write([]byte("idle console noise with no marker in it\n")); err != nil {
+				t.Fatal(err)
+			}
+			if len(d.tail) > d.keep {
+				t.Fatalf("%s: tail grew to %d bytes after %d writes (keep=%d)", name, len(d.tail), i+1, d.keep)
+			}
+		}
+	}
+	// The single-byte marker is still detected despite carrying nothing over.
+	var n int
+	d := newMarkerDetector(func() { n++ }, "X")
+	_, _ = d.Write([]byte("noise"))
+	_, _ = d.Write([]byte("X"))
+	if n != 1 {
+		t.Fatalf("single-byte marker fired %d times, want 1", n)
+	}
+}
