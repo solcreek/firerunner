@@ -534,9 +534,10 @@ hit rate, and `/metrics` exposes them as `firerunner_artifact_rpcs_total` /
 `firerunner_artifact_errors_total`.
 
 **Jobs that run in a container.** A `container:` job does not run its steps in
-the runner's process environment: the runner launches each one with `docker exec
--e KEY` for exactly the keys in its own step-environment table, which (on a
-cache-redirect golden) holds only the renamed, dead `ACTIONS_RESULTS_ORL`. The
+the runner's process environment: the runner launches each one with
+`docker exec -e KEY` for exactly the keys in its own step-environment table,
+which (on a cache-redirect golden) holds only the renamed, dead
+`ACTIONS_RESULTS_ORL`. The
 `ACTIONS_RESULTS_URL` the boot script exported would never enter the container,
 so cache would silently miss and `upload-artifact` would fail. Docker-toolset
 goldens (`base`/`full`) therefore install a small shim ahead of `/usr/bin/docker`

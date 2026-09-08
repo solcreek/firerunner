@@ -19,10 +19,12 @@
 #
 # The job container's environment at *create* time is inherited by every later
 # `docker exec`, so the one place to inject the URL is the runner's own
-# `docker create`. This shim does exactly that and nothing else: it only acts
-# when ACTIONS_RESULTS_URL is set (cache-redirect + a configured cache), only
-# for `create`, and only when the caller is Runner.Worker — a job's own docker
-# usage passes through untouched.
+# `docker create`. This shim adds ACTIONS_RESULTS_URL there, plus
+# ACTIONS_CACHE_SERVICE_V2 (forwarded if the runner set it, else "true") so
+# actions/cache speaks the v2 protocol the cache-server implements — and nothing
+# else: it only acts when ACTIONS_RESULTS_URL is set (cache-redirect + a
+# configured cache), only for `create`, and only when the caller is
+# Runner.Worker — a job's own docker usage passes through untouched.
 set -eu
 
 # The real binary is looked up in fixed locations that exclude this shim's own
