@@ -9,15 +9,18 @@ SHIM="$HERE/assets/docker-shim.sh"
 TMP="$(mktemp -d)"
 trap 'kill "${WORKER_PID:-}" 2>/dev/null || true; rm -rf "$TMP"' EXIT
 
-# Fake docker: one argv element per line, then exit with $FAKE_DOCKER_EXIT.
+# Fake docker: one argv element per line, its environment to a second file,
+# then exit with $FAKE_DOCKER_EXIT.
 cat > "$TMP/docker" <<'FAKE'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "$FAKE_DOCKER_ARGV"
+env > "$FAKE_DOCKER_ENV"
 exit "${FAKE_DOCKER_EXIT:-0}"
 FAKE
 chmod +x "$TMP/docker"
 export FIRERUNNER_SHIM_REAL_DOCKER="$TMP/docker"
 export FAKE_DOCKER_ARGV="$TMP/argv"
+export FAKE_DOCKER_ENV="$TMP/env"
 
 # A process whose comm is "Runner.Worker".
 cp "$(command -v sleep)" "$TMP/Runner.Worker"
@@ -110,5 +113,23 @@ case "$rc" in
 	0)   echo "ok   no recursion (real docker present on this host)";;
 	*)   echo "FAIL recursion guard: rc=$rc out=$out"; fails=$((fails+1));;
 esac
+
+# 10. The environment reaches the real docker verbatim — including names that
+#     are not valid shell identifiers. The runner passes step inputs as
+#     `-e INPUT_INCLUDE-HIDDEN-FILES` and relies on the docker CLI reading the
+#     value from its own environment; a /bin/sh (dash) shim strips such names
+#     and every hyphenated action input arrives empty.
+run_shim ACTIONS_RESULTS_URL="$URL" FIRERUNNER_SHIM_PPID="$WORKER_PID" \
+	'INPUT_INCLUDE-HIDDEN-FILES=false' 'INPUT_RETENTION-DAYS=14' 'INPUT_IF-NO-FILES-FOUND=warn' \
+	"$SHIM" exec -e INPUT_INCLUDE-HIDDEN-FILES -e INPUT_RETENTION-DAYS abc node /index.js
+envfail=0
+for kv in 'INPUT_INCLUDE-HIDDEN-FILES=false' 'INPUT_RETENTION-DAYS=14' 'INPUT_IF-NO-FILES-FOUND=warn' "ACTIONS_RESULTS_URL=$URL"; do
+	grep -qxF "$kv" "$FAKE_DOCKER_ENV" || { echo "     missing from docker env: $kv"; envfail=1; }
+done
+if [ "$envfail" = 0 ]; then echo "ok   hyphenated env names survive the shim"; else echo "FAIL hyphenated env names dropped"; fails=$((fails+1)); fi
+
+# 11. The shim is bash, not sh: /bin/sh is dash on the golden and would fail
+#     test 10 (see the header comment in the shim).
+if head -1 "$SHIM" | grep -q '^#!/bin/bash'; then echo "ok   shim runs under bash"; else echo "FAIL shim shebang is not /bin/bash: $(head -1 "$SHIM")"; fails=$((fails+1)); fi
 
 [ "$fails" = 0 ] && echo "all docker-shim tests passed" || { echo "$fails test(s) failed"; exit 1; }

@@ -1,6 +1,12 @@
-#!/bin/sh
+#!/bin/bash
 # firerunner docker shim — installed as /usr/local/bin/docker on goldens that
 # ship Docker, ahead of the real /usr/bin/docker on PATH.
+#
+# bash, not sh: on Ubuntu /bin/sh is dash, which silently drops environment
+# variables whose names are not valid shell identifiers. The runner passes step
+# inputs to `docker exec -e INPUT_INCLUDE-HIDDEN-FILES` and expects the docker
+# CLI to read the value from its own environment; a dash shim would strip every
+# such hyphenated name in transit and the action would see an empty input.
 #
 # Why: a cache-redirect golden points actions/cache and upload-artifact at the
 # host's cache-server by exporting ACTIONS_RESULTS_URL from firerunner-run.sh.
