@@ -380,13 +380,13 @@ func TestStatus_CacheStats(t *testing.T) {
 
 	// Forwarded RPCs and errors are both reported.
 	busy := render(serve(cacheserver.Stats{Entries: 3, ArtifactRPCs: 42, ArtifactErrors: 2}))
-	if !strings.Contains(busy, "42 artifact rpcs forwarded to GitHub, 2 errors") {
+	if !strings.Contains(busy, "42 artifact rpcs forwarded upstream, 2 errors") {
 		t.Errorf("artifact counters not rendered\n%s", busy)
 	}
 
 	// Errors alone (e.g. forwarding disabled) still surface.
 	failing := render(serve(cacheserver.Stats{ArtifactErrors: 5}))
-	if !strings.Contains(failing, "0 artifact rpcs forwarded to GitHub, 5 errors") {
+	if !strings.Contains(failing, "0 artifact rpcs forwarded upstream, 5 errors") {
 		t.Errorf("error-only artifact counters not rendered\n%s", failing)
 	}
 

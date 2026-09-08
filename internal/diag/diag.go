@@ -286,7 +286,7 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			fmt.Fprintf(tw, "\t%d entries, %s, %s hit rate (%d hit / %d miss), %d evicted\n",
 				st.Entries, size, hitRate(st.Hits, st.Misses), st.Hits, st.Misses, st.Evictions)
 			if st.ArtifactRPCs > 0 || st.ArtifactErrors > 0 {
-				fmt.Fprintf(tw, "\t%d artifact rpcs forwarded to GitHub, %d errors\n", st.ArtifactRPCs, st.ArtifactErrors)
+				fmt.Fprintf(tw, "\t%d artifact rpcs forwarded upstream, %d errors\n", st.ArtifactRPCs, st.ArtifactErrors)
 			}
 		}
 	} else {
