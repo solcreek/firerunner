@@ -1,13 +1,13 @@
 package cacheserver
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"strings"
 	"time"
 )
 
@@ -28,7 +28,27 @@ const (
 	// streamed by the client straight to the signed blob URL the upstream
 	// returns and never passes through this server.
 	maxArtifactRPCBody = 1 << 20
+
+	// defaultArtifactRPCTimeout bounds one forwarded RPC end to end — inbound
+	// body, upstream round trip and response relay — so a trickling client or
+	// a stalled upstream cannot pin a goroutine and two sockets indefinitely.
+	// The per-phase transport timeouts stop once headers arrive; this is the
+	// deadline that covers everything after that as well.
+	defaultArtifactRPCTimeout = 2 * time.Minute
 )
+
+// artifactMethods is the complete ArtifactService surface the @actions/artifact
+// toolkit calls. Whitelisting the decoded method name is what makes the
+// single-service boundary hold: the route wildcard alone would also accept an
+// encoded dot segment such as %2e%2e%2fCacheService%2fCreateCacheEntry, which
+// an upstream that normalizes paths could route outside ArtifactService.
+var artifactMethods = map[string]bool{
+	"CreateArtifact":       true,
+	"FinalizeArtifact":     true,
+	"ListArtifacts":        true,
+	"GetSignedArtifactURL": true,
+	"DeleteArtifact":       true,
+}
 
 // SetArtifactUpstream configures where ArtifactService RPCs are forwarded.
 // An empty value disables forwarding: artifact RPCs then fail fast with a
@@ -36,9 +56,7 @@ const (
 // 404 the toolkit would otherwise surface. Call before serving.
 func (s *Server) SetArtifactUpstream(raw string) error {
 	if raw == "" {
-		s.mu.Lock()
-		s.artifactProxy = nil
-		s.mu.Unlock()
+		s.artifactProxy.Store(nil)
 		return nil
 	}
 	u, err := url.Parse(raw)
@@ -51,7 +69,7 @@ func (s *Server) SetArtifactUpstream(raw string) error {
 	if u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("artifact upstream %q: must not carry a query or fragment", raw)
 	}
-	p := &httputil.ReverseProxy{
+	s.artifactProxy.Store(&httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			// SetURL joins the upstream base path with the inbound Twirp path and
 			// rewrites Host to the upstream. It deliberately does not add
@@ -61,16 +79,14 @@ func (s *Server) SetArtifactUpstream(raw string) error {
 		},
 		Transport:    artifactTransport(),
 		ErrorHandler: s.artifactProxyError,
-	}
-	s.mu.Lock()
-	s.artifactProxy = p
-	s.mu.Unlock()
+	})
 	return nil
 }
 
 // artifactTransport is a bounded HTTP transport for the upstream hop. The
-// server sits between a guest and the internet, so every phase gets a deadline
-// rather than inheriting the client's patience.
+// server sits between a guest and the internet, so the connection phases get
+// deadlines rather than inheriting the client's patience; the request-level
+// deadline in handleArtifactProxy covers the body phases these cannot.
 func artifactTransport() http.RoundTripper {
 	return &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
@@ -90,18 +106,22 @@ func artifactTransport() http.RoundTripper {
 // handleArtifactProxy forwards one ArtifactService RPC to the configured
 // upstream and relays the response verbatim.
 //
-// Only this one Twirp service is forwarded, and only to the operator-configured
-// upstream, so the server never acts as a general proxy for guests. The
-// client's Authorization header (its ACTIONS_RUNTIME_TOKEN) is passed through
-// untouched: it is GitHub's credential for GitHub's service, and this server
-// neither needs nor is able to validate it. The Twirp reply — including any
-// Twirp error envelope such as 409 already_exists — is returned as-is so the
-// toolkit sees exactly what GitHub said.
+// Only the five known ArtifactService methods are forwarded, and only to the
+// operator-configured upstream, so the server never acts as a general proxy
+// for guests. The client's Authorization header (its ACTIONS_RUNTIME_TOKEN) is
+// passed through untouched: it is GitHub's credential for GitHub's service,
+// and this server neither needs nor is able to validate it. The Twirp reply —
+// including any Twirp error envelope such as 409 already_exists — is returned
+// as-is so the toolkit sees exactly what GitHub said.
 func (s *Server) handleArtifactProxy(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	p := s.artifactProxy
-	s.mu.Unlock()
-	method := strings.TrimPrefix(r.URL.Path, artifactTwirpBase)
+	method := r.PathValue("method")
+	if !artifactMethods[method] {
+		s.artifactErrors.Add(1)
+		s.log.Warn("artifact rpc refused: unknown method", "method", method)
+		twirpError(w, http.StatusNotFound, "bad_route", "unknown ArtifactService method")
+		return
+	}
+	p := s.artifactProxy.Load()
 	if p == nil {
 		s.artifactErrors.Add(1)
 		s.log.Warn("artifact rpc refused: no upstream configured", "method", method)
@@ -114,9 +134,23 @@ func (s *Server) handleArtifactProxy(w http.ResponseWriter, r *http.Request) {
 		twirpError(w, http.StatusRequestEntityTooLarge, "invalid_argument", "artifact rpc body too large")
 		return
 	}
+	ctx, cancel := context.WithTimeout(r.Context(), s.artifactTimeout)
+	defer cancel()
+	r = r.WithContext(ctx)
 	r.Body = http.MaxBytesReader(w, r.Body, maxArtifactRPCBody)
 	s.artifactRPCs.Add(1)
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	// ReverseProxy aborts the handler with http.ErrAbortHandler when relaying
+	// the upstream body fails after headers went out (truncated or reset
+	// reply). That is a failed RPC too, so count it on the way past and let
+	// net/http finish handling the abort as usual.
+	defer func() {
+		if v := recover(); v != nil {
+			s.artifactErrors.Add(1)
+			s.log.Warn("artifact rpc aborted mid-response", "method", method, "status", rec.status)
+			panic(v)
+		}
+	}()
 	p.ServeHTTP(rec, r)
 	if rec.proxyErr || rec.status >= 500 {
 		s.artifactErrors.Add(1)
@@ -124,18 +158,24 @@ func (s *Server) handleArtifactProxy(w http.ResponseWriter, r *http.Request) {
 	s.log.Info("artifact rpc forwarded", "method", method, "status", rec.status)
 }
 
-// artifactProxyError turns an upstream transport failure into a Twirp error
+// artifactProxyError turns a failure on the upstream hop into a Twirp error
 // envelope so the toolkit reports a readable reason rather than a bare 502.
+// The message is deliberately generic: the underlying error names the
+// upstream host and transport details, which belong in the server log, not
+// in a reply to an unauthenticated guest.
 func (s *Server) artifactProxyError(w http.ResponseWriter, r *http.Request, err error) {
 	if rec, ok := w.(*statusRecorder); ok {
 		rec.proxyErr = true
 	}
-	code, twirpCode, msg := http.StatusBadGateway, "unavailable", "artifact upstream unreachable: "+err.Error()
+	code, twirpCode, msg := http.StatusBadGateway, "unavailable", "artifact upstream unavailable"
 	var mbe *http.MaxBytesError
-	if errors.As(err, &mbe) {
+	switch {
+	case errors.As(err, &mbe):
 		code, twirpCode, msg = http.StatusRequestEntityTooLarge, "invalid_argument", "artifact rpc body too large"
+	case errors.Is(err, context.DeadlineExceeded):
+		code, twirpCode, msg = http.StatusGatewayTimeout, "deadline_exceeded", "artifact rpc timed out"
 	}
-	s.log.Warn("artifact rpc failed", "method", strings.TrimPrefix(r.URL.Path, artifactTwirpBase), "err", err)
+	s.log.Warn("artifact rpc failed", "method", r.PathValue("method"), "err", err)
 	twirpError(w, code, twirpCode, msg)
 }
 

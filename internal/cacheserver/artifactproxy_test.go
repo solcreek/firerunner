@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // upstreamRecorder is a fake GitHub Results service. It captures every request
@@ -248,8 +249,13 @@ func TestArtifactProxyUpstreamUnreachable(t *testing.T) {
 		t.Fatalf("status = %d, want 502: %s", resp.StatusCode, raw)
 	}
 	code, msg := decodeTwirpErr(t, raw)
-	if code != "unavailable" || !strings.Contains(msg, "artifact upstream unreachable") {
+	if code != "unavailable" || msg != "artifact upstream unavailable" {
 		t.Fatalf("envelope = %s", raw)
+	}
+	// The reply must not tell an unauthenticated guest where the hop goes or
+	// why it failed; that detail belongs in the server log only.
+	if strings.Contains(string(raw), l.Addr().String()) || strings.Contains(string(raw), "connection refused") {
+		t.Fatalf("envelope leaks upstream/transport detail: %s", raw)
 	}
 	if got := s.artifactErrors.Load(); got != 1 {
 		t.Fatalf("artifact_errors = %d, want 1", got)
@@ -524,10 +530,7 @@ func TestSetArtifactUpstreamValidation(t *testing.T) {
 	if err := s.SetArtifactUpstream(""); err != nil {
 		t.Fatalf("disable: %v", err)
 	}
-	s.mu.Lock()
-	disabled := s.artifactProxy == nil
-	s.mu.Unlock()
-	if !disabled {
+	if s.artifactProxy.Load() != nil {
 		t.Fatalf("empty upstream did not disable forwarding")
 	}
 }
@@ -568,5 +571,145 @@ func TestArtifactProxyConcurrent(t *testing.T) {
 	}
 	if s.artifactRPCs.Load() != n || s.artifactErrors.Load() != 0 {
 		t.Fatalf("counters rpcs=%d errors=%d, want %d/0", s.artifactRPCs.Load(), s.artifactErrors.Load(), n)
+	}
+}
+
+// TestArtifactProxyRejectsUnknownMethod checks the method whitelist: names the
+// toolkit never calls — including an encoded dot-segment that the route
+// wildcard alone would accept and an upstream might normalize into a different
+// service — are refused before anything is forwarded.
+func TestArtifactProxyRejectsUnknownMethod(t *testing.T) {
+	up, upTS := newUpstream(t, http.StatusOK, `{}`)
+	s, front := newArtifactServer(t, upTS.URL)
+
+	for _, m := range []string{
+		"MigrateArtifact",
+		"createartifact", // case matters in Twirp routes
+		"%2e%2e%2fCacheService%2fCreateCacheEntry",
+		"CreateArtifact%2f..%2fFinalizeArtifact",
+		"..%2FCacheService%2FCreateCacheEntry",
+	} {
+		req, _ := http.NewRequest(http.MethodPost, front.URL+artifactTwirpBase+m, strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%q -> %d, want 404: %s", m, resp.StatusCode, raw)
+		}
+		if code, _ := decodeTwirpErr(t, raw); code != "bad_route" {
+			t.Fatalf("%q envelope = %s", m, raw)
+		}
+	}
+	if up.count() != 0 {
+		t.Fatalf("upstream received %d requests; unknown methods must never be forwarded", up.count())
+	}
+	if s.artifactRPCs.Load() != 0 || s.artifactErrors.Load() != 5 {
+		t.Fatalf("counters rpcs=%d errors=%d, want 0/5", s.artifactRPCs.Load(), s.artifactErrors.Load())
+	}
+}
+
+// TestArtifactProxyTimeout checks the end-to-end RPC deadline: an upstream that
+// accepts the request but never answers is cut off with a 504 Twirp
+// deadline_exceeded, counted as an error, and does not hold the handler open.
+func TestArtifactProxyTimeout(t *testing.T) {
+	release := make(chan struct{})
+	upTS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { close(release); upTS.Close() })
+	s, front := newArtifactServer(t, upTS.URL)
+	s.artifactTimeout = 150 * time.Millisecond
+
+	start := time.Now()
+	resp, raw := artifactRPC(t, front.URL, "ListArtifacts", `{}`)
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("handler held open %v despite deadline", elapsed)
+	}
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504: %s", resp.StatusCode, raw)
+	}
+	if code, msg := decodeTwirpErr(t, raw); code != "deadline_exceeded" || msg != "artifact rpc timed out" {
+		t.Fatalf("envelope = %s", raw)
+	}
+	if s.artifactErrors.Load() != 1 {
+		t.Fatalf("artifact_errors = %d, want 1", s.artifactErrors.Load())
+	}
+}
+
+// TestArtifactProxyTimeoutCoversStalledBody checks the deadline also applies
+// after headers arrive, where the transport's ResponseHeaderTimeout no longer
+// helps: an upstream that sends headers and then stalls is still cut off, and
+// the truncated relay is counted as a failed RPC.
+func TestArtifactProxyTimeoutCoversStalledBody(t *testing.T) {
+	release := make(chan struct{})
+	upTS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		_, _ = io.WriteString(w, `{"artifacts":[`)
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { close(release); upTS.Close() })
+	s, front := newArtifactServer(t, upTS.URL)
+	s.artifactTimeout = 150 * time.Millisecond
+
+	start := time.Now()
+	req, _ := http.NewRequest(http.MethodPost, front.URL+artifactTwirpBase+"ListArtifacts", strings.NewReader(`{}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	_, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("stalled body held the handler open %v", elapsed)
+	}
+	// Headers were already relayed, so the client sees a 200 whose body is cut
+	// short; what matters is that it ends, and that the server counted it.
+	if readErr == nil {
+		t.Fatalf("expected the truncated body to surface a read error")
+	}
+	if s.artifactErrors.Load() != 1 {
+		t.Fatalf("artifact_errors = %d, want 1 for a truncated relay", s.artifactErrors.Load())
+	}
+}
+
+// TestArtifactProxyCountsTruncatedUpstreamReply checks a reply whose body is
+// cut off by the upstream (connection reset after headers, no deadline
+// involved) is recorded in artifact_errors even though ReverseProxy aborts the
+// handler before the normal post-call accounting runs.
+func TestArtifactProxyCountsTruncatedUpstreamReply(t *testing.T) {
+	upTS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "64")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"partial":`)
+		// Returning with fewer bytes than Content-Length makes net/http close
+		// the connection mid-body: the proxy's copy fails after headers went out.
+	}))
+	t.Cleanup(upTS.Close)
+	s, front := newArtifactServer(t, upTS.URL)
+
+	req, _ := http.NewRequest(http.MethodPost, front.URL+artifactTwirpBase+"ListArtifacts", strings.NewReader(`{}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err == nil {
+		_, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatalf("expected the client to observe a truncated reply")
+	}
+	if s.artifactRPCs.Load() != 1 || s.artifactErrors.Load() != 1 {
+		t.Fatalf("counters rpcs=%d errors=%d, want 1/1", s.artifactRPCs.Load(), s.artifactErrors.Load())
 	}
 }

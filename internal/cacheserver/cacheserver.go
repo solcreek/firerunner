@@ -128,11 +128,13 @@ type Server struct {
 	saves     uint64
 	evictions uint64
 
-	// artifactProxy forwards ArtifactService RPCs to GitHub (nil = disabled);
-	// its counters are atomic so the proxy path never waits on the index lock.
-	artifactProxy  *httputil.ReverseProxy
-	artifactRPCs   atomic.Uint64
-	artifactErrors atomic.Uint64
+	// artifactProxy forwards ArtifactService RPCs to GitHub (nil = disabled).
+	// It and its counters are atomic so the proxy path never waits on the
+	// index lock, which cache hit/finalize paths hold across index writes.
+	artifactProxy   atomic.Pointer[httputil.ReverseProxy]
+	artifactTimeout time.Duration
+	artifactRPCs    atomic.Uint64
+	artifactErrors  atomic.Uint64
 }
 
 // Stats is a point-in-time snapshot of the cache store, served by /stats and
@@ -226,11 +228,12 @@ func New(dir string, log *slog.Logger) (*Server, error) {
 		return nil, fmt.Errorf("chmod cache dir %q: %w", dir, err)
 	}
 	s := &Server{
-		dir:     dir,
-		log:     log.With("module", "cacheserver"),
-		entries: make(map[uint64]*Entry),
-		staged:  make(map[uint64]int64),
-		nextID:  1,
+		dir:             dir,
+		log:             log.With("module", "cacheserver"),
+		entries:         make(map[uint64]*Entry),
+		staged:          make(map[uint64]int64),
+		nextID:          1,
+		artifactTimeout: defaultArtifactRPCTimeout,
 	}
 	if err := s.load(); err != nil {
 		return nil, err

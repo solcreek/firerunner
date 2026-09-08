@@ -534,12 +534,17 @@ structurally by running **one cache-server per repository** and pinning it:
   LAN/WAN client can reach it.
 - Assume any job that can reach it can read and overwrite every entry within its
   tenant (a fork-PR job can poison a cache a later trusted job restores).
-- The artifact forwarder is not a general proxy: it relays exactly one Twirp
-  service, only via `POST`, only to the single operator-configured
-  `--artifact-upstream`, with request bodies capped at 1 MiB. The guest's
+- The artifact forwarder is not a general proxy: it relays exactly the five
+  `ArtifactService` methods the toolkit calls (anything else, including an
+  encoded dot-segment aimed at another service, is refused before forwarding),
+  only via `POST`, only to the single operator-configured
+  `--artifact-upstream`, with request bodies capped at 1 MiB and each RPC
+  bounded by a 2-minute end-to-end deadline. The guest's
   `ACTIONS_RUNTIME_TOKEN` is passed through to that host alone (it is GitHub's
-  credential for GitHub's service), and no `X-Forwarded-*` headers are added, so
-  a guest cannot steer the hop elsewhere or learn anything about the host.
+  credential for GitHub's service), no `X-Forwarded-*` headers are added, and
+  hop failures come back as generic Twirp errors — the upstream address and
+  transport details stay in the server log — so a guest cannot steer the hop
+  elsewhere or learn anything about the host.
 
 Uploads are bounded per-entry (`--max-entry-size`, default 10GB) and in total
 (`--max-size`), and finalized entries are immutable.
