@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"sync/atomic"
 	"time"
 )
 
@@ -74,6 +77,12 @@ func (s *Server) SetArtifactUpstream(raw string) error {
 	}
 	if u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("artifact upstream %q: must not carry a query or fragment", raw)
+	}
+	if u.User != nil {
+		// The configured value is echoed in the startup log; a password embedded
+		// as userinfo would land there. The upstream authenticates the guest's
+		// bearer token, not the operator, so there is no legitimate use for it.
+		return fmt.Errorf("artifact upstream must not carry userinfo (user:password@)")
 	}
 	s.artifactProxy.Store(&httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -153,9 +162,13 @@ func (s *Server) handleArtifactProxy(w http.ResponseWriter, r *http.Request) {
 	rc := http.NewResponseController(w)
 	_ = rc.SetReadDeadline(time.Now().Add(s.artifactTimeout))
 	_ = rc.SetWriteDeadline(time.Now().Add(s.artifactTimeout + artifactWriteGrace))
-	r.Body = http.MaxBytesReader(w, r.Body, maxArtifactRPCBody)
-	s.artifactRPCs.Add(1)
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	// Watch the client body read ourselves: when the socket deadline trips the
+	// HTTP/1 transport reports it as a flattened "connection broken" string
+	// that carries neither the net.Error nor the context error, so the error
+	// handler could not otherwise tell a stalled client from a dead upstream.
+	r.Body = http.MaxBytesReader(w, &timeoutObservingBody{ReadCloser: r.Body, timedOut: &rec.bodyTimedOut}, maxArtifactRPCBody)
+	s.artifactRPCs.Add(1)
 	// ReverseProxy aborts the handler with http.ErrAbortHandler when relaying
 	// the upstream body fails after headers went out (truncated or reset
 	// reply). That is a failed RPC too, so count it on the way past and let
@@ -180,7 +193,8 @@ func (s *Server) handleArtifactProxy(w http.ResponseWriter, r *http.Request) {
 // upstream host and transport details, which belong in the server log, not
 // in a reply to an unauthenticated guest.
 func (s *Server) artifactProxyError(w http.ResponseWriter, r *http.Request, err error) {
-	if rec, ok := w.(*statusRecorder); ok {
+	rec, _ := w.(*statusRecorder)
+	if rec != nil {
 		rec.proxyErr = true
 	}
 	code, twirpCode, msg := http.StatusBadGateway, "unavailable", "artifact upstream unavailable"
@@ -189,9 +203,14 @@ func (s *Server) artifactProxyError(w http.ResponseWriter, r *http.Request, err 
 	switch {
 	case errors.As(err, &mbe):
 		code, twirpCode, msg = http.StatusRequestEntityTooLarge, "invalid_argument", "artifact rpc body too large"
-	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
-		// Either the RPC context expired or the client-socket read deadline
-		// tripped while relaying a stalled request body.
+	case errors.Is(r.Context().Err(), context.DeadlineExceeded),
+		rec != nil && rec.bodyTimedOut.Load(),
+		errors.Is(err, context.DeadlineExceeded),
+		errors.As(err, &ne) && ne.Timeout():
+		// The RPC deadline expired, or the client-socket read deadline tripped
+		// while relaying a stalled request body (observed via the body wrapper,
+		// since the transport flattens that error). Both are the caller's
+		// timeout, not an upstream fault.
 		code, twirpCode, msg = http.StatusGatewayTimeout, "deadline_exceeded", "artifact rpc timed out"
 	}
 	s.log.Warn("artifact rpc failed", "method", r.PathValue("method"), "err", err)
@@ -203,8 +222,9 @@ func (s *Server) artifactProxyError(w http.ResponseWriter, r *http.Request, err 
 // can count failures without buffering the body.
 type statusRecorder struct {
 	http.ResponseWriter
-	status   int
-	proxyErr bool
+	status       int
+	proxyErr     bool
+	bodyTimedOut atomic.Bool // set from the transport's body-write goroutine
 }
 
 func (sr *statusRecorder) WriteHeader(code int) {
@@ -215,3 +235,20 @@ func (sr *statusRecorder) WriteHeader(code int) {
 // Unwrap lets http.ResponseController reach the underlying writer (the reverse
 // proxy uses it to flush streamed responses).
 func (sr *statusRecorder) Unwrap() http.ResponseWriter { return sr.ResponseWriter }
+
+// timeoutObservingBody records whether reading the client body failed on the
+// socket deadline, which is the only reliable way to attribute that failure
+// once the transport has flattened the error.
+type timeoutObservingBody struct {
+	io.ReadCloser
+	timedOut *atomic.Bool
+}
+
+func (b *timeoutObservingBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	var ne net.Error
+	if err != nil && (errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout())) {
+		b.timedOut.Store(true)
+	}
+	return n, err
+}

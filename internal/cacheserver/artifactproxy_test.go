@@ -517,10 +517,17 @@ func TestSetArtifactUpstreamValidation(t *testing.T) {
 		"https://",                                       // no host
 		"https://example.com/?x=1",                       // query
 		"https://example.com/#frag",                      // fragment
+		"https://user:hunter2@example.com/",              // userinfo would be echoed in the startup log
+		"https://token@example.com/",
 		"://bad",
 	} {
-		if err := s.SetArtifactUpstream(bad); err == nil {
+		err := s.SetArtifactUpstream(bad)
+		if err == nil {
 			t.Errorf("SetArtifactUpstream(%q) accepted, want error", bad)
+			continue
+		}
+		if strings.Contains(bad, "hunter2") && strings.Contains(err.Error(), "hunter2") {
+			t.Errorf("rejection error echoes the password: %v", err)
 		}
 	}
 	for _, good := range []string{DefaultArtifactUpstream, "http://10.0.0.1:8080", "https://ghes.example.com/_services/results/"} {
