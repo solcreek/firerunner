@@ -101,16 +101,22 @@ else
 	echo "FAIL missing real docker: rc=$rc out=$out"; fails=$((fails+1))
 fi
 
-# 9. Unset override falls back to the fixed search list and never picks itself:
-#    with an empty search result it must fail cleanly rather than recurse.
+# 9. Unset override falls back to the fixed search list and never picks itself.
+#    With PATH holding only a copy of the shim, `docker` resolves to that copy,
+#    which must hand off to a real binary outside its own directory — or fail
+#    cleanly with 127 when the host has none. `--version` never touches a
+#    daemon or the network, so this is deterministic on any host; a recursion
+#    would show up as a hang (bounded by timeout) or a non-0/127 exit.
 mkdir -p "$TMP/lonely"; cp "$SHIM" "$TMP/lonely/docker"
 set +e
-out="$(env -u FIRERUNNER_SHIM_REAL_DOCKER PATH="$TMP/lonely" ACTIONS_RESULTS_URL="$URL" \
-	bash -c 'exec docker create img' 2>&1)"; rc=$?
+BASH_BIN="$(command -v bash)"
+out="$(timeout 10 env -u FIRERUNNER_SHIM_REAL_DOCKER -u ACTIONS_RESULTS_URL PATH="$TMP/lonely" \
+	"$BASH_BIN" -c 'exec docker --version' 2>&1)"; rc=$?
 set -e
 case "$rc" in
-	127) echo "ok   no recursion without a real docker (rc=127)";;
-	0)   echo "ok   no recursion (real docker present on this host)";;
+	0)   if [[ "$out" == Docker\ version* ]]; then echo "ok   no recursion (handed off to the host's real docker)"; else echo "FAIL unexpected --version output: $out"; fails=$((fails+1)); fi;;
+	127) if [[ "$out" == *"real docker binary not found"* ]]; then echo "ok   no recursion (no real docker on this host, rc=127)"; else echo "FAIL rc=127 but shim message missing: $out"; fails=$((fails+1)); fi;;
+	124) echo "FAIL recursion guard: shim hung (timeout)"; fails=$((fails+1));;
 	*)   echo "FAIL recursion guard: rc=$rc out=$out"; fails=$((fails+1));;
 esac
 
