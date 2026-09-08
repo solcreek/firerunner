@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Unit tests for assets/docker-shim.sh. Linux-only (like the shim: it reads
-# /proc/<pid>/comm) and needs bash + coreutils (`timeout`); no docker daemon
-# is required. A fake docker records its argv, and a copy of `sleep` named
+# /proc/<pid>/comm) and needs bash, coreutils (`timeout`, `sleep`, `env`),
+# grep and diff; no docker daemon is required. A fake docker records its argv, and a copy of `sleep` named
 # Runner.Worker stands in for the runner so /proc/<pid>/comm reads
 # "Runner.Worker".
 set -euo pipefail
