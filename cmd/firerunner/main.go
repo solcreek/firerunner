@@ -114,7 +114,7 @@ func cacheServe(args []string) error {
 	maxSize := fs.String("max-size", "50GB", "evict least-recently-used entries above this total size (e.g. 50GB, 0 for unlimited)")
 	maxEntry := fs.String("max-entry-size", "10GB", "refuse any single cache entry larger than this (e.g. 10GB, 0 for unlimited)")
 	repo := fs.String("repository", "", "pin every entry to this tenant, ignoring the unauthenticated client repository_id; set it (e.g. owner/name) so one server safely serves a single repository")
-	artifactUpstream := fs.String("artifact-upstream", cacheserver.DefaultArtifactUpstream, "GitHub Results endpoint to forward ArtifactService RPCs (upload/download-artifact v4+) to, since a cache-redirect golden diverts them here along with the cache; set your GHES results URL on Enterprise Server, or empty to refuse artifact RPCs")
+	artifactUpstream := fs.String("artifact-upstream", cacheserver.DefaultArtifactUpstream, "Results endpoint to forward ArtifactService RPCs (upload/download-artifact v4+) to, since a cache-redirect golden diverts them here along with the cache; defaults to github.com's, accepts any protocol-compatible upstream, or empty to refuse artifact RPCs")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -237,6 +237,10 @@ cache-server flags:
   --repository string  pin every entry to this tenant, ignoring the
                      unauthenticated client repository_id; set it (e.g.
                      owner/name) so one server safely serves a single repository
+  --artifact-upstream string  forward ArtifactService RPCs (upload/download-
+                     artifact v4+, which share ACTIONS_RESULTS_URL with the
+                     cache) to this Results endpoint so artifacts stay on GitHub
+                     (default github.com's results-receiver; "" refuses them)
 `)
 }
 

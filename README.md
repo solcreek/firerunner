@@ -497,11 +497,15 @@ Twirp error envelopes included. Only the small JSON RPCs take this hop; the
 archive itself flows between the guest and the signed
 `productionresultssa*.blob.core.windows.net` URL GitHub returns, exactly as it
 does without any redirect (so an egress allowlist needs nothing new). The
-upstream defaults to github.com's `results-receiver.actions.githubusercontent.com`;
-on GitHub Enterprise Server pass your instance's results URL:
+upstream defaults to github.com's `results-receiver.actions.githubusercontent.com`.
+This is a github.com feature for now: `upload-artifact@v4+` is not supported on
+GitHub Enterprise Server, so there is no GHES ArtifactService endpoint to point
+at. `--artifact-upstream` is still a flag rather than a constant so a
+protocol-compatible upstream can be substituted (a test double, a future GHES
+service) without a rebuild:
 
 ```bash
-firerunner cache-server ... --artifact-upstream https://ghes.example.com/_services/results/
+firerunner cache-server ... --artifact-upstream https://results.example.internal/
 ```
 
 Setting `--artifact-upstream ""` refuses artifact RPCs outright (a Twirp
