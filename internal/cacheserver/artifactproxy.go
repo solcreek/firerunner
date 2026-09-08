@@ -3,7 +3,6 @@ package cacheserver
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -68,21 +67,22 @@ func (s *Server) SetArtifactUpstream(raw string) error {
 		s.artifactProxy.Store(nil)
 		return nil
 	}
+	// None of these errors echo the value: cacheServe logs the returned error,
+	// and a rejected URL may be the one carrying a credential.
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("artifact upstream %q: %w", raw, err)
+		return errors.New("artifact upstream: not a valid URL")
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return fmt.Errorf("artifact upstream %q: must be an absolute http(s) URL", raw)
+		return errors.New("artifact upstream: must be an absolute http(s) URL")
 	}
 	if u.RawQuery != "" || u.Fragment != "" {
-		return fmt.Errorf("artifact upstream %q: must not carry a query or fragment", raw)
+		return errors.New("artifact upstream: must not carry a query or fragment")
 	}
 	if u.User != nil {
-		// The configured value is echoed in the startup log; a password embedded
-		// as userinfo would land there. The upstream authenticates the guest's
-		// bearer token, not the operator, so there is no legitimate use for it.
-		return fmt.Errorf("artifact upstream must not carry userinfo (user:password@)")
+		// The upstream authenticates the guest's bearer token, not the operator,
+		// so userinfo has no legitimate use and would only end up in a log.
+		return errors.New("artifact upstream: must not carry userinfo (user:password@)")
 	}
 	s.artifactProxy.Store(&httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {

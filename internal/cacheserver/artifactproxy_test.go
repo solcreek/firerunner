@@ -511,23 +511,25 @@ func TestSetArtifactUpstreamValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Every rejected form smuggles a "secret" so the test can prove no
+	// validation error ever echoes the input: cacheServe logs these errors.
 	for _, bad := range []string{
-		"results-receiver.actions.githubusercontent.com", // no scheme
-		"ftp://example.com/",                             // wrong scheme
-		"https://",                                       // no host
-		"https://example.com/?x=1",                       // query
-		"https://example.com/#frag",                      // fragment
-		"https://user:hunter2@example.com/",              // userinfo would be echoed in the startup log
-		"https://token@example.com/",
-		"://bad",
+		"results-receiver.actions.githubusercontent.com/hunter2", // no scheme
+		"ftp://hunter2@example.com/",                             // wrong scheme
+		"https://?x=hunter2",                                     // no host
+		"https://example.com/?token=hunter2",                     // query
+		"https://example.com/#hunter2",                           // fragment
+		"https://user:hunter2@example.com/",                      // userinfo
+		"https://hunter2@example.com/",
+		"://hunter2", // unparseable
 	} {
 		err := s.SetArtifactUpstream(bad)
 		if err == nil {
 			t.Errorf("SetArtifactUpstream(%q) accepted, want error", bad)
 			continue
 		}
-		if strings.Contains(bad, "hunter2") && strings.Contains(err.Error(), "hunter2") {
-			t.Errorf("rejection error echoes the password: %v", err)
+		if strings.Contains(err.Error(), "hunter2") {
+			t.Errorf("rejection error for %q echoes the input: %v", bad, err)
 		}
 	}
 	for _, good := range []string{DefaultArtifactUpstream, "http://10.0.0.1:8080", "https://ghes.example.com/_services/results/"} {
