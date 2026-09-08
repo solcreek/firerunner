@@ -114,6 +114,7 @@ func cacheServe(args []string) error {
 	maxSize := fs.String("max-size", "50GB", "evict least-recently-used entries above this total size (e.g. 50GB, 0 for unlimited)")
 	maxEntry := fs.String("max-entry-size", "10GB", "refuse any single cache entry larger than this (e.g. 10GB, 0 for unlimited)")
 	repo := fs.String("repository", "", "pin every entry to this tenant, ignoring the unauthenticated client repository_id; set it (e.g. owner/name) so one server safely serves a single repository")
+	artifactUpstream := fs.String("artifact-upstream", cacheserver.DefaultArtifactUpstream, "Results endpoint to forward ArtifactService RPCs (upload/download-artifact v4+) to, since a cache-redirect golden diverts them here along with the cache; defaults to github.com's, accepts any protocol-compatible upstream, or empty to refuse artifact RPCs")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -137,6 +138,12 @@ func cacheServe(args []string) error {
 	srv.SetRepository(*repo)
 	if *repo == "" {
 		log.Warn("cache server not pinned to a repository; the unauthenticated client repository_id is trusted and caches are not isolated across repositories — pass --repository to serve a single repo safely")
+	}
+	if err := srv.SetArtifactUpstream(*artifactUpstream); err != nil {
+		return fmt.Errorf("--artifact-upstream: %w", err)
+	}
+	if *artifactUpstream == "" {
+		log.Warn("artifact forwarding disabled; actions/upload-artifact and download-artifact will fail on cache-redirect goldens — pass --artifact-upstream to forward them to GitHub")
 	}
 	stopJanitor := srv.StartJanitor()
 	defer stopJanitor()
@@ -163,7 +170,7 @@ func cacheServe(args []string) error {
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
-	log.Info("cache-server listening", "addr", *addr, "dir", *dir, "max_size", *maxSize)
+	log.Info("cache-server listening", "addr", *addr, "dir", *dir, "max_size", *maxSize, "artifact_upstream", *artifactUpstream)
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
@@ -230,6 +237,10 @@ cache-server flags:
   --repository string  pin every entry to this tenant, ignoring the
                      unauthenticated client repository_id; set it (e.g.
                      owner/name) so one server safely serves a single repository
+  --artifact-upstream string  forward ArtifactService RPCs (upload/download-
+                     artifact v4+, which share ACTIONS_RESULTS_URL with the
+                     cache) to this Results endpoint so artifacts stay on GitHub
+                     (default github.com's results-receiver; "" refuses them)
 `)
 }
 

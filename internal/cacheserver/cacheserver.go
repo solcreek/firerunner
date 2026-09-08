@@ -25,6 +25,19 @@
 // off disk with Range support. Signed URLs are built from the request's Host
 // header so each microVM reaches the server on its own per-slot gateway IP.
 //
+// # Artifacts
+//
+// ACTIONS_RESULTS_URL is shared by a second Twirp service, ArtifactService
+// (actions/upload-artifact and download-artifact v4+), so a cache-redirect
+// golden diverts artifact RPCs here as well. Artifacts are user-facing
+// deliverables that must stay visible in the GitHub UI, API and `gh run
+// download`, so instead of storing them the server forwards that one service
+// to the real GitHub Results endpoint (SetArtifactUpstream) and relays the
+// reply verbatim; the archive itself then flows between the guest and the
+// signed blob URL GitHub returns, exactly as it would without any redirect:
+//
+//	POST /twirp/github.actions.results.api.v1.ArtifactService/<Method>  -> upstream
+//
 // # Isolation and trust model
 //
 // This server performs NO authentication and cannot cryptographically isolate
@@ -59,12 +72,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httputil"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -112,25 +127,38 @@ type Server struct {
 	misses    uint64
 	saves     uint64
 	evictions uint64
+
+	// artifactProxy forwards ArtifactService RPCs to GitHub (nil = disabled).
+	// It and its counters are atomic so the proxy path never waits on the
+	// index lock, which cache hit/finalize paths hold across index writes.
+	artifactProxy   atomic.Pointer[httputil.ReverseProxy]
+	artifactTimeout time.Duration
+	artifactRPCs    atomic.Uint64
+	artifactErrors  atomic.Uint64
 }
 
 // Stats is a point-in-time snapshot of the cache store, served by /stats and
 // /metrics and consumed by `firerunner status`.
 type Stats struct {
-	Entries   int    `json:"entries"`   // completed entries currently stored
-	Bytes     int64  `json:"bytes"`     // total size of completed blobs
-	MaxBytes  int64  `json:"max_bytes"` // configured cap (0 = unlimited)
-	Hits      uint64 `json:"hits"`      // download-URL lookups that matched
-	Misses    uint64 `json:"misses"`    // download-URL lookups that did not
-	Saves     uint64 `json:"saves"`     // entries finalized
-	Evictions uint64 `json:"evictions"` // entries removed by the size cap
+	Entries        int    `json:"entries"`         // completed entries currently stored
+	Bytes          int64  `json:"bytes"`           // total size of completed blobs
+	MaxBytes       int64  `json:"max_bytes"`       // configured cap (0 = unlimited)
+	Hits           uint64 `json:"hits"`            // download-URL lookups that matched
+	Misses         uint64 `json:"misses"`          // download-URL lookups that did not
+	Saves          uint64 `json:"saves"`           // entries finalized
+	Evictions      uint64 `json:"evictions"`       // entries removed by the size cap
+	ArtifactRPCs   uint64 `json:"artifact_rpcs"`   // ArtifactService RPCs forwarded upstream
+	ArtifactErrors uint64 `json:"artifact_errors"` // artifact RPCs refused, failed, or answered 5xx
 }
 
 // snapshot collects current stats. The caller must NOT hold s.mu.
 func (s *Server) snapshot() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st := Stats{MaxBytes: s.maxSize, Hits: s.hits, Misses: s.misses, Saves: s.saves, Evictions: s.evictions}
+	st := Stats{
+		MaxBytes: s.maxSize, Hits: s.hits, Misses: s.misses, Saves: s.saves, Evictions: s.evictions,
+		ArtifactRPCs: s.artifactRPCs.Load(), ArtifactErrors: s.artifactErrors.Load(),
+	}
 	for _, e := range s.entries {
 		if e.Complete {
 			st.Entries++
@@ -200,11 +228,12 @@ func New(dir string, log *slog.Logger) (*Server, error) {
 		return nil, fmt.Errorf("chmod cache dir %q: %w", dir, err)
 	}
 	s := &Server{
-		dir:     dir,
-		log:     log.With("module", "cacheserver"),
-		entries: make(map[uint64]*Entry),
-		staged:  make(map[uint64]int64),
-		nextID:  1,
+		dir:             dir,
+		log:             log.With("module", "cacheserver"),
+		entries:         make(map[uint64]*Entry),
+		staged:          make(map[uint64]int64),
+		nextID:          1,
+		artifactTimeout: defaultArtifactRPCTimeout,
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -214,6 +243,7 @@ func New(dir string, log *slog.Logger) (*Server, error) {
 	s.mux.HandleFunc("POST "+twirpBase+"CreateCacheEntry", s.handleCreate)
 	s.mux.HandleFunc("POST "+twirpBase+"FinalizeCacheEntryUpload", s.handleFinalize)
 	s.mux.HandleFunc("POST "+twirpBase+"GetCacheEntryDownloadURL", s.handleGetDownloadURL)
+	s.mux.HandleFunc("POST "+artifactTwirpBase+"{method}", s.handleArtifactProxy)
 	s.mux.HandleFunc("PUT /upload/{id}", s.handleUpload)
 	s.mux.HandleFunc("GET /download/{id}", s.handleDownload)
 	s.mux.HandleFunc("HEAD /download/{id}", s.handleDownload)
@@ -659,6 +689,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# TYPE firerunner_cache_saves_total counter\nfirerunner_cache_saves_total %d\n", st.Saves)
 	fmt.Fprintf(w, "# HELP firerunner_cache_evictions_total Entries removed by the size cap.\n")
 	fmt.Fprintf(w, "# TYPE firerunner_cache_evictions_total counter\nfirerunner_cache_evictions_total %d\n", st.Evictions)
+	fmt.Fprintf(w, "# HELP firerunner_artifact_rpcs_total ArtifactService RPCs forwarded to the upstream.\n")
+	fmt.Fprintf(w, "# TYPE firerunner_artifact_rpcs_total counter\nfirerunner_artifact_rpcs_total %d\n", st.ArtifactRPCs)
+	fmt.Fprintf(w, "# HELP firerunner_artifact_errors_total Artifact RPCs refused, failed, or answered 5xx.\n")
+	fmt.Fprintf(w, "# TYPE firerunner_artifact_errors_total counter\nfirerunner_artifact_errors_total %d\n", st.ArtifactErrors)
 }
 
 // authEntry resolves and authorizes the {id} + ?sig= on a blob request.

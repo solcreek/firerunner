@@ -485,6 +485,35 @@ firerunner ... --golden /var/lib/firerunner/ubuntu-rootfs-minimal.ext4 --cache-p
 cache-server for reachability; both note that the cache is off by default and
 that jobs fall back to GitHub's hosted cache when it is not configured.
 
+**Artifacts keep going to GitHub.** `ACTIONS_RESULTS_URL` is not only the cache
+endpoint: `actions/upload-artifact` and `download-artifact` (v4+) talk to a
+second Twirp service, `ArtifactService`, at the same URL. A cache-redirect
+golden therefore sends artifact RPCs to the cache-server too — and artifacts are
+user-facing deliverables that must remain visible in the GitHub UI, the API and
+`gh run download`, so storing them locally would silently break every consumer
+outside the job. The cache-server instead **forwards** that one service to the
+real GitHub Results endpoint and relays the reply verbatim, bearer token and
+Twirp error envelopes included. Only the small JSON RPCs take this hop; the
+archive itself flows between the guest and the signed
+`productionresultssa*.blob.core.windows.net` URL GitHub returns, exactly as it
+does without any redirect (so an egress allowlist needs nothing new). The
+upstream defaults to github.com's `results-receiver.actions.githubusercontent.com`.
+This is a github.com feature for now: `upload-artifact@v4+` is not supported on
+GitHub Enterprise Server, so there is no GHES ArtifactService endpoint to point
+at. `--artifact-upstream` is still a flag rather than a constant so a
+protocol-compatible upstream can be substituted (a test double, a future GHES
+service) without a rebuild:
+
+```bash
+firerunner cache-server ... --artifact-upstream https://results.example.internal/
+```
+
+Setting `--artifact-upstream ""` refuses artifact RPCs outright (a Twirp
+`unimplemented` error naming the flag) — useful only where jobs never upload
+artifacts. `status` reports forwarded artifact RPCs and errors next to the cache
+hit rate, and `/metrics` exposes them as `firerunner_artifact_rpcs_total` /
+`firerunner_artifact_errors_total`.
+
 **Security model.** This server performs **no authentication** and cannot
 cryptographically isolate repositories: the `ACTIONS_RUNTIME_TOKEN` a runner
 presents is signed by an internal GitHub key with no public JWKS, so a
@@ -509,6 +538,17 @@ structurally by running **one cache-server per repository** and pinning it:
   LAN/WAN client can reach it.
 - Assume any job that can reach it can read and overwrite every entry within its
   tenant (a fork-PR job can poison a cache a later trusted job restores).
+- The artifact forwarder is not a general proxy: it relays exactly the five
+  `ArtifactService` methods the toolkit calls (anything else, including an
+  encoded dot-segment aimed at another service, is refused before forwarding),
+  only via `POST`, only to the single operator-configured
+  `--artifact-upstream`, with request bodies capped at 1 MiB and each RPC
+  bounded by a 2-minute end-to-end deadline. The guest's
+  `ACTIONS_RUNTIME_TOKEN` is passed through to that host alone (it is GitHub's
+  credential for GitHub's service), no `X-Forwarded-*` headers are added, and
+  hop failures come back as generic Twirp errors — the upstream address and
+  transport details stay in the server log — so a guest cannot steer the hop
+  elsewhere or learn anything about the host.
 
 Uploads are bounded per-entry (`--max-entry-size`, default 10GB) and in total
 (`--max-size`), and finalized entries are immutable.

@@ -3,11 +3,14 @@ package diag
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/solcreek/firerunner/internal/cacheserver"
 	"github.com/solcreek/firerunner/internal/config"
 	"github.com/solcreek/firerunner/internal/provisioner"
 )
@@ -336,6 +339,68 @@ func TestStatus_Cache(t *testing.T) {
 	}
 	if !strings.Contains(uText.String(), "http://cache.internal:8099") {
 		t.Errorf("url status missing URL\n%s", uText.String())
+	}
+}
+
+// TestStatus_CacheStats ensures live cache-server numbers, including the
+// artifact-forwarding counters, are fetched from /stats and rendered: the
+// artifact line appears exactly when there is something to report, and both
+// forwarded RPCs and errors are shown.
+func TestStatus_CacheStats(t *testing.T) {
+	serve := func(st cacheserver.Stats) *config.Config {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/stats" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(st)
+		}))
+		t.Cleanup(ts.Close)
+		return &config.Config{ScaleSetName: "firerunner", Firecracker: provisioner.FirecrackerConfig{
+			WorkDir: t.TempDir(), TapPrefix: "fr", NetBase: 16, CacheURL: ts.URL,
+		}}
+	}
+	render := func(cfg *config.Config) string {
+		var buf bytes.Buffer
+		if err := Status(cfg, "test", &buf, false); err != nil {
+			t.Fatalf("Status: %v", err)
+		}
+		return buf.String()
+	}
+
+	// Cache numbers only: no artifact line when nothing has been forwarded.
+	quiet := render(serve(cacheserver.Stats{Entries: 3, Bytes: 2048, Hits: 7, Misses: 1}))
+	if !strings.Contains(quiet, "3 entries") || !strings.Contains(quiet, "7 hit / 1 miss") {
+		t.Errorf("cache stats not rendered\n%s", quiet)
+	}
+	if strings.Contains(quiet, "artifact") {
+		t.Errorf("artifact line shown with zero counters\n%s", quiet)
+	}
+
+	// Forwarded RPCs and errors are both reported.
+	busy := render(serve(cacheserver.Stats{Entries: 3, ArtifactRPCs: 42, ArtifactErrors: 2}))
+	if !strings.Contains(busy, "42 artifact rpcs forwarded upstream, 2 errors") {
+		t.Errorf("artifact counters not rendered\n%s", busy)
+	}
+
+	// Errors alone (e.g. forwarding disabled) still surface.
+	failing := render(serve(cacheserver.Stats{ArtifactErrors: 5}))
+	if !strings.Contains(failing, "0 artifact rpcs forwarded upstream, 5 errors") {
+		t.Errorf("error-only artifact counters not rendered\n%s", failing)
+	}
+
+	// The JSON report carries the raw counters for tooling.
+	var out bytes.Buffer
+	if err := Status(serve(cacheserver.Stats{ArtifactRPCs: 9, ArtifactErrors: 1}), "test", &out, true); err != nil {
+		t.Fatalf("Status json: %v", err)
+	}
+	var r StatusReport
+	if err := json.Unmarshal(out.Bytes(), &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if r.Cache == nil || r.Cache.Stats == nil || r.Cache.Stats.ArtifactRPCs != 9 || r.Cache.Stats.ArtifactErrors != 1 {
+		t.Errorf("json stats = %+v, want artifact_rpcs=9 artifact_errors=1", r.Cache)
 	}
 }
 
