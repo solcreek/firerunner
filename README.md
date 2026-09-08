@@ -533,6 +533,22 @@ artifacts. `status` reports forwarded artifact RPCs and errors next to the cache
 hit rate, and `/metrics` exposes them as `firerunner_artifact_rpcs_total` /
 `firerunner_artifact_errors_total`.
 
+**Jobs that run in a container.** A `container:` job does not run its steps in
+the runner's process environment: the runner launches each one with
+`docker exec -e KEY` for exactly the keys in its own step-environment table,
+which (on a cache-redirect golden) holds only the renamed, dead
+`ACTIONS_RESULTS_ORL`. The
+`ACTIONS_RESULTS_URL` the boot script exported would never enter the container,
+so cache would silently miss and `upload-artifact` would fail. Docker-toolset
+goldens (`base`/`full`) therefore install a small shim ahead of `/usr/bin/docker`
+on `PATH` that adds `-e ACTIONS_RESULTS_URL=…` and `-e ACTIONS_CACHE_SERVICE_V2=…`
+(forwarding the runner's value, else `true`, so `actions/cache` speaks the v2
+protocol the cache-server implements) to the runner's own `docker create` — the
+job container's create-time environment is inherited by every later `docker
+exec`. The shim acts only when the variable is set, only for
+`create`, and only when the caller is `Runner.Worker`; a job's own `docker`
+commands pass through untouched, and on a non-redirect golden it is inert.
+
 **Security model.** This server performs **no authentication** and cannot
 cryptographically isolate repositories: the `ACTIONS_RUNTIME_TOKEN` a runner
 presents is signed by an internal GitHub key with no public JWKS, so a
