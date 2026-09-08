@@ -129,8 +129,9 @@ type FirecrackerConfig struct {
 	MaxVMLifetime time.Duration
 
 	// ConnectTimeout, when non-zero, bounds how long a freshly booted microVM
-	// may take to register with GitHub (the runner's "Listening for Jobs" on
-	// the console) before firerunner kills it and frees its slot. A VM that
+	// may take to register with GitHub — the runner's "Listening for Jobs" on
+	// the console, or "Running job:" when a job is dequeued before the idle
+	// line ever prints — before firerunner kills it and frees its slot. A VM that
 	// never connects — no route or DNS to GitHub, a rejected JIT config, a
 	// broken golden — would otherwise sit idle holding a slot for the whole
 	// MaxVMLifetime while the scheduler saw a healthy running VM. The kill is

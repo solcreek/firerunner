@@ -333,7 +333,8 @@ hostage. Two host-side deadlines reclaim it:
   still running after this long, however it got there (hung guest, wedged job).
   Keep it longer than your longest real job.
 
-Both are `0` to disable; the connect timeout must be shorter than the lifetime.
+Both are `0` to disable. When both are set, the connect timeout must be shorter
+than the lifetime (otherwise it could never fire first).
 
 ### Pre-seeded tool cache (`--toolcache`, opt-in)
 
