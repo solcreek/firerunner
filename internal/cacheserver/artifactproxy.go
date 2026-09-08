@@ -20,7 +20,8 @@ const (
 	// artifacts. The runner receives it per job as ResultsServiceUrl and would
 	// have exported it as ACTIONS_RESULTS_URL; a cache-redirect golden diverts
 	// that variable here, so the server has to know where to send artifact
-	// traffic back to. GHES deployments override it with SetArtifactUpstream.
+	// traffic back to. SetArtifactUpstream substitutes any protocol-compatible
+	// endpoint (upload-artifact v4+ has no GHES service to point at today).
 	DefaultArtifactUpstream = "https://results-receiver.actions.githubusercontent.com/"
 
 	// maxArtifactRPCBody bounds a forwarded Twirp request body. Artifact RPCs
@@ -35,6 +36,11 @@ const (
 	// The per-phase transport timeouts stop once headers arrive; this is the
 	// deadline that covers everything after that as well.
 	defaultArtifactRPCTimeout = 2 * time.Minute
+
+	// artifactWriteGrace is how much longer than the RPC deadline the client
+	// socket stays writable, so the deadline's own Twirp error envelope can
+	// still reach a client whose read side has just been cut off.
+	artifactWriteGrace = 5 * time.Second
 )
 
 // artifactMethods is the complete ArtifactService surface the @actions/artifact
@@ -137,6 +143,16 @@ func (s *Server) handleArtifactProxy(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.artifactTimeout)
 	defer cancel()
 	r = r.WithContext(ctx)
+	// The context bounds the upstream hop, but not the accepted client socket:
+	// the enclosing http.Server sets no ReadTimeout, so a client that declares
+	// a Content-Length, sends one byte and stalls would keep the body read (and
+	// this handler) open past the deadline. Put the same bound on the socket
+	// itself, route-locally, so the unlimited cache upload paths are unaffected.
+	// The write deadline gets a little slack so the timeout's own error
+	// envelope can still be delivered after the read side has expired.
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Now().Add(s.artifactTimeout))
+	_ = rc.SetWriteDeadline(time.Now().Add(s.artifactTimeout + artifactWriteGrace))
 	r.Body = http.MaxBytesReader(w, r.Body, maxArtifactRPCBody)
 	s.artifactRPCs.Add(1)
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
@@ -169,10 +185,13 @@ func (s *Server) artifactProxyError(w http.ResponseWriter, r *http.Request, err 
 	}
 	code, twirpCode, msg := http.StatusBadGateway, "unavailable", "artifact upstream unavailable"
 	var mbe *http.MaxBytesError
+	var ne net.Error
 	switch {
 	case errors.As(err, &mbe):
 		code, twirpCode, msg = http.StatusRequestEntityTooLarge, "invalid_argument", "artifact rpc body too large"
-	case errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
+		// Either the RPC context expired or the client-socket read deadline
+		// tripped while relaying a stalled request body.
 		code, twirpCode, msg = http.StatusGatewayTimeout, "deadline_exceeded", "artifact rpc timed out"
 	}
 	s.log.Warn("artifact rpc failed", "method", r.PathValue("method"), "err", err)

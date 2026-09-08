@@ -1,6 +1,7 @@
 package cacheserver
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -711,5 +712,96 @@ func TestArtifactProxyCountsTruncatedUpstreamReply(t *testing.T) {
 	}
 	if s.artifactRPCs.Load() != 1 || s.artifactErrors.Load() != 1 {
 		t.Fatalf("counters rpcs=%d errors=%d, want 1/1", s.artifactRPCs.Load(), s.artifactErrors.Load())
+	}
+}
+
+// TestArtifactProxyTimeoutCoversStalledClientBody checks the bound on the
+// accepted client socket: a request that declares a Content-Length, sends one
+// byte and then stalls must not hold the handler open past the deadline. The
+// RPC context alone cannot do this (it bounds the upstream hop, not the client
+// read), which is why the handler also sets a route-local read deadline.
+func TestArtifactProxyTimeoutCoversStalledClientBody(t *testing.T) {
+	up, upTS := newUpstream(t, http.StatusOK, `{}`)
+	s, front := newArtifactServer(t, upTS.URL)
+	s.artifactTimeout = 200 * time.Millisecond
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(front.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	start := time.Now()
+	fmt.Fprintf(conn, "POST %sCreateArtifact HTTP/1.1\r\nHost: cache\r\nContent-Type: application/json\r\nContent-Length: 40\r\n\r\n{",
+		artifactTwirpBase)
+	// ...and never send the remaining 39 bytes.
+
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("no response to a stalled body within 5s (handler held open?): %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("stalled client body held the handler open %v", elapsed)
+	}
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504: %s", resp.StatusCode, raw)
+	}
+	if code, msg := decodeTwirpErr(t, raw); code != "deadline_exceeded" || msg != "artifact rpc timed out" {
+		t.Fatalf("envelope = %s", raw)
+	}
+	if s.artifactErrors.Load() != 1 {
+		t.Fatalf("artifact_errors = %d, want 1", s.artifactErrors.Load())
+	}
+	// Whatever reached the upstream, it was never a complete 40-byte body.
+	if up.count() > 0 && len(up.last(t).body) >= 40 {
+		t.Fatalf("upstream received a full body from a stalled client")
+	}
+}
+
+// TestArtifactProxyDeadlineIsRouteLocal checks the socket deadlines set for an
+// artifact RPC do not bleed into the cache paths, which legitimately stream
+// large blobs with no overall deadline: a cache upload on a fresh connection
+// after an artifact timeout is unaffected.
+func TestArtifactProxyDeadlineIsRouteLocal(t *testing.T) {
+	_, upTS := newUpstream(t, http.StatusOK, `{}`)
+	s, front := newArtifactServer(t, upTS.URL)
+	s.artifactTimeout = 100 * time.Millisecond
+
+	// Trip an artifact deadline first.
+	conn, err := net.Dial("tcp", strings.TrimPrefix(front.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(conn, "POST %sCreateArtifact HTTP/1.1\r\nHost: cache\r\nContent-Length: 10\r\n\r\n{", artifactTwirpBase)
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := http.ReadResponse(bufio.NewReader(conn), nil); err != nil {
+		t.Fatalf("artifact timeout reply: %v", err)
+	}
+	conn.Close()
+
+	// A slow cache upload that takes longer than the artifact deadline still
+	// succeeds end to end.
+	create := twirp(t, front.URL, "CreateCacheEntry", createReq{Key: "slow", Version: "v1"})
+	if create["ok"] != true {
+		t.Fatalf("create: %v", create)
+	}
+	pr, pw := io.Pipe()
+	go func() {
+		pw.Write([]byte("half-"))
+		time.Sleep(300 * time.Millisecond) // > artifactTimeout
+		pw.Write([]byte("blob"))
+		pw.Close()
+	}()
+	req, _ := http.NewRequest(http.MethodPut, create["signed_upload_url"].(string), pr)
+	req.Header.Set("x-ms-blob-type", "BlockBlob")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("slow cache upload: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("slow cache upload -> %d, want 201 (artifact deadline leaked into cache path?)", resp.StatusCode)
 	}
 }
