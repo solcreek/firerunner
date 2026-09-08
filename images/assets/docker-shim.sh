@@ -27,11 +27,19 @@
 # Runner.Worker — a job's own docker usage passes through untouched.
 set -eu
 
+# Test hooks (FIRERUNNER_SHIM_REAL_DOCKER substitutes the real binary,
+# FIRERUNNER_SHIM_PPID the parent pid) are honoured only when the shim is NOT
+# being run by Runner.Worker itself. The runner merges a step's environment —
+# including workflow-defined `env:` — into the docker CLI it spawns for
+# `docker exec`, so without this a workflow could steer the runner's own docker
+# calls; with it, production calls always use the fixed lookup and the real
+# parent, and a job can only ever decorate its own invocations.
+if [ "$(cat "/proc/$PPID/comm" 2>/dev/null || true)" = "Runner.Worker" ]; then
+	unset FIRERUNNER_SHIM_REAL_DOCKER FIRERUNNER_SHIM_PPID
+fi
+
 # The real binary is looked up in fixed locations that exclude this shim's own
-# directory, so the shim can never re-exec itself. FIRERUNNER_SHIM_REAL_DOCKER
-# lets the test suite substitute a fake; like FIRERUNNER_SHIM_PPID below it
-# crosses no privilege boundary (a job already controls its own processes, and
-# cannot reach the runner's environment).
+# directory, so the shim can never re-exec itself.
 real="${FIRERUNNER_SHIM_REAL_DOCKER:-}"
 if [ -z "$real" ]; then
 	for d in /usr/bin /bin /usr/sbin; do
@@ -46,8 +54,6 @@ if [ -z "$real" ] || [ ! -x "$real" ]; then
 	exit 127
 fi
 
-# FIRERUNNER_SHIM_PPID exists so the test suite can stand in for the runner;
-# a job that sets it only ever decorates its own containers.
 inject=0
 if [ -n "${ACTIONS_RESULTS_URL:-}" ] && [ "${1:-}" = "create" ]; then
 	parent="$(cat "/proc/${FIRERUNNER_SHIM_PPID:-$PPID}/comm" 2>/dev/null || true)"

@@ -122,6 +122,32 @@ case "$rc" in
 	*)   echo "FAIL recursion guard: rc=$rc out=$out"; fails=$((fails+1));;
 esac
 
+# 9b. Test hooks are ignored when Runner.Worker itself runs the shim. A bash
+#     copy named Runner.Worker execs the shim with FIRERUNNER_SHIM_REAL_DOCKER
+#     pointing at a decoy: the decoy must not run, and the call must fall back
+#     to the fixed lookup (real docker's --version, or 127 with no docker).
+cp "$BASH_BIN" "$TMP/Runner.Worker.bash"; mv "$TMP/Runner.Worker.bash" "$TMP/rw/Runner.Worker" 2>/dev/null || { mkdir -p "$TMP/rw"; mv "$TMP/Runner.Worker.bash" "$TMP/rw/Runner.Worker"; }
+cat > "$TMP/decoy" <<'DECOY'
+#!/usr/bin/env bash
+echo DECOY-RAN > "$DECOY_MARKER"; echo "Docker version decoy"; exit 0
+DECOY
+chmod +x "$TMP/decoy"; rm -f "$TMP/decoy.marker"
+set +e
+out="$(DECOY_MARKER="$TMP/decoy.marker" FIRERUNNER_SHIM_REAL_DOCKER="$TMP/decoy" FIRERUNNER_SHIM_PPID="$WORKER_PID" \
+	timeout 10 "$TMP/rw/Runner.Worker" -c '"$0" --version; exit $?' "$SHIM" 2>&1)"; rc=$?
+# (the trailing `exit $?` stops bash from tail-call exec'ing the shim, so its
+# parent really is the process named Runner.Worker)
+set -e
+if [ -e "$TMP/decoy.marker" ]; then
+	echo "FAIL Runner.Worker-run shim honoured FIRERUNNER_SHIM_REAL_DOCKER"; fails=$((fails+1))
+elif [ "$rc" = 0 ] && [[ "$out" == Docker\ version* ]] && [[ "$out" != *decoy* ]]; then
+	echo "ok   test hooks ignored under Runner.Worker (real docker used)"
+elif [ "$rc" = 127 ] && [[ "$out" == *"real docker binary not found"* ]]; then
+	echo "ok   test hooks ignored under Runner.Worker (no real docker, rc=127)"
+else
+	echo "FAIL hooks-under-runner: rc=$rc out=$out"; fails=$((fails+1))
+fi
+
 # 10. The environment reaches the real docker verbatim — including names that
 #     are not valid shell identifiers. The runner passes step inputs as
 #     `-e INPUT_INCLUDE-HIDDEN-FILES` and relies on the docker CLI reading the
