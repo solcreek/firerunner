@@ -338,5 +338,23 @@ func (s *Scheduler) Running() int {
 	return s.running
 }
 
+// Capacity returns how many jobs this tier can hold concurrently right now:
+// the microVMs already in flight (each takes one job) plus whatever the shared
+// slot pool could still launch, capped at the tier's Max. It is what the
+// listener advertises to GitHub as the scale set's capacity, so the number must
+// not exceed what the host can actually serve — otherwise GitHub assigns the
+// job here and it queues behind the pool while a sibling host sits idle. A
+// provisioner without a shared pool has no such constraint, so Max stands.
+func (s *Scheduler) Capacity() int {
+	s.mu.Lock()
+	running := s.running
+	s.mu.Unlock()
+	sr, ok := s.opts.Provisioner.(provisioner.SlotReporter)
+	if !ok {
+		return s.opts.Max
+	}
+	return min(s.opts.Max, running+sr.FreeSlots())
+}
+
 // Drain blocks until all in-flight microVMs have exited.
 func (s *Scheduler) Drain() { s.wg.Wait() }
