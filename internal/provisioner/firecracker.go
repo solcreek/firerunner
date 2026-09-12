@@ -209,6 +209,10 @@ func NewFirecracker(cfg FirecrackerConfig, log *slog.Logger) *Firecracker {
 // Name implements Provisioner.
 func (f *Firecracker) Name() string { return "firecracker" }
 
+// FreeSlots implements SlotReporter with the network slot pool, which is the
+// shared --max-runners budget every tier draws from.
+func (f *Firecracker) FreeSlots() int { return f.ipam.available() }
+
 // Launch implements Provisioner: reflink-clone the golden rootfs, allocate a
 // per-VM network slot, create a tap, boot the microVM with the JIT config
 // delivered via MMDS v2, then block until the guest self-destructs (reboot -f)

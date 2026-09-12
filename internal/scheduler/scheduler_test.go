@@ -24,6 +24,15 @@ func (p provFunc) Launch(ctx context.Context, name, jit string, spec core.Runner
 }
 func (provFunc) Name() string { return "fake" }
 
+// slotProv is a provFunc that also reports a shared-pool free count, like the
+// Firecracker provisioner does.
+type slotProv struct {
+	provFunc
+	free int
+}
+
+func (p slotProv) FreeSlots() int { return p.free }
+
 type jitStub struct{}
 
 func (jitStub) Generate(context.Context, core.RunnerSpec) (string, string, error) {
@@ -84,6 +93,57 @@ func TestReconcileRespectsMaxAndDrains(t *testing.T) {
 	s.Drain()
 	if got := s.Running(); got != 0 {
 		t.Fatalf("running=%d want 0 after drain", got)
+	}
+}
+
+func TestCapacityIsRunningPlusFreeSlotsCappedAtMax(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 16)
+	launch := provFunc(func(ctx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		entered <- struct{}{}
+		<-release
+		return nil
+	})
+	prov := &slotProv{provFunc: launch, free: 1}
+	s := New(Options{Max: 4, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
+
+	// Nothing running, one slot free on the host: only one job can be held.
+	if got := s.Capacity(); got != 1 {
+		t.Fatalf("capacity=%d want 1 (0 running + 1 free)", got)
+	}
+
+	s.Reconcile(context.Background(), 2)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for launch to enter")
+		}
+	}
+	// Two in flight (each holds a job) and the pool is now dry: capacity is
+	// exactly what is already assigned, so GitHub should send nothing more.
+	prov.free = 0
+	if got := s.Capacity(); got != 2 {
+		t.Fatalf("capacity=%d want 2 (2 running + 0 free)", got)
+	}
+	// The pool recovering never lifts capacity above the tier's own max.
+	prov.free = 10
+	if got := s.Capacity(); got != 4 {
+		t.Fatalf("capacity=%d want 4 (min(max=4, 2+10))", got)
+	}
+
+	close(release)
+	s.Drain()
+	if got := s.Capacity(); got != 4 {
+		t.Fatalf("capacity=%d want 4 after drain with a full pool", got)
+	}
+}
+
+func TestCapacityWithoutSlotReporterIsMax(t *testing.T) {
+	prov := provFunc(func(context.Context, string, string, core.RunnerSpec, func()) error { return nil })
+	s := New(Options{Max: 3, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
+	if got := s.Capacity(); got != 3 {
+		t.Fatalf("capacity=%d want Max(3) when the provisioner has no shared pool", got)
 	}
 }
 
