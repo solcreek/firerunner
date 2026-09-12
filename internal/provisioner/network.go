@@ -157,6 +157,13 @@ func (p *ipam) acquire() (int, bool) {
 	return slot, true
 }
 
+// available reports how many slots are currently free.
+func (p *ipam) available() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.free)
+}
+
 // release returns a slot to the pool.
 func (p *ipam) release(slot int) {
 	p.mu.Lock()
