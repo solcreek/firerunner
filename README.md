@@ -265,6 +265,25 @@ build/test/lint/SAST jobs that never touch Docker; Docker jobs stay on
 real CodeQL run it matches the full image's speed at a fraction of the size
 (CodeQL bundle served from the drive, no per-run download).
 
+#### Several hosts behind one `runs-on` (active-active)
+
+GitHub lets two scale sets share a name as long as they sit in **different
+runner groups**; jobs for that name are then assigned to whichever one is free
+and either host keeps serving if the other goes away. Run the same tier catalog
+on each host with a different `--runner-group` / `FR_RUNNER_GROUP` and no
+workflow has to change.
+
+What makes this work under load is that each tier advertises its **live**
+capacity to GitHub on every poll — the microVMs it already has in flight plus
+whatever the host's `--max-runners` pool could still launch, capped at the
+tier's `max` — rather than the static `max` alone. A host whose pool is
+exhausted therefore reports "no room", GitHub assigns nothing more to it, and
+the sibling host picks the job up instead of it queuing behind a full pool.
+`firerunner` logs `advertising capacity` whenever the number changes. The
+advertised value never drops below 1: the back-end's reading of a zero capacity
+is undocumented, so a tier with nothing running on a full host may still be
+handed one job, which then waits for the next free slot.
+
 ### Inspecting a deployment (`status`, `doctor`)
 
 Two read-only subcommands help operators inspect and diagnose a runner host.
