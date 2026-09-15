@@ -41,22 +41,27 @@ func (jitStub) Generate(context.Context, core.RunnerSpec) (string, string, error
 
 func TestPlan(t *testing.T) {
 	cases := []struct {
-		name                  string
-		desired, running, max int
-		want                  int
+		name                        string
+		desired, live, running, max int
+		want                        int
 	}{
-		{"none wanted", 0, 0, 4, 0},
-		{"scale from zero", 3, 0, 4, 3},
-		{"bounded by max", 10, 0, 4, 4},
-		{"partial capacity", 10, 3, 4, 1},
-		{"at capacity", 4, 4, 4, 0},
-		{"desired below running", 1, 3, 4, 0},
-		{"over capacity running", 10, 5, 4, 0},
+		{"none wanted", 0, 0, 0, 4, 0},
+		{"scale from zero", 3, 0, 0, 4, 3},
+		{"bounded by max", 10, 0, 0, 4, 4},
+		{"partial capacity", 10, 3, 3, 4, 1},
+		{"at capacity", 4, 4, 4, 4, 0},
+		{"desired below running", 1, 3, 3, 4, 0},
+		{"over capacity running", 10, 5, 5, 4, 0},
+		// A launch in backoff or a VM tearing down is in running but not live:
+		// demand still gets a fresh launch, within the concurrency bound.
+		{"demand ignores a launch in backoff", 1, 0, 1, 4, 1},
+		{"but running still bounds the attempts", 3, 0, 4, 4, 0},
+		{"room left after dead entries", 3, 1, 2, 4, 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := plan(tc.desired, tc.running, tc.max); got != tc.want {
-				t.Fatalf("plan(%d,%d,%d)=%d want %d", tc.desired, tc.running, tc.max, got, tc.want)
+			if got := plan(tc.desired, tc.live, tc.running, tc.max); got != tc.want {
+				t.Fatalf("plan(%d,%d,%d,%d)=%d want %d", tc.desired, tc.live, tc.running, tc.max, got, tc.want)
 			}
 		})
 	}
@@ -397,11 +402,11 @@ func TestPendingSettlesBeforeJITFailureBackoff(t *testing.T) {
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
+	// backoff takes the lock a moment after enter() releases the reservation,
+	// so wait for the count to settle rather than sampling once.
+	waitCapacity(t, s, 3) // 0 live + min(Max-1 running, 3 free)
 	if got := s.Running(); got != 1 {
 		t.Fatalf("running=%d want 1: the goroutine should still be in backoff", got)
-	}
-	if got := s.Capacity(); got != 3 {
-		t.Fatalf("capacity=%d want 3 (0 live + 3 free, none reserved)", got)
 	}
 	s.Drain()
 }
@@ -421,12 +426,133 @@ func waitCapacity(t *testing.T, s *Scheduler, want int) {
 	}
 }
 
-func TestCapacityWithoutSlotReporterIsMax(t *testing.T) {
-	prov := provFunc(func(context.Context, string, string, core.RunnerSpec, func()) error { return nil })
+func TestReconcileServesDemandPastALaunchInBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var attempts int32
+	entered := make(chan struct{}, 8)
+	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			return errors.New("boot failed") // first attempt dies and backs off
+		}
+		entered <- struct{}{}
+		<-vmCtx.Done()
+		return nil
+	})
+	s := New(Options{Max: 4, Min: 0, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 1)
+	waitCapacity(t, s, 3) // the failed launch is in backoff: 0 live, room 3
+	if got := s.Running(); got != 1 {
+		t.Fatalf("running=%d want 1 (the launch in backoff)", got)
+	}
+
+	// GitHub's next callback still reports one assigned job. Before, plan
+	// measured it against running and launched nothing, leaving the job to
+	// wait out the backoff; it must get a fresh VM now.
+	s.Reconcile(ctx, 1)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("demand was not served while a failed launch backed off")
+	}
+	if got := s.Running(); got != 2 {
+		t.Fatalf("running=%d want 2 (one live, one in backoff)", got)
+	}
+	cancel()
+	s.Drain()
+}
+
+func TestReconcileServesDemandWhileCancelledVMsTearDown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{}, 8)
+	exit := make(chan struct{})
+	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		entered <- struct{}{}
+		<-vmCtx.Done()
+		<-exit
+		return nil
+	})
+	s := New(Options{Max: 4, Min: 0, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 2)
+	<-entered
+	<-entered
+	s.Reconcile(ctx, 0) // both cancelled, both stuck in teardown
+	if got := s.Running(); got != 2 {
+		t.Fatalf("running=%d want 2 while the cancelled VMs tear down", got)
+	}
+
+	// Demand returns before they have exited: neither can serve it.
+	s.Reconcile(ctx, 1)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("demand was not served while cancelled VMs tore down")
+	}
+	close(exit)
+	cancel()
+	s.Drain()
+}
+
+func TestScaleDownDoesNotCancelALiveVMForALaunchInBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var attempts int32
+	entered := make(chan struct{}, 8)
+	cancelled := make(chan struct{}, 8)
+	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			return errors.New("boot failed")
+		}
+		entered <- struct{}{}
+		<-vmCtx.Done()
+		cancelled <- struct{}{}
+		return nil
+	})
+	s := New(Options{Max: 4, Min: 0, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 2)
+	<-entered
+	waitCapacity(t, s, 3) // 1 live + room 2 (running=2 with one in backoff)
+
+	// Demand holds at 1: the live VM is exactly what is needed. Measured
+	// against running (2) it would look like excess and be cancelled.
+	s.Reconcile(ctx, 1)
+	select {
+	case <-cancelled:
+		t.Fatal("the only live VM was cancelled to make room for a launch in backoff")
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	s.Drain()
+}
+
+func TestCapacityWithoutSlotReporterIsBoundedOnlyByMax(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 8)
+	prov := provFunc(func(ctx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		entered <- struct{}{}
+		<-release
+		return nil
+	})
 	s := New(Options{Max: 3, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
 	if got := s.Capacity(); got != 3 {
 		t.Fatalf("capacity=%d want Max(3) when the provisioner has no shared pool", got)
 	}
+	s.Reconcile(context.Background(), 2)
+	for i := 0; i < 2; i++ {
+		<-entered
+	}
+	if got := s.Capacity(); got != 3 {
+		t.Fatalf("capacity=%d want 3 (2 live + 1 room)", got)
+	}
+	close(release)
+	s.Drain()
 }
 
 func TestReconcileZeroDoesNothing(t *testing.T) {
