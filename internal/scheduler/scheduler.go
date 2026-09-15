@@ -180,7 +180,7 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 		s.maintainMinimum(ctx)
 	}()
 
-	// The launch stops being pending the moment the provisioner is entered
+	// The launch stops being pending once it is about to enter the provisioner
 	// (Firecracker.Launch draws its slot as its first act) or when we bail
 	// before getting there.
 	entered := false
@@ -225,6 +225,9 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 	// job that overruns the stop timeout.
 	vmCtx, vmCancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer vmCancel()
+	// Settle the reservation before the handle becomes visible to scaleDown:
+	// a handle that is both pending and cancelled would be discounted twice.
+	enter()
 	s.track(name, vmCancel)
 	defer s.untrack(name)
 
@@ -236,7 +239,6 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 		}
 	}()
 
-	enter()
 	launchErr := s.opts.Provisioner.Launch(vmCtx, name, jit, s.opts.Spec, func() { s.MarkBusy(name) })
 	// The VM is gone either way; drop its handle now so a scale-down during the
 	// backoff below cannot mark it cancelled and have Capacity discount it twice.
@@ -429,8 +431,12 @@ func (s *Scheduler) Capacity() int {
 	if !ok {
 		return s.opts.Max
 	}
-	free := max(0, sr.FreeSlots()-s.opts.Pending.Count())
-	return min(s.opts.Max, running+free)
+	// Pending launches are in running but not yet out of the free count, so
+	// they net out of the sum. When more launches were committed than the pool
+	// has slots (they will fail), the sum falls below running, which is right:
+	// only the ones that get a slot can serve.
+	total := running + sr.FreeSlots() - s.opts.Pending.Count()
+	return max(0, min(s.opts.Max, total))
 }
 
 // Drain blocks until all in-flight microVMs have exited.

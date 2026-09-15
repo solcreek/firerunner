@@ -194,6 +194,34 @@ func TestCapacityExcludesPendingLaunchesFromFreeSlots(t *testing.T) {
 	s.Drain()
 }
 
+func TestCapacityWhenMoreIsPendingThanFree(t *testing.T) {
+	jitGate := make(chan struct{})
+	release := make(chan struct{})
+	prov := &slotProv{free: 1, provFunc: func(ctx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		<-release
+		return nil
+	}}
+	var pending PendingLaunches
+	a := New(Options{Max: 4, Provisioner: prov, JIT: gateJIT{jitGate}, Logger: testLogger(), Pending: &pending})
+	b := New(Options{Max: 4, Provisioner: prov, JIT: jitStub{}, Logger: testLogger(), Pending: &pending})
+
+	a.Reconcile(context.Background(), 3)
+	// Three launches committed against one free slot: only one can ever get
+	// a slot, so the tier can hold one job, not three.
+	if got := a.Capacity(); got != 1 {
+		t.Fatalf("tier A capacity=%d want 1 (3 running + 1 free - 3 pending)", got)
+	}
+	// And the sibling tier sees a pool that is already oversubscribed.
+	if got := b.Capacity(); got != 0 {
+		t.Fatalf("tier B capacity=%d want 0 (0 running + 1 free - 3 pending, floored)", got)
+	}
+
+	close(jitGate)
+	close(release)
+	a.Drain()
+	b.Drain()
+}
+
 func TestCapacityPendingIsSharedAcrossTiers(t *testing.T) {
 	jitGate := make(chan struct{})
 	release := make(chan struct{})
