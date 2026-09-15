@@ -272,11 +272,14 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 	}()
 
 	launchErr := s.opts.Provisioner.Launch(vmCtx, name, jit, s.opts.Spec, func() { s.MarkBusy(name) })
-	// The VM is gone and its slot is back in the pool. Drop the handle in the
-	// same critical section that settles the count, so no sample sees the VM
-	// and its freed slot at once, and a scale-down during the backoff below
-	// cannot mark a dead launch cancelled. A failed launch keeps its place in
-	// running through backoff so plan bounds the retry attempts.
+	// The VM is gone and its slot is back in the pool. Settle the count and
+	// drop the handle in one critical section, so the two never disagree and a
+	// scale-down during the backoff below cannot mark a dead launch cancelled.
+	// The provisioner released the slot just before returning, so a Capacity
+	// sample between that release and this lock still sees the VM and its
+	// freed slot together; the window is a few instructions and closing it
+	// would tie the provisioner's slot lifecycle to this lock. A failed launch
+	// keeps its place in running through backoff so plan bounds the retries.
 	s.mu.Lock()
 	delete(s.active, name)
 	failed := launchErr != nil && vmCtx.Err() == nil
@@ -458,7 +461,9 @@ func (s *Scheduler) Running() int {
 // Launches sleeping in backoff and VMs tearing down after a cancel are in
 // running but not in live: they cannot take a job, and their slot is either
 // absent or not yet back in the pool. A provisioner without a shared pool has
-// no slot constraint, so only Max - running bounds the last term.
+// no slot constraint, so only Max - running bounds the last term — which is
+// still below Max while such entries hold places in running, exactly as plan
+// would refuse to launch into them.
 //
 // Every tier on the host sees the same free count, so the tiers' advertised
 // values can sum to more than the pool while several are idle, and a burst

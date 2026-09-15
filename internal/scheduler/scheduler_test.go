@@ -555,6 +555,25 @@ func TestCapacityWithoutSlotReporterIsBoundedOnlyByMax(t *testing.T) {
 	s.Drain()
 }
 
+func TestCapacityWithoutSlotReporterStillDiscountsBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	prov := provFunc(func(context.Context, string, string, core.RunnerSpec, func()) error {
+		return errors.New("boot failed")
+	})
+	s := New(Options{Max: 4, Min: 0, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
+	s.Reconcile(ctx, 1)
+	// No pool to constrain it, but the launch in backoff still holds one of
+	// the Max places plan will hand out, so capacity says 3, not 4, until the
+	// backoff ends and the goroutine exits.
+	waitCapacity(t, s, 3)
+	if got := s.Running(); got != 1 {
+		t.Fatalf("running=%d want 1 (the launch in backoff)", got)
+	}
+	cancel()
+	s.Drain()
+}
+
 func TestReconcileZeroDoesNothing(t *testing.T) {
 	prov := provFunc(func(context.Context, string, string, core.RunnerSpec, func()) error {
 		t.Fatal("Launch should not be called for desired=0")
