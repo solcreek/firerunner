@@ -218,15 +218,18 @@ func (f *Firecracker) FreeSlots() int { return f.ipam.available() }
 // delivered via MMDS v2, then block until the guest self-destructs (reboot -f)
 // and reap everything.
 func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec core.RunnerSpec, onBusy func()) error {
-	if err := f.SetupNetwork(ctx); err != nil {
-		return fmt.Errorf("setup network: %w", err)
-	}
-
+	// Draw the slot before anything else: the scheduler stops counting this
+	// launch as pending the moment Launch is entered, so FreeSlots must reflect
+	// it from the first instruction on.
 	slot, ok := f.ipam.acquire()
 	if !ok {
 		return fmt.Errorf("no free network slot (max %d microVMs)", f.cfg.MaxVMs)
 	}
 	defer f.ipam.release(slot)
+
+	if err := f.SetupNetwork(ctx); err != nil {
+		return fmt.Errorf("setup network: %w", err)
+	}
 	vnet := slotNet(slot, f.cfg.TapPrefix, f.cfg.NetBase)
 
 	if err := f.setupNet(ctx, vnet); err != nil {
