@@ -176,8 +176,9 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 		s.maintainMinimum(ctx)
 	}()
 
-	// The launch stops being pending the moment the provisioner is entered (it
-	// draws its slot first thing) or when we bail before getting there.
+	// The launch stops being pending the moment the provisioner is entered
+	// (Firecracker.Launch draws its slot as its first act) or when we bail
+	// before getting there.
 	entered := false
 	enter := func() {
 		if !entered {
@@ -385,7 +386,10 @@ func (s *Scheduler) Running() int {
 //
 // Launches any tier has committed to but not yet entered are still in the
 // free count, so they are subtracted first; Capacity is sampled right after
-// Reconcile, which is exactly when that window is open.
+// Reconcile, which is exactly when that window is open. A VM that scaleDown
+// has cancelled is the mirror case: still in running while it tears down, yet
+// unable to take a job and its slot not yet back in the pool, so it is left
+// out of both.
 //
 // Every tier on the host sees the same free count, so the tiers' advertised
 // values can sum to more than the pool while several are idle, and a burst
@@ -398,6 +402,11 @@ func (s *Scheduler) Running() int {
 func (s *Scheduler) Capacity() int {
 	s.mu.Lock()
 	running := s.running
+	for _, h := range s.active {
+		if h.cancelled {
+			running--
+		}
+	}
 	s.mu.Unlock()
 	sr, ok := s.opts.Provisioner.(provisioner.SlotReporter)
 	if !ok {

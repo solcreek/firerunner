@@ -235,6 +235,51 @@ func TestPendingSettlesWhenLaunchBailsBeforeProvisioner(t *testing.T) {
 	}
 }
 
+func TestCapacityExcludesCancelledVMsWhileTheyTearDown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{}, 8)
+	exit := make(chan struct{})
+	prov := &slotProv{free: 1, provFunc: func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		entered <- struct{}{}
+		<-vmCtx.Done()
+		<-exit // a cancelled VM lingers in teardown until the test lets it go
+		return nil
+	}}
+	s := New(Options{Max: 4, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 3)
+	for i := 0; i < 3; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("launch never started")
+		}
+	}
+	if got := s.Capacity(); got != 4 {
+		t.Fatalf("capacity=%d want 4 (3 running + 1 free)", got)
+	}
+
+	s.Reconcile(ctx, 1) // two idle VMs are cancelled but have not exited yet
+	if got := s.Running(); got != 3 {
+		t.Fatalf("running=%d want 3 while cancelled VMs are still tearing down", got)
+	}
+	// Those two can neither take a job nor have they returned their slots.
+	if got := s.Capacity(); got != 2 {
+		t.Fatalf("capacity=%d want 2 (1 live + 1 free; 2 cancelled excluded)", got)
+	}
+
+	close(exit)
+	waitRunning(t, s, 1)
+	prov.free = 3
+	if got := s.Capacity(); got != 4 {
+		t.Fatalf("capacity=%d want 4 once the cancelled VMs have exited and freed their slots", got)
+	}
+	cancel()
+	s.Drain()
+}
+
 func TestCapacityWithoutSlotReporterIsMax(t *testing.T) {
 	prov := provFunc(func(context.Context, string, string, core.RunnerSpec, func()) error { return nil })
 	s := New(Options{Max: 3, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
