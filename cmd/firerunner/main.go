@@ -273,6 +273,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	var (
 		listeners []*listener.ScaleSet
 		scheds    []*scheduler.Scheduler
+		pending   scheduler.PendingLaunches
 	)
 	closeAll := func() {
 		for _, l := range listeners {
@@ -305,6 +306,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			Provisioner: prov,
 			JIT:         lis.JIT(),
 			Logger:      tlog,
+			Pending:     &pending,
 		}))
 	}
 	defer closeAll()
@@ -347,10 +349,11 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			return sched.Running()
 		}
 		onBusy := func(name string) { sched.MarkBusy(name) }
+		capacity := func() int { return sched.Capacity() }
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := lis.Run(runCtx, onDesired, onBusy); err != nil && runCtx.Err() == nil {
+			if err := lis.Run(runCtx, onDesired, onBusy, capacity); err != nil && runCtx.Err() == nil {
 				errCh <- err
 				cancel()
 			}

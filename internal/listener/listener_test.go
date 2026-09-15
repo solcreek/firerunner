@@ -36,6 +36,111 @@ func TestScalerHandleDesiredRunnerCount(t *testing.T) {
 	}
 }
 
+func TestScalerAdvertisesCapacityAfterEveryDesiredCount(t *testing.T) {
+	capacity := 5
+	var advertised []int
+	a := &scaler{
+		maxRunners:  8,
+		log:         testLogger(),
+		onDesired:   func(context.Context, int) int { return 0 },
+		capacity:    func() int { return capacity },
+		setCapacity: func(c int) { advertised = append(advertised, c) },
+	}
+	for _, c := range []int{5, 2, 2, 7} {
+		capacity = c
+		if _, err := a.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Every callback re-reads capacity and pushes it, so the library's next
+	// GetMessage always carries the current value, even when unchanged.
+	want := []int{5, 2, 2, 7}
+	if len(advertised) != len(want) {
+		t.Fatalf("advertised %v, want %v", advertised, want)
+	}
+	for i := range want {
+		if advertised[i] != want[i] {
+			t.Fatalf("advertised %v, want %v", advertised, want)
+		}
+	}
+}
+
+func TestScalerClampsAdvertisedCapacity(t *testing.T) {
+	cases := []struct {
+		name     string
+		capacity int
+		want     int
+	}{
+		{"above tier max is capped", 50, 8},
+		{"at tier max passes", 8, 8},
+		{"zero becomes one", 0, 1},
+		{"negative becomes one", -3, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got int
+			a := &scaler{
+				maxRunners:  8,
+				log:         testLogger(),
+				onDesired:   func(context.Context, int) int { return 0 },
+				capacity:    func() int { return tc.capacity },
+				setCapacity: func(c int) { got = c },
+			}
+			if _, err := a.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("advertised %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestScalerCapacityReadAfterDesired(t *testing.T) {
+	// onDesired reconciles (launching VMs), so the capacity GitHub sees must be
+	// sampled after it, not before — otherwise a burst would be advertised
+	// against a stale, pre-launch count.
+	var order []string
+	a := &scaler{
+		maxRunners: 4,
+		log:        testLogger(),
+		onDesired: func(context.Context, int) int {
+			order = append(order, "desired")
+			return 1
+		},
+		capacity:    func() int { order = append(order, "capacity"); return 1 },
+		setCapacity: func(int) { order = append(order, "set") },
+	}
+	if _, err := a.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(order) != 3 || order[0] != "desired" || order[1] != "capacity" || order[2] != "set" {
+		t.Fatalf("call order = %v, want [desired capacity set]", order)
+	}
+}
+
+func TestScalerWithoutCapacityFuncNeverAdvertises(t *testing.T) {
+	a := &scaler{
+		maxRunners:  4,
+		log:         testLogger(),
+		onDesired:   func(context.Context, int) int { return 0 },
+		setCapacity: func(int) { t.Fatal("setCapacity must not be called without a CapacityFunc") },
+	}
+	if _, err := a.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	// And a CapacityFunc with nowhere to send it is equally inert.
+	b := &scaler{
+		maxRunners: 4,
+		log:        testLogger(),
+		onDesired:  func(context.Context, int) int { return 0 },
+		capacity:   func() int { t.Fatal("capacity must not be read without a sink"); return 0 },
+	}
+	if _, err := b.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestScalerJobCallbacks(t *testing.T) {
 	var busy []string
 	a := &scaler{

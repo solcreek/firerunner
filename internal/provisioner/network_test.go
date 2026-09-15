@@ -82,6 +82,37 @@ func TestIPAMAcquireRelease(t *testing.T) {
 	}
 }
 
+func TestIPAMAvailableTracksPool(t *testing.T) {
+	p := newIPAM(3)
+	if got := p.available(); got != 3 {
+		t.Fatalf("available=%d want 3 for a fresh pool", got)
+	}
+	a, _ := p.acquire()
+	p.acquire()
+	if got := p.available(); got != 1 {
+		t.Fatalf("available=%d want 1 after two acquires", got)
+	}
+	p.acquire()
+	if got := p.available(); got != 0 {
+		t.Fatalf("available=%d want 0 when exhausted", got)
+	}
+	p.release(a)
+	if got := p.available(); got != 1 {
+		t.Fatalf("available=%d want 1 after release", got)
+	}
+}
+
+func TestFreeSlotsReportsIPAM(t *testing.T) {
+	f := NewFirecracker(FirecrackerConfig{MaxVMs: 2}, testLogger())
+	if got := f.FreeSlots(); got != 2 {
+		t.Fatalf("FreeSlots=%d want 2", got)
+	}
+	f.ipam.acquire()
+	if got := f.FreeSlots(); got != 1 {
+		t.Fatalf("FreeSlots=%d want 1 after one acquire", got)
+	}
+}
+
 func TestSetupNetworkRequiresExtIface(t *testing.T) {
 	f := NewFirecracker(FirecrackerConfig{Egress: EgressConfig{Categories: []string{"open"}}}, testLogger())
 	f.run = func(context.Context, string, ...string) error { return nil }

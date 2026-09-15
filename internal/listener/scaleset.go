@@ -159,7 +159,7 @@ func (s *ScaleSet) JIT() *JITSource {
 }
 
 // Run implements Listener: long-poll GitHub and drive onDesired.
-func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFunc) error {
+func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFunc, capacity CapacityFunc) error {
 	l, err := sslistener.New(s.session, sslistener.Config{
 		ScaleSetID: s.scaleSetID,
 		MaxRunners: s.cfg.MaxRunners,
@@ -168,7 +168,19 @@ func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFu
 	if err != nil {
 		return fmt.Errorf("create scaleset listener: %w", err)
 	}
-	return l.Run(ctx, &scaler{onDesired: onDesired, onBusy: onBusy, minRunners: s.cfg.MinRunners, log: s.log})
+	a := &scaler{
+		onDesired:  onDesired,
+		onBusy:     onBusy,
+		minRunners: s.cfg.MinRunners,
+		maxRunners: s.cfg.MaxRunners,
+		log:        s.log,
+	}
+	if capacity != nil {
+		a.capacity = capacity
+		a.setCapacity = l.SetMaxRunners
+		a.advertiseCapacity()
+	}
+	return l.Run(ctx, a)
 }
 
 // Close deregisters the scale set and closes the message session. It deletes the
@@ -196,11 +208,22 @@ func (s *ScaleSet) Close(ctx context.Context) error {
 // dequeues a job (the primary, earliest source), while the scale-set protocol's
 // JobStarted can arrive later, but OR-ing them is strictly safe — a busy flag
 // only ever makes the drain wait for a real job, never cancels one early.
+//
+// capacity/setCapacity close the loop in the other direction: the library sends
+// GitHub an X-ScaleSetMaxCapacity header on every poll, and GitHub assigns no
+// more jobs than that to the scale set. The header defaults to the tier's static
+// max, which is only honest when the tier has the host to itself; advertising
+// the live capacity instead lets a host at the shared slot cap decline work
+// that a sibling scale set (same name, another runner group) could start now.
 type scaler struct {
-	onDesired  DesiredFunc
-	onBusy     BusyFunc
-	minRunners int
-	log        *slog.Logger
+	onDesired   DesiredFunc
+	onBusy      BusyFunc
+	capacity    CapacityFunc
+	setCapacity func(int)
+	minRunners  int
+	maxRunners  int
+	log         *slog.Logger
+	lastAdvert  int
 }
 
 var _ sslistener.Scaler = (*scaler)(nil)
@@ -208,7 +231,30 @@ var _ sslistener.Scaler = (*scaler)(nil)
 func (a *scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
 	desired := a.minRunners + count
 	running := a.onDesired(ctx, desired)
+	a.advertiseCapacity()
 	return running, nil
+}
+
+// advertiseCapacity pushes the current CapacityFunc value to the library for
+// its next GetMessage. The value is clamped to [1, maxRunners]: the ceiling is
+// the tier's own max, and the floor avoids sending 0, whose meaning to the
+// Actions back-end is undocumented (ARC never sends it).
+func (a *scaler) advertiseCapacity() {
+	if a.capacity == nil || a.setCapacity == nil {
+		return
+	}
+	c := a.capacity()
+	if c > a.maxRunners {
+		c = a.maxRunners
+	}
+	if c < 1 {
+		c = 1
+	}
+	if c != a.lastAdvert {
+		a.log.Info("advertising capacity", "capacity", c, "max", a.maxRunners)
+		a.lastAdvert = c
+	}
+	a.setCapacity(c)
 }
 
 func (a *scaler) HandleJobStarted(_ context.Context, j *scaleset.JobStarted) error {

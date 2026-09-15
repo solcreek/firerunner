@@ -6,6 +6,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/solcreek/firerunner/internal/core"
@@ -26,7 +27,26 @@ type Options struct {
 	Provisioner provisioner.Provisioner
 	JIT         JITSource
 	Logger      *slog.Logger
+	// Pending, when set, is shared by every Scheduler on the host so that each
+	// tier's Capacity accounts for launches the other tiers have committed to
+	// but the provisioner has not yet drawn a slot for. nil gives the
+	// Scheduler a private counter.
+	Pending *PendingLaunches
 }
+
+// PendingLaunches counts microVMs a Scheduler has added to its running total
+// whose Launch has not yet been entered, so they are in neither the
+// provisioner's free-slot count nor its in-use count. Capacity subtracts them
+// from the free count to keep the two numbers a consistent snapshot: between
+// Reconcile and the provisioner acquiring a slot (a JIT registration round
+// trip to GitHub) a launching VM would otherwise be counted twice.
+type PendingLaunches struct{ n atomic.Int64 }
+
+func (p *PendingLaunches) add(n int) { p.n.Add(int64(n)) }
+func (p *PendingLaunches) done()     { p.n.Add(-1) }
+
+// Count returns the number of launches committed but not yet entered.
+func (p *PendingLaunches) Count() int { return int(p.n.Load()) }
 
 // Scheduler launches one ephemeral microVM per assigned job, up to Max
 // concurrently.
@@ -44,6 +64,13 @@ type Scheduler struct {
 	// golden (which burns a JIT registration per attempt). Reset on any healthy
 	// launch. Guarded by mu.
 	failures int
+	// backingOff counts launch goroutines sleeping in backoff after a failed
+	// boot: still in running (so the pacing and replenish bookkeeping hold)
+	// but with no VM behind them. live leaves them out. Guarded by mu.
+	backingOff int
+	// pending is this tier's share of opts.Pending: launches in running that
+	// have not yet drawn a slot. Guarded by mu.
+	pending int
 }
 
 // vmHandle is the shutdown-relevant state of one in-flight microVM.
@@ -58,16 +85,24 @@ type vmHandle struct {
 
 // New returns a Scheduler.
 func New(o Options) *Scheduler {
+	if o.Pending == nil {
+		o.Pending = &PendingLaunches{}
+	}
 	return &Scheduler{opts: o, active: make(map[string]*vmHandle)}
 }
 
 // plan returns how many new runners to launch given the desired count reported
-// by GitHub, the number already running, and the capacity limit. It returns only
-// the scale-up amount (never negative) bounded by available capacity; scaling
-// down when desired drops is handled separately by scaleDown, which cancels
-// idle VMs rather than relying solely on them self-terminating.
-func plan(desired, running, max int) int {
-	want := desired - running
+// by GitHub, the number of microVMs able to take a job (live), the number of
+// launch goroutines in flight (running, which also counts VMs tearing down and
+// launches sleeping in backoff), and the capacity limit. Demand is measured
+// against live, so a job is never left waiting on a VM that cannot serve it;
+// the launch is bounded by max - running, so a failing golden can hold at most
+// max attempts in backoff at once. It returns only the scale-up amount (never
+// negative); scaling down when desired drops is handled separately by
+// scaleDown, which cancels idle VMs rather than relying solely on them
+// self-terminating.
+func plan(desired, live, running, max int) int {
+	want := desired - live
 	if want < 0 {
 		want = 0
 	}
@@ -80,13 +115,28 @@ func plan(desired, running, max int) int {
 	return want
 }
 
+// live returns how many in-flight microVMs can take a job: running minus the
+// launches sleeping in backoff (no VM behind them) and the VMs scaleDown has
+// cancelled (tearing down). Callers must hold s.mu.
+func (s *Scheduler) live() int {
+	n := s.running - s.backingOff
+	for _, h := range s.active {
+		if h.cancelled {
+			n--
+		}
+	}
+	return n
+}
+
 // Reconcile launches microVMs to meet the desired count, bounded by capacity,
 // and cancels idle VMs when desired drops below the number running. It is safe
 // for concurrent use; each launched runner handles exactly one job.
 func (s *Scheduler) Reconcile(ctx context.Context, desired int) {
 	s.mu.Lock()
-	n := plan(desired, s.running, s.opts.Max)
+	n := plan(desired, s.live(), s.running, s.opts.Max)
 	s.running += n
+	s.pending += n
+	s.opts.Pending.add(n)
 	running := s.running
 	stopped := 0
 	if n == 0 {
@@ -120,7 +170,7 @@ func (s *Scheduler) scaleDown(desired int) int {
 	if floor < s.opts.Min {
 		floor = s.opts.Min
 	}
-	excess := s.running - floor
+	excess := s.live() - floor
 	if excess <= 0 {
 		return 0
 	}
@@ -142,15 +192,37 @@ func (s *Scheduler) scaleDown(desired int) int {
 
 func (s *Scheduler) launchOne(ctx context.Context) {
 	defer s.wg.Done()
+	finished := false
+	finish := func() {
+		if !finished {
+			finished = true
+			s.running--
+		}
+	}
 	// This runs before wg.Done above (defers are LIFO), so the WaitGroup counter
 	// stays >=1 while maintainMinimum may Add a replacement — avoiding a
 	// concurrent-Add-during-Drain race.
 	defer func() {
 		s.mu.Lock()
-		s.running--
+		finish()
 		s.mu.Unlock()
 		s.maintainMinimum(ctx)
 	}()
+
+	// The launch stops being pending once it is about to enter the provisioner
+	// (Firecracker.Launch draws its slot as its first act) or when we bail
+	// before getting there.
+	entered := false
+	enter := func() {
+		if !entered {
+			entered = true
+			s.mu.Lock()
+			s.pending--
+			s.mu.Unlock()
+			s.opts.Pending.done()
+		}
+	}
+	defer enter()
 
 	// Once shutdown has begun the listener has stopped accepting work and Drain
 	// is waiting to reap; don't boot a brand-new microVM into a draining host.
@@ -163,6 +235,9 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 		s.opts.Logger.Error("generate JIT config", "err", err)
 		// A failed JIT generation is a GitHub API error; without pacing, the
 		// maintainMinimum defer relaunches at once and spins a tight retry loop.
+		// Settle the reservation first: backoff already keeps this launch out of
+		// Capacity, and a slot it will never draw must not stay spoken for.
+		enter()
 		s.backoff(ctx)
 		return
 	}
@@ -182,6 +257,9 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 	// job that overruns the stop timeout.
 	vmCtx, vmCancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer vmCancel()
+	// Settle the reservation before the handle becomes visible to scaleDown:
+	// a handle that is both pending and cancelled would be discounted twice.
+	enter()
 	s.track(name, vmCancel)
 	defer s.untrack(name)
 
@@ -194,6 +272,21 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 	}()
 
 	launchErr := s.opts.Provisioner.Launch(vmCtx, name, jit, s.opts.Spec, func() { s.MarkBusy(name) })
+	// The VM is gone and its slot is back in the pool. Settle the count and
+	// drop the handle in one critical section, so the two never disagree and a
+	// scale-down during the backoff below cannot mark a dead launch cancelled.
+	// The provisioner released the slot just before returning, so a Capacity
+	// sample between that release and this lock still sees the VM and its
+	// freed slot together; the window is a few instructions and closing it
+	// would tie the provisioner's slot lifecycle to this lock. A failed launch
+	// keeps its place in running through backoff so plan bounds the retries.
+	s.mu.Lock()
+	delete(s.active, name)
+	failed := launchErr != nil && vmCtx.Err() == nil
+	if !failed {
+		finish()
+	}
+	s.mu.Unlock()
 	switch {
 	case vmCtx.Err() != nil:
 		// We cancelled this VM ourselves (scale-down or shutdown); any error it
@@ -218,8 +311,14 @@ func (s *Scheduler) backoff(ctx context.Context) {
 	}
 	s.mu.Lock()
 	s.failures++
+	s.backingOff++
 	n := s.failures
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.backingOff--
+		s.mu.Unlock()
+	}()
 	d := backoffDelay(n)
 	s.opts.Logger.Warn("microVM boot failed; backing off before replenishing", "consecutiveFailures", n, "delay", d)
 	t := time.NewTimer(d)
@@ -316,9 +415,16 @@ func (s *Scheduler) maintainMinimum(ctx context.Context) {
 	if s.opts.Min <= 0 || ctx.Err() != nil {
 		return
 	}
+	// The floor is measured against running rather than live on purpose: a
+	// launch sleeping in backoff is the pool's pending replenishment, and
+	// counting it keeps a failing golden from being retried faster than backoff
+	// allows. Demand-driven launches (Reconcile) are the ones that must not
+	// wait on it.
 	s.mu.Lock()
-	n := plan(s.opts.Min, s.running, s.opts.Max)
+	n := plan(s.opts.Min, s.running, s.running, s.opts.Max)
 	s.running += n
+	s.pending += n
+	s.opts.Pending.add(n)
 	running := s.running
 	s.mu.Unlock()
 	if n == 0 {
@@ -336,6 +442,50 @@ func (s *Scheduler) Running() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.running
+}
+
+// Capacity returns how many jobs this tier can hold concurrently right now.
+// It is what the listener advertises to GitHub as the scale set's capacity, so
+// it must match what Reconcile can actually serve — otherwise GitHub assigns
+// the job here and it queues while a sibling host sits idle. Three parts add
+// up, mirroring plan:
+//
+//   - VMs that hold a slot and can take a job (live minus this tier's pending
+//     launches);
+//   - pending launches that will find a slot (the shared pool has room for
+//     them; those it does not have room for will fail and are not counted);
+//   - launches Reconcile could still make: bounded both by Max - running, as
+//     plan is, and by the slots the pool has left once every tier's pending
+//     launches have drawn theirs.
+//
+// Launches sleeping in backoff and VMs tearing down after a cancel are in
+// running but not in live: they cannot take a job, and their slot is either
+// absent or not yet back in the pool. A provisioner without a shared pool has
+// no slot constraint, so only Max - running bounds the last term — which is
+// still below Max while such entries hold places in running, exactly as plan
+// would refuse to launch into them.
+//
+// Every tier on the host sees the same free count, so the tiers' advertised
+// values can sum to more than the pool while several are idle, and a burst
+// that lands on two tiers within one poll can still be over-assigned by up to
+// the free count. That is deliberate: dividing the free slots between tiers
+// would leave a slot unadvertised whenever the tier that wants it has used up
+// its share, stranding a job on a single host that has room for it. The
+// overlap only lasts until the next poll, and the sum is never larger than the
+// static maxima advertised before.
+func (s *Scheduler) Capacity() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	room := max(0, s.opts.Max-s.running)
+	committed := max(0, s.live()-s.pending)
+	sr, ok := s.opts.Provisioner.(provisioner.SlotReporter)
+	if !ok {
+		return committed + s.pending + room
+	}
+	free := sr.FreeSlots()
+	willBoot := min(s.pending, free)
+	headroom := max(0, min(room, free-s.opts.Pending.Count()))
+	return committed + willBoot + headroom
 }
 
 // Drain blocks until all in-flight microVMs have exited.
