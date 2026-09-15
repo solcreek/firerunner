@@ -203,6 +203,9 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 		s.opts.Logger.Error("generate JIT config", "err", err)
 		// A failed JIT generation is a GitHub API error; without pacing, the
 		// maintainMinimum defer relaunches at once and spins a tight retry loop.
+		// Settle the reservation first: backoff already keeps this launch out of
+		// Capacity, and a slot it will never draw must not stay spoken for.
+		enter()
 		s.backoff(ctx)
 		return
 	}
@@ -235,6 +238,9 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 
 	enter()
 	launchErr := s.opts.Provisioner.Launch(vmCtx, name, jit, s.opts.Spec, func() { s.MarkBusy(name) })
+	// The VM is gone either way; drop its handle now so a scale-down during the
+	// backoff below cannot mark it cancelled and have Capacity discount it twice.
+	s.untrack(name)
 	switch {
 	case vmCtx.Err() != nil:
 		// We cancelled this VM ourselves (scale-down or shutdown); any error it

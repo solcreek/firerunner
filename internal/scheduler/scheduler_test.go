@@ -309,6 +309,75 @@ func TestCapacityExcludesLaunchesInBackoff(t *testing.T) {
 	s.Drain()
 }
 
+func TestCapacityCountsFailedLaunchOnceUnderScaleDown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{}, 8)
+	failed := make(chan struct{}, 8)
+	var attempts int32
+	prov := &slotProv{free: 2, provFunc: func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			failed <- struct{}{}
+			return errors.New("boot failed") // the first launch dies and backs off
+		}
+		entered <- struct{}{}
+		<-vmCtx.Done()
+		return nil
+	}}
+	s := New(Options{Max: 4, Min: 0, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 2)
+	select {
+	case <-failed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("failing launch never attempted")
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("healthy launch never entered")
+	}
+	// running=2: one live VM, one goroutine in backoff. Demand drops to 0, so
+	// scaleDown cancels every idle handle it can find — the failed launch must
+	// not be among them, or it would be discounted for backoff and again for
+	// cancellation, dragging capacity below the free slots the host has.
+	s.Reconcile(ctx, 0)
+	waitRunning(t, s, 1)
+	waitCapacity(t, s, 2) // 0 live (the survivor was cancelled) + 2 free
+
+	cancel()
+	s.Drain()
+}
+
+func TestPendingSettlesBeforeJITFailureBackoff(t *testing.T) {
+	prov := &slotProv{free: 3, provFunc: func(context.Context, string, string, core.RunnerSpec, func()) error {
+		t.Fatal("Launch must not be reached after a JIT failure")
+		return nil
+	}}
+	var pending PendingLaunches
+	s := New(Options{Max: 4, Provisioner: prov, JIT: failJIT{}, Logger: testLogger(), Pending: &pending})
+	s.Reconcile(context.Background(), 1)
+	// The goroutine sleeps in backoff for 500ms. Its reservation must be
+	// released as soon as JIT fails, not when the goroutine exits, otherwise
+	// the free slot it will never use is hidden from every tier meanwhile.
+	deadline := time.After(200 * time.Millisecond)
+	for pending.Count() != 0 {
+		select {
+		case <-deadline:
+			t.Fatalf("pending=%d want 0 while the JIT failure backs off", pending.Count())
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	if got := s.Running(); got != 1 {
+		t.Fatalf("running=%d want 1: the goroutine should still be in backoff", got)
+	}
+	if got := s.Capacity(); got != 3 {
+		t.Fatalf("capacity=%d want 3 (0 live + 3 free, none reserved)", got)
+	}
+	s.Drain()
+}
+
 func waitCapacity(t *testing.T, s *Scheduler, want int) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
