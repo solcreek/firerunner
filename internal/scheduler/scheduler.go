@@ -64,6 +64,10 @@ type Scheduler struct {
 	// golden (which burns a JIT registration per attempt). Reset on any healthy
 	// launch. Guarded by mu.
 	failures int
+	// backingOff counts launch goroutines sleeping in backoff after a failed
+	// boot: still in running (so the pacing and replenish bookkeeping hold)
+	// but with no VM behind them. Capacity leaves them out. Guarded by mu.
+	backingOff int
 }
 
 // vmHandle is the shutdown-relevant state of one in-flight microVM.
@@ -255,8 +259,14 @@ func (s *Scheduler) backoff(ctx context.Context) {
 	}
 	s.mu.Lock()
 	s.failures++
+	s.backingOff++
 	n := s.failures
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.backingOff--
+		s.mu.Unlock()
+	}()
 	d := backoffDelay(n)
 	s.opts.Logger.Warn("microVM boot failed; backing off before replenishing", "consecutiveFailures", n, "delay", d)
 	t := time.NewTimer(d)
@@ -389,7 +399,8 @@ func (s *Scheduler) Running() int {
 // Reconcile, which is exactly when that window is open. A VM that scaleDown
 // has cancelled is the mirror case: still in running while it tears down, yet
 // unable to take a job and its slot not yet back in the pool, so it is left
-// out of both.
+// out of both. So is a launch sleeping in backoff after a failed boot: it
+// holds a place in running for pacing, but there is no VM behind it.
 //
 // Every tier on the host sees the same free count, so the tiers' advertised
 // values can sum to more than the pool while several are idle, and a burst
@@ -401,7 +412,7 @@ func (s *Scheduler) Running() int {
 // static maxima advertised before.
 func (s *Scheduler) Capacity() int {
 	s.mu.Lock()
-	running := s.running
+	running := s.running - s.backingOff
 	for _, h := range s.active {
 		if h.cancelled {
 			running--

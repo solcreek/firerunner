@@ -280,6 +280,50 @@ func TestCapacityExcludesCancelledVMsWhileTheyTearDown(t *testing.T) {
 	s.Drain()
 }
 
+func TestCapacityExcludesLaunchesInBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	failed := make(chan struct{}, 8)
+	prov := &slotProv{free: 0, provFunc: func(context.Context, string, string, core.RunnerSpec, func()) error {
+		failed <- struct{}{}
+		return errors.New("no free network slot (max 4 microVMs)")
+	}}
+	s := New(Options{Max: 4, Min: 0, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 2)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-failed:
+		case <-time.After(2 * time.Second):
+			t.Fatal("launch never attempted")
+		}
+	}
+	// Both goroutines are now sleeping in backoff (first delay 500ms), still
+	// counted in running for pacing, with no VM and no slot behind them.
+	waitCapacity(t, s, 0)
+	if got := s.Running(); got != 2 {
+		t.Fatalf("running=%d want 2 while the failed launches back off", got)
+	}
+	cancel()
+	s.Drain()
+}
+
+func waitCapacity(t *testing.T, s *Scheduler, want int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		if got := s.Capacity(); got == want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("capacity=%d want %d", s.Capacity(), want)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
 func TestCapacityWithoutSlotReporterIsMax(t *testing.T) {
 	prov := provFunc(func(context.Context, string, string, core.RunnerSpec, func()) error { return nil })
 	s := New(Options{Max: 3, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
