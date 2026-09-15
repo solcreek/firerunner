@@ -282,7 +282,11 @@ the sibling host picks the job up instead of it queuing behind a full pool.
 `firerunner` logs `advertising capacity` whenever the number changes. The
 advertised value never drops below 1: the back-end's reading of a zero capacity
 is undocumented, so a tier with nothing running on a full host may still be
-handed one job, which then waits for the next free slot.
+handed one job, which then waits for the next free slot. And because every tier
+on a host counts the same free slots, a burst that hits two tiers within one
+poll can still be over-assigned by up to the free count until their next poll —
+the pool is not split between tiers, since a split would strand jobs on a single
+host whenever the busy tier had exhausted its share while other tiers sat idle.
 
 ### Inspecting a deployment (`status`, `doctor`)
 

@@ -345,6 +345,15 @@ func (s *Scheduler) Running() int {
 // not exceed what the host can actually serve — otherwise GitHub assigns the
 // job here and it queues behind the pool while a sibling host sits idle. A
 // provisioner without a shared pool has no such constraint, so Max stands.
+//
+// Every tier on the host sees the same free count, so the tiers' advertised
+// values can sum to more than the pool while several are idle, and a burst
+// that lands on two tiers within one poll can still be over-assigned by up to
+// the free count. That is deliberate: dividing the free slots between tiers
+// would leave a slot unadvertised whenever the tier that wants it has used up
+// its share, stranding a job on a single host that has room for it. The
+// overlap only lasts until the next poll, and the sum is never larger than the
+// static maxima advertised before.
 func (s *Scheduler) Capacity() int {
 	s.mu.Lock()
 	running := s.running
