@@ -192,9 +192,6 @@ func (s *Scheduler) scaleDown(desired int) int {
 
 func (s *Scheduler) launchOne(ctx context.Context) {
 	defer s.wg.Done()
-	// This runs before wg.Done above (defers are LIFO), so the WaitGroup counter
-	// stays >=1 while maintainMinimum may Add a replacement — avoiding a
-	// concurrent-Add-during-Drain race.
 	finished := false
 	finish := func() {
 		if !finished {
@@ -202,6 +199,9 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 			s.running--
 		}
 	}
+	// This runs before wg.Done above (defers are LIFO), so the WaitGroup counter
+	// stays >=1 while maintainMinimum may Add a replacement — avoiding a
+	// concurrent-Add-during-Drain race.
 	defer func() {
 		s.mu.Lock()
 		finish()
