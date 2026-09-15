@@ -139,6 +139,102 @@ func TestCapacityIsRunningPlusFreeSlotsCappedAtMax(t *testing.T) {
 	}
 }
 
+// gateJIT blocks Generate until released, holding a launch in the window
+// between Reconcile committing to it and the provisioner being entered.
+type gateJIT struct{ release chan struct{} }
+
+func (g gateJIT) Generate(context.Context, core.RunnerSpec) (string, string, error) {
+	<-g.release
+	return "runner", "jit", nil
+}
+
+type failJIT struct{}
+
+func (failJIT) Generate(context.Context, core.RunnerSpec) (string, string, error) {
+	return "", "", errors.New("jit unavailable")
+}
+
+func TestCapacityExcludesPendingLaunchesFromFreeSlots(t *testing.T) {
+	jitGate := make(chan struct{})
+	release := make(chan struct{})
+	entered := make(chan struct{}, 16)
+	prov := &slotProv{free: 2, provFunc: func(ctx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		entered <- struct{}{}
+		<-release
+		return nil
+	}}
+	s := New(Options{Max: 6, Provisioner: prov, JIT: gateJIT{jitGate}, Logger: testLogger()})
+
+	s.Reconcile(context.Background(), 2)
+	// Both launches are committed (running=2) but stuck in JIT generation, so
+	// the provisioner still reports both slots free. Counting them in both
+	// places would advertise 4; the honest figure is 2.
+	if got := s.Capacity(); got != 2 {
+		t.Fatalf("capacity=%d want 2 while 2 launches are pending against 2 free slots", got)
+	}
+
+	close(jitGate)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for launch to enter")
+		}
+	}
+	// Entering the provisioner settles the pending count; the fake pool is
+	// then updated the way the real one would be by the acquire.
+	if got := s.opts.Pending.Count(); got != 0 {
+		t.Fatalf("pending=%d want 0 once both launches entered the provisioner", got)
+	}
+	prov.free = 0
+	if got := s.Capacity(); got != 2 {
+		t.Fatalf("capacity=%d want 2 with 2 running and a dry pool", got)
+	}
+	close(release)
+	s.Drain()
+}
+
+func TestCapacityPendingIsSharedAcrossTiers(t *testing.T) {
+	jitGate := make(chan struct{})
+	release := make(chan struct{})
+	prov := &slotProv{free: 3, provFunc: func(ctx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		<-release
+		return nil
+	}}
+	var pending PendingLaunches
+	a := New(Options{Max: 4, Provisioner: prov, JIT: gateJIT{jitGate}, Logger: testLogger(), Pending: &pending})
+	b := New(Options{Max: 4, Provisioner: prov, JIT: jitStub{}, Logger: testLogger(), Pending: &pending})
+
+	a.Reconcile(context.Background(), 2)
+	// Tier B has nothing running, but two of the three free slots are already
+	// spoken for by tier A's pending launches.
+	if got := b.Capacity(); got != 1 {
+		t.Fatalf("tier B capacity=%d want 1 (3 free - 2 pending elsewhere)", got)
+	}
+	if got := a.Capacity(); got != 3 {
+		t.Fatalf("tier A capacity=%d want 3 (2 running + (3 free - 2 pending))", got)
+	}
+
+	close(jitGate)
+	close(release)
+	a.Drain()
+	b.Drain()
+}
+
+func TestPendingSettlesWhenLaunchBailsBeforeProvisioner(t *testing.T) {
+	prov := provFunc(func(context.Context, string, string, core.RunnerSpec, func()) error {
+		t.Fatal("Launch must not be reached after a JIT failure")
+		return nil
+	})
+	var pending PendingLaunches
+	s := New(Options{Max: 2, Provisioner: prov, JIT: failJIT{}, Logger: testLogger(), Pending: &pending})
+	s.Reconcile(context.Background(), 1)
+	s.Drain()
+	if got := pending.Count(); got != 0 {
+		t.Fatalf("pending=%d want 0 after the launch bailed on JIT generation", got)
+	}
+}
+
 func TestCapacityWithoutSlotReporterIsMax(t *testing.T) {
 	prov := provFunc(func(context.Context, string, string, core.RunnerSpec, func()) error { return nil })
 	s := New(Options{Max: 3, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})

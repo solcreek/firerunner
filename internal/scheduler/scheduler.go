@@ -6,6 +6,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/solcreek/firerunner/internal/core"
@@ -26,7 +27,26 @@ type Options struct {
 	Provisioner provisioner.Provisioner
 	JIT         JITSource
 	Logger      *slog.Logger
+	// Pending, when set, is shared by every Scheduler on the host so that each
+	// tier's Capacity accounts for launches the other tiers have committed to
+	// but the provisioner has not yet drawn a slot for. nil gives the
+	// Scheduler a private counter.
+	Pending *PendingLaunches
 }
+
+// PendingLaunches counts microVMs a Scheduler has added to its running total
+// whose Launch has not yet been entered, so they are in neither the
+// provisioner's free-slot count nor its in-use count. Capacity subtracts them
+// from the free count to keep the two numbers a consistent snapshot: between
+// Reconcile and the provisioner acquiring a slot (a JIT registration round
+// trip to GitHub) a launching VM would otherwise be counted twice.
+type PendingLaunches struct{ n atomic.Int64 }
+
+func (p *PendingLaunches) add(n int) { p.n.Add(int64(n)) }
+func (p *PendingLaunches) done()     { p.n.Add(-1) }
+
+// Count returns the number of launches committed but not yet entered.
+func (p *PendingLaunches) Count() int { return int(p.n.Load()) }
 
 // Scheduler launches one ephemeral microVM per assigned job, up to Max
 // concurrently.
@@ -58,6 +78,9 @@ type vmHandle struct {
 
 // New returns a Scheduler.
 func New(o Options) *Scheduler {
+	if o.Pending == nil {
+		o.Pending = &PendingLaunches{}
+	}
 	return &Scheduler{opts: o, active: make(map[string]*vmHandle)}
 }
 
@@ -87,6 +110,7 @@ func (s *Scheduler) Reconcile(ctx context.Context, desired int) {
 	s.mu.Lock()
 	n := plan(desired, s.running, s.opts.Max)
 	s.running += n
+	s.opts.Pending.add(n)
 	running := s.running
 	stopped := 0
 	if n == 0 {
@@ -152,6 +176,17 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 		s.maintainMinimum(ctx)
 	}()
 
+	// The launch stops being pending the moment the provisioner is entered (it
+	// draws its slot first thing) or when we bail before getting there.
+	entered := false
+	enter := func() {
+		if !entered {
+			entered = true
+			s.opts.Pending.done()
+		}
+	}
+	defer enter()
+
 	// Once shutdown has begun the listener has stopped accepting work and Drain
 	// is waiting to reap; don't boot a brand-new microVM into a draining host.
 	if ctx.Err() != nil {
@@ -193,6 +228,7 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 		}
 	}()
 
+	enter()
 	launchErr := s.opts.Provisioner.Launch(vmCtx, name, jit, s.opts.Spec, func() { s.MarkBusy(name) })
 	switch {
 	case vmCtx.Err() != nil:
@@ -319,6 +355,7 @@ func (s *Scheduler) maintainMinimum(ctx context.Context) {
 	s.mu.Lock()
 	n := plan(s.opts.Min, s.running, s.opts.Max)
 	s.running += n
+	s.opts.Pending.add(n)
 	running := s.running
 	s.mu.Unlock()
 	if n == 0 {
@@ -346,6 +383,10 @@ func (s *Scheduler) Running() int {
 // job here and it queues behind the pool while a sibling host sits idle. A
 // provisioner without a shared pool has no such constraint, so Max stands.
 //
+// Launches any tier has committed to but not yet entered are still in the
+// free count, so they are subtracted first; Capacity is sampled right after
+// Reconcile, which is exactly when that window is open.
+//
 // Every tier on the host sees the same free count, so the tiers' advertised
 // values can sum to more than the pool while several are idle, and a burst
 // that lands on two tiers within one poll can still be over-assigned by up to
@@ -362,7 +403,8 @@ func (s *Scheduler) Capacity() int {
 	if !ok {
 		return s.opts.Max
 	}
-	return min(s.opts.Max, running+sr.FreeSlots())
+	free := max(0, sr.FreeSlots()-s.opts.Pending.Count())
+	return min(s.opts.Max, running+free)
 }
 
 // Drain blocks until all in-flight microVMs have exited.

@@ -273,6 +273,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	var (
 		listeners []*listener.ScaleSet
 		scheds    []*scheduler.Scheduler
+		pending   scheduler.PendingLaunches
 	)
 	closeAll := func() {
 		for _, l := range listeners {
@@ -305,6 +306,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			Provisioner: prov,
 			JIT:         lis.JIT(),
 			Logger:      tlog,
+			Pending:     &pending,
 		}))
 	}
 	defer closeAll()
