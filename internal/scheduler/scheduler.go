@@ -27,13 +27,12 @@ type JITSource interface {
 // re-queues it. Deregistering first closes the race: GitHub refuses with
 // core.ErrRunnerBusy while a job is assigned, and after a successful removal it
 // can assign the runner nothing.
+//
+// RemoveRunner must return in bounded time on its own; the scheduler waits for
+// its answer, since only that answer says whether the VM may be cancelled.
 type RunnerRemover interface {
 	RemoveRunner(ctx context.Context, name string) error
 }
-
-// removeTimeout bounds how long a VM stays removing. On timeout the VM goes
-// back to idle and the next scale-down retries it. A var so tests can shorten it.
-var removeTimeout = 15 * time.Second
 
 // Options configures a Scheduler.
 type Options struct {
@@ -232,20 +231,12 @@ func (s *Scheduler) scaleDown(desired int) (int, []string) {
 // already assigned, the VM is marked busy and left to run it; on any other
 // failure it goes back to idle, so a later scale-down can pick it again.
 func (s *Scheduler) removeThenCancel(ctx context.Context, name string) {
-	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), removeTimeout)
-	defer cancel()
-	// Wait on the deadline, not on the call: a Remover may block without
-	// honouring ctx (scaleset.Client queues every call on one mutex). A call
-	// that outlives the deadline and then succeeds leaves an idle VM whose
-	// runner is gone; the next scale-down finds it unknown and cancels it.
-	done := make(chan error, 1)
-	go func() { done <- s.opts.Remover.RemoveRunner(rctx, name) }()
-	var err error
-	select {
-	case err = <-done:
-	case <-rctx.Done():
-		err = rctx.Err()
-	}
+	// Wait for the Remover's own answer rather than racing a deadline here: an
+	// abandoned call could still succeed, leaving a deregistered VM counted as
+	// live. The Remover bounds each attempt from when it can run (see
+	// listener.JITSource.RemoveRunner), and the VM is removing, so scaleDown
+	// never starts a second attempt for it meanwhile.
+	err := s.opts.Remover.RemoveRunner(context.WithoutCancel(ctx), name)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
