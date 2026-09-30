@@ -8,6 +8,12 @@ import "errors"
 // yet. The runner must be left to run the job.
 var ErrRunnerBusy = errors.New("runner has a job assigned")
 
+// ErrRemovalUnknown reports that a runner deregistration failed in a way that
+// leaves open whether GitHub applied it (a timeout or lost response), and
+// asking GitHub afterwards failed too. The runner may already be gone, so its
+// VM must not be treated as able to take a job until that is settled.
+var ErrRemovalUnknown = errors.New("runner removal outcome unknown")
+
 // RunnerSpec describes the shape of the ephemeral microVM that will host a
 // single GitHub Actions job. One spec maps to one scale-set tier (e.g. the
 // runs-on label "firerunner-4c8g" -> 4 vCPU / 8192 MiB / a Docker-less golden

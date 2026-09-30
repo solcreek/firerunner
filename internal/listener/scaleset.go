@@ -45,12 +45,11 @@ type ScaleSet struct {
 	// removeClient serves only runner deregistration. scaleset.Client holds one
 	// non-context-aware mutex across every call, so sharing client would let a
 	// slow JIT generation stall a scale-down past its deadline, and a slow
-	// removal delay the next scale-up.
+	// removal delay the next scale-up. The scheduler issues one removal at a
+	// time per tier, so nothing ever waits on this client's mutex.
 	removeClient *scaleset.Client
-	// removeSlot admits one removal at a time to removeClient; see RemoveRunner.
-	removeSlot chan struct{}
-	session    *scaleset.MessageSessionClient
-	scaleSetID int
+	session      *scaleset.MessageSessionClient
+	scaleSetID   int
 	// created is true only when this process created the scale set (rather than
 	// reusing a pre-existing one). Close deletes the scale set only when created,
 	// so it never deregisters a set another instance is relying on.
@@ -125,7 +124,7 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 	cfg.Logger.Info("registered runner scale set",
 		"name", cfg.Name, "scaleSetID", scaleSet.ID, "group", cfg.RunnerGroup, "reused", reused)
 
-	return &ScaleSet{cfg: cfg, log: cfg.Logger, client: client, removeClient: removeClient, removeSlot: make(chan struct{}, 1), session: session, scaleSetID: scaleSet.ID, created: !reused}, nil
+	return &ScaleSet{cfg: cfg, log: cfg.Logger, client: client, removeClient: removeClient, session: session, scaleSetID: scaleSet.ID, created: !reused}, nil
 }
 
 // openSessionWithRetry opens a message session, retrying while GitHub reports a
@@ -168,7 +167,7 @@ func isSessionConflict(err error) bool {
 // JIT returns a JIT source bound to this scale set, satisfying
 // scheduler.JITSource.
 func (s *ScaleSet) JIT() *JITSource {
-	return &JITSource{client: s.client, remover: s.removeClient, removeSlot: s.removeSlot, scaleSetID: s.scaleSetID, namePrefix: s.cfg.Name}
+	return &JITSource{client: s.client, remover: s.removeClient, scaleSetID: s.scaleSetID, namePrefix: s.cfg.Name}
 }
 
 // Run implements Listener: long-poll GitHub and drive onDesired.
@@ -287,7 +286,6 @@ func (a *scaler) HandleJobCompleted(_ context.Context, j *scaleset.JobCompleted)
 type JITSource struct {
 	client     *scaleset.Client
 	remover    runnerRemover
-	removeSlot chan struct{}
 	scaleSetID int
 	namePrefix string
 }
@@ -309,9 +307,9 @@ type runnerRemover interface {
 	RemoveRunner(ctx context.Context, runnerID int64) error
 }
 
-// removeOpTimeout bounds one removal from the moment it holds removeSlot, so
-// time spent queued behind other removals never eats into it. A var so tests
-// can shorten it.
+// removeOpTimeout bounds each request of a removal. The scheduler calls
+// RemoveRunner only when that removal can run, so none of it is spent queued.
+// A var so tests can shorten it.
 var removeOpTimeout = 15 * time.Second
 
 // RemoveRunner implements scheduler.RunnerRemover: it deregisters the named
@@ -319,33 +317,38 @@ var removeOpTimeout = 15 * time.Second
 // already has a job assigned. A runner GitHub no longer knows is already gone,
 // so that is success.
 //
-// scaleset.Client queues every call on a mutex that ignores ctx, so removals
-// take removeSlot first: the wait for it honours ctx, and the one holder is
-// bounded by removeOpTimeout (every scaleset request carries its ctx), so no
-// caller is ever stuck behind the client's mutex.
+// Any other DELETE failure is ambiguous: a timeout or lost response can follow
+// a removal GitHub already applied. So it asks GitHub again. Gone is success,
+// still there is a plain error (the VM may take jobs), and no answer at all is
+// core.ErrRemovalUnknown, which the scheduler retries.
 func (j *JITSource) RemoveRunner(ctx context.Context, name string) error {
-	select {
-	case j.removeSlot <- struct{}{}:
-	case <-ctx.Done():
-		return fmt.Errorf("remove runner %q: %w", name, ctx.Err())
-	}
-	defer func() { <-j.removeSlot }()
-	ctx, cancel := context.WithTimeout(ctx, removeOpTimeout)
+	opCtx, cancel := context.WithTimeout(ctx, removeOpTimeout)
 	defer cancel()
-
-	r, err := j.remover.GetRunnerByName(ctx, name)
+	r, err := j.remover.GetRunnerByName(opCtx, name)
 	if err != nil {
+		// Nothing was sent that could remove it, so it is still registered.
 		return fmt.Errorf("look up runner %q: %w", name, err)
 	}
 	if r == nil {
 		return nil
 	}
-	err = j.remover.RemoveRunner(ctx, int64(r.ID))
+	err = j.remover.RemoveRunner(opCtx, int64(r.ID))
 	switch {
 	case err == nil, errors.Is(err, scaleset.RunnerNotFoundError):
 		return nil
 	case errors.Is(err, scaleset.JobStillRunningError):
 		return fmt.Errorf("remove runner %q: %w: %w", name, core.ErrRunnerBusy, err)
+	}
+
+	// opCtx may be what failed; verify on a fresh budget.
+	vCtx, vCancel := context.WithTimeout(ctx, removeOpTimeout)
+	defer vCancel()
+	still, verr := j.remover.GetRunnerByName(vCtx, name)
+	switch {
+	case verr != nil:
+		return fmt.Errorf("remove runner %q: %w: %w (verify: %w)", name, core.ErrRemovalUnknown, err, verr)
+	case still == nil:
+		return nil
 	default:
 		return fmt.Errorf("remove runner %q: %w", name, err)
 	}

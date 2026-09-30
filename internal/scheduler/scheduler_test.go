@@ -1003,6 +1003,82 @@ func TestScaleDownAppliesASlowRemovalAndNeverDuplicatesIt(t *testing.T) {
 	waitRunning(t, s, 0)
 }
 
+// TestDemandRiseReclaimsQueuedRemovals verifies that when demand comes back
+// while removals are still queued, those VMs return to the idle pool instead of
+// being deregistered one by one; only the removal already running proceeds.
+func TestDemandRiseReclaimsQueuedRemovals(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{}, 8)
+	release := make(chan struct{})
+	var calls atomic.Int64
+	rm := removerFunc(func(context.Context, string) error {
+		calls.Add(1)
+		<-release
+		return nil
+	})
+	s := New(Options{Max: 3, Provisioner: idleProv(entered), JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	startIdle(t, ctx, s, entered, 3)
+
+	s.Reconcile(ctx, 0) // one removal runs, two queue
+	waitCalls(t, &calls, 1)
+	s.Reconcile(ctx, 3) // demand is back before the queue drains
+
+	s.mu.Lock()
+	live, queued := s.live(), len(s.removeQ)
+	s.mu.Unlock()
+	if live != 2 || queued != 0 {
+		t.Fatalf("live=%d queued=%d want 2 reclaimed and an empty queue", live, queued)
+	}
+
+	close(release)
+	waitRunning(t, s, 2) // only the in-flight removal went through
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("remover called %d times, want 1", got)
+	}
+}
+
+// TestUnconfirmedRemovalStaysRemovingUntilSettled verifies an
+// ErrRemovalUnknown answer keeps the VM out of live and retries until GitHub
+// gives a definite one.
+func TestUnconfirmedRemovalStaysRemovingUntilSettled(t *testing.T) {
+	old := removeRetryDelay
+	removeRetryDelay = 10 * time.Millisecond
+	defer func() { removeRetryDelay = old }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{}, 8)
+	settle := make(chan struct{})
+	var calls atomic.Int64
+	rm := removerFunc(func(context.Context, string) error {
+		calls.Add(1)
+		select {
+		case <-settle:
+			return nil
+		default:
+			return fmt.Errorf("remove: %w", core.ErrRemovalUnknown)
+		}
+	})
+	s := New(Options{Max: 4, Provisioner: idleProv(entered), JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	startIdle(t, ctx, s, entered, 1)
+
+	s.Reconcile(ctx, 0)
+	waitCalls(t, &calls, 3) // retried, not abandoned
+	s.mu.Lock()
+	live := s.live()
+	s.mu.Unlock()
+	if live != 0 {
+		t.Fatalf("live=%d want 0 while the removal is unconfirmed", live)
+	}
+
+	close(settle)
+	waitRunning(t, s, 0)
+}
+
 func waitCalls(t *testing.T, n *atomic.Int64, want int64) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)

@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"testing"
-	"time"
 
 	"github.com/actions/scaleset"
 
@@ -232,15 +231,24 @@ func TestIsSessionConflict(t *testing.T) {
 	}
 }
 
+type lookup struct {
+	ref *scaleset.RunnerReference
+	err error
+}
+
+// fakeRemover answers GetRunnerByName from lookups in order (the last one
+// repeats) and RemoveRunner with removeErr.
 type fakeRemover struct {
-	ref       *scaleset.RunnerReference
-	lookupErr error
+	lookups   []lookup
 	removeErr error
 	removed   []int64
+	looked    int
 }
 
 func (f *fakeRemover) GetRunnerByName(context.Context, string) (*scaleset.RunnerReference, error) {
-	return f.ref, f.lookupErr
+	l := f.lookups[min(f.looked, len(f.lookups)-1)]
+	f.looked++
+	return l.ref, l.err
 }
 
 func (f *fakeRemover) RemoveRunner(_ context.Context, id int64) error {
@@ -248,29 +256,37 @@ func (f *fakeRemover) RemoveRunner(_ context.Context, id int64) error {
 	return f.removeErr
 }
 
-// TestJITSourceRemoveRunnerMapsErrors pins the mapping the scheduler relies on:
-// only JobStillRunning reads as busy, and a runner GitHub no longer knows is
-// already gone.
+// TestJITSourceRemoveRunnerMapsErrors pins the contract the scheduler relies
+// on: only JobStillRunning reads as busy; a runner GitHub no longer knows is
+// gone; an ambiguous DELETE failure is settled by asking GitHub again, and is
+// ErrRemovalUnknown only when that also fails; any other error means the
+// runner is still registered.
 func TestJITSourceRemoveRunnerMapsErrors(t *testing.T) {
 	ref := &scaleset.RunnerReference{ID: 42, Name: "r"}
+	found := lookup{ref: ref}
+	gone := lookup{}
+	down := lookup{err: errors.New("503")}
 	cases := []struct {
-		name       string
-		fake       fakeRemover
-		wantErr    bool
-		wantBusy   bool
-		wantRemove bool
+		name        string
+		fake        fakeRemover
+		wantErr     bool
+		wantBusy    bool
+		wantUnknown bool
+		wantRemove  bool
 	}{
-		{"removed", fakeRemover{ref: ref}, false, false, true},
-		{"unknown runner", fakeRemover{}, false, false, false},
-		{"not found on remove", fakeRemover{ref: ref, removeErr: fmt.Errorf("req: %w: gone", scaleset.RunnerNotFoundError)}, false, false, true},
-		{"job assigned", fakeRemover{ref: ref, removeErr: fmt.Errorf("req: %w: busy", scaleset.JobStillRunningError)}, true, true, true},
-		{"other remove failure", fakeRemover{ref: ref, removeErr: errors.New("503")}, true, false, true},
-		{"lookup failure", fakeRemover{lookupErr: errors.New("503")}, true, false, false},
+		{"removed", fakeRemover{lookups: []lookup{found}}, false, false, false, true},
+		{"unknown runner", fakeRemover{lookups: []lookup{gone}}, false, false, false, false},
+		{"lookup failure", fakeRemover{lookups: []lookup{down}}, true, false, false, false},
+		{"not found on remove", fakeRemover{lookups: []lookup{found}, removeErr: fmt.Errorf("req: %w: gone", scaleset.RunnerNotFoundError)}, false, false, false, true},
+		{"job assigned", fakeRemover{lookups: []lookup{found}, removeErr: fmt.Errorf("req: %w: busy", scaleset.JobStillRunningError)}, true, true, false, true},
+		{"remove failed, verify finds it", fakeRemover{lookups: []lookup{found, found}, removeErr: errors.New("503")}, true, false, false, true},
+		{"remove failed, verify finds it gone", fakeRemover{lookups: []lookup{found, gone}, removeErr: context.DeadlineExceeded}, false, false, false, true},
+		{"remove failed, verify fails", fakeRemover{lookups: []lookup{found, down}, removeErr: context.DeadlineExceeded}, true, false, true, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := tc.fake
-			j := &JITSource{remover: &f, removeSlot: make(chan struct{}, 1)}
+			j := &JITSource{remover: &f}
 			err := j.RemoveRunner(context.Background(), "r")
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("err=%v wantErr=%v", err, tc.wantErr)
@@ -278,73 +294,12 @@ func TestJITSourceRemoveRunnerMapsErrors(t *testing.T) {
 			if got := errors.Is(err, core.ErrRunnerBusy); got != tc.wantBusy {
 				t.Fatalf("errors.Is(err, ErrRunnerBusy)=%v want %v (err=%v)", got, tc.wantBusy, err)
 			}
+			if got := errors.Is(err, core.ErrRemovalUnknown); got != tc.wantUnknown {
+				t.Fatalf("errors.Is(err, ErrRemovalUnknown)=%v want %v (err=%v)", got, tc.wantUnknown, err)
+			}
 			if got := len(f.removed) == 1 && f.removed[0] == 42; got != tc.wantRemove {
 				t.Fatalf("removed=%v wantRemove=%v", f.removed, tc.wantRemove)
 			}
 		})
-	}
-}
-
-// blockingRemover holds each RemoveRunner until release, honouring ctx the way
-// scaleset's requests do once they are running.
-type blockingRemover struct {
-	release chan struct{}
-	started chan struct{}
-}
-
-func (b *blockingRemover) GetRunnerByName(context.Context, string) (*scaleset.RunnerReference, error) {
-	return &scaleset.RunnerReference{ID: 1}, nil
-}
-
-func (b *blockingRemover) RemoveRunner(ctx context.Context, _ int64) error {
-	b.started <- struct{}{}
-	select {
-	case <-b.release:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// TestRemoveRunnerTimeoutStartsWhenItRuns verifies a removal queued behind
-// another gets its full removeOpTimeout once it runs, instead of spending it
-// waiting in the queue.
-func TestRemoveRunnerTimeoutStartsWhenItRuns(t *testing.T) {
-	old := removeOpTimeout
-	removeOpTimeout = 200 * time.Millisecond
-	defer func() { removeOpTimeout = old }()
-
-	b := &blockingRemover{release: make(chan struct{}), started: make(chan struct{}, 2)}
-	j := &JITSource{remover: b, removeSlot: make(chan struct{}, 1)}
-
-	first := make(chan error, 1)
-	go func() { first <- j.RemoveRunner(context.Background(), "a") }()
-	<-b.started
-	second := make(chan error, 1)
-	go func() { second <- j.RemoveRunner(context.Background(), "b") }()
-
-	// The first holds the slot for most of a timeout while the second waits.
-	time.Sleep(150 * time.Millisecond)
-	b.release <- struct{}{}
-	if err := <-first; err != nil {
-		t.Fatalf("first removal: %v", err)
-	}
-	<-b.started
-	time.Sleep(100 * time.Millisecond) // ~250 ms after it queued, ~100 ms after it ran
-	b.release <- struct{}{}
-	if err := <-second; err != nil {
-		t.Fatalf("queued removal timed out before it ran: %v", err)
-	}
-}
-
-// TestRemoveRunnerGivesUpWaitingOnCtx verifies a caller whose ctx ends while
-// queued returns instead of piling up behind the slot.
-func TestRemoveRunnerGivesUpWaitingOnCtx(t *testing.T) {
-	j := &JITSource{remover: &fakeRemover{}, removeSlot: make(chan struct{}, 1)}
-	j.removeSlot <- struct{}{} // slot held elsewhere
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	if err := j.RemoveRunner(ctx, "r"); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err=%v want DeadlineExceeded", err)
 	}
 }
