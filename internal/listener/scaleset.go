@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -285,6 +286,29 @@ func (j *JITSource) Generate(ctx context.Context, _ core.RunnerSpec) (name, jitC
 		return "", "", fmt.Errorf("generate JIT config: %w", err)
 	}
 	return name, cfg.EncodedJITConfig, nil
+}
+
+// RemoveRunner implements scheduler.RunnerRemover: it deregisters the named
+// runner, returning core.ErrRunnerBusy when GitHub refuses because the runner
+// already has a job assigned. A runner GitHub no longer knows is already gone,
+// so that is success.
+func (j *JITSource) RemoveRunner(ctx context.Context, name string) error {
+	r, err := j.client.GetRunnerByName(ctx, name)
+	if err != nil {
+		return fmt.Errorf("look up runner %q: %w", name, err)
+	}
+	if r == nil {
+		return nil
+	}
+	err = j.client.RemoveRunner(ctx, int64(r.ID))
+	switch {
+	case err == nil, errors.Is(err, scaleset.RunnerNotFoundError):
+		return nil
+	case errors.Is(err, scaleset.JobStillRunningError):
+		return fmt.Errorf("remove runner %q: %w: %w", name, core.ErrRunnerBusy, err)
+	default:
+		return fmt.Errorf("remove runner %q: %w", name, err)
+	}
 }
 
 // --- helpers ---

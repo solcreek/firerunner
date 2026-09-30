@@ -1,6 +1,13 @@
 // Package core holds the shared domain types for firerunner.
 package core
 
+import "errors"
+
+// ErrRunnerBusy reports that GitHub refused to deregister a runner because it
+// has already assigned that runner a job, even if the guest has not started it
+// yet. The runner must be left to run the job.
+var ErrRunnerBusy = errors.New("runner has a job assigned")
+
 // RunnerSpec describes the shape of the ephemeral microVM that will host a
 // single GitHub Actions job. One spec maps to one scale-set tier (e.g. the
 // runs-on label "firerunner-4c8g" -> 4 vCPU / 8192 MiB / a Docker-less golden

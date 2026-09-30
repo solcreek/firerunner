@@ -4,6 +4,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,21 @@ type JITSource interface {
 	Generate(ctx context.Context, spec core.RunnerSpec) (name, jitConfig string, err error)
 }
 
+// RunnerRemover deregisters an idle runner from GitHub before scale-down kills
+// its microVM. GitHub may already have assigned the runner a job in the few
+// seconds before its guest logs "Running job:"; killing the VM then strands
+// that job on a dead runner until GitHub reaps the session (~5 min) and
+// re-queues it. Deregistering first closes the race: GitHub refuses with
+// core.ErrRunnerBusy while a job is assigned, and after a successful removal it
+// can assign the runner nothing.
+type RunnerRemover interface {
+	RemoveRunner(ctx context.Context, name string) error
+}
+
+// removeTimeout bounds one deregistration round trip. On timeout the VM is
+// left running and the next scale-down retries it.
+const removeTimeout = 15 * time.Second
+
 // Options configures a Scheduler.
 type Options struct {
 	Max         int
@@ -26,7 +42,11 @@ type Options struct {
 	Spec        core.RunnerSpec
 	Provisioner provisioner.Provisioner
 	JIT         JITSource
-	Logger      *slog.Logger
+	// Remover, when set, deregisters each idle VM with GitHub before
+	// scale-down cancels it. nil cancels at once, with the race described on
+	// RunnerRemover.
+	Remover RunnerRemover
+	Logger  *slog.Logger
 	// Pending, when set, is shared by every Scheduler on the host so that each
 	// tier's Capacity accounts for launches the other tiers have committed to
 	// but the provisioner has not yet drawn a slot for. nil gives the
@@ -81,6 +101,11 @@ type vmHandle struct {
 	// idle VM twice across rapid Reconcile calls before its launch goroutine has
 	// removed it from the registry.
 	cancelled bool
+	// removing marks an idle VM scale-down has chosen whose deregistration
+	// with GitHub is in flight. It is not live: scale-down has already
+	// counted it as gone, and it returns to the pool (busy or idle) only if
+	// GitHub refuses the removal.
+	removing bool
 }
 
 // New returns a Scheduler.
@@ -117,11 +142,11 @@ func plan(desired, live, running, max int) int {
 
 // live returns how many in-flight microVMs can take a job: running minus the
 // launches sleeping in backoff (no VM behind them) and the VMs scaleDown has
-// cancelled (tearing down). Callers must hold s.mu.
+// cancelled (tearing down) or is deregistering. Callers must hold s.mu.
 func (s *Scheduler) live() int {
 	n := s.running - s.backingOff
 	for _, h := range s.active {
-		if h.cancelled {
+		if h.cancelled || h.removing {
 			n--
 		}
 	}
@@ -139,8 +164,9 @@ func (s *Scheduler) Reconcile(ctx context.Context, desired int) {
 	s.opts.Pending.add(n)
 	running := s.running
 	stopped := 0
+	var remove []string
 	if n == 0 {
-		stopped = s.scaleDown(desired)
+		stopped, remove = s.scaleDown(desired)
 	}
 	s.mu.Unlock()
 
@@ -155,39 +181,80 @@ func (s *Scheduler) Reconcile(ctx context.Context, desired int) {
 	if stopped > 0 {
 		s.opts.Logger.Info("scaling down", "desired", desired, "cancelling", stopped, "running", running, "min", s.opts.Min)
 	}
+	for _, name := range remove {
+		go s.removeThenCancel(ctx, name)
+	}
 }
 
-// scaleDown cancels idle (non-busy, not already cancelling) microVMs so the total
-// running count converges toward max(desired, Min), returning how many it
-// cancelled. Callers must hold s.mu; the cancel is invoked under the lock (a
-// context.CancelFunc is non-blocking and re-enters the scheduler only
-// asynchronously) so a MarkBusy cannot slip between the busy check and the
-// cancel. Busy VMs are never cancelled — they are running a job and left to
-// finish and self-terminate; the warm-pool floor (Min) is always preserved so a
-// scale-to-zero still keeps pre-booted capacity.
-func (s *Scheduler) scaleDown(desired int) int {
+// scaleDown picks idle (non-busy, not already cancelling or deregistering)
+// microVMs so the live count converges toward max(desired, Min), returning how
+// many it picked. Without a Remover it cancels them at once; with one it only
+// marks them removing and returns their names for removeThenCancel. Callers
+// must hold s.mu; the cancel is invoked under the lock (a context.CancelFunc is
+// non-blocking and re-enters the scheduler only asynchronously) so a MarkBusy
+// cannot slip between the busy check and the cancel. Busy VMs are never
+// cancelled — they are running a job and left to finish and self-terminate;
+// the warm-pool floor (Min) is always preserved so a scale-to-zero still keeps
+// pre-booted capacity.
+func (s *Scheduler) scaleDown(desired int) (int, []string) {
 	floor := desired
 	if floor < s.opts.Min {
 		floor = s.opts.Min
 	}
 	excess := s.live() - floor
 	if excess <= 0 {
-		return 0
+		return 0, nil
 	}
-	cancelled := 0
-	for _, h := range s.active {
+	picked := 0
+	var remove []string
+	for name, h := range s.active {
 		if excess <= 0 {
 			break
 		}
-		if h.busy || h.cancelled {
+		if h.busy || h.cancelled || h.removing {
 			continue
 		}
-		h.cancelled = true
-		h.cancel()
-		cancelled++
+		if s.opts.Remover != nil {
+			h.removing = true
+			remove = append(remove, name)
+		} else {
+			h.cancelled = true
+			h.cancel()
+		}
+		picked++
 		excess--
 	}
-	return cancelled
+	return picked, remove
+}
+
+// removeThenCancel deregisters a VM scale-down picked and cancels it only once
+// GitHub can no longer hand it a job. If GitHub refuses because a job is
+// already assigned, the VM is marked busy and left to run it; on any other
+// failure it goes back to idle, so a later scale-down can pick it again.
+func (s *Scheduler) removeThenCancel(ctx context.Context, name string) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), removeTimeout)
+	defer cancel()
+	err := s.opts.Remover.RemoveRunner(rctx, name)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h := s.active[name]
+	if h == nil {
+		return // exited (or was reaped by shutdown) while we waited
+	}
+	h.removing = false
+	switch {
+	case errors.Is(err, core.ErrRunnerBusy):
+		h.busy = true
+		s.opts.Logger.Info("scale-down spared runner: GitHub already assigned it a job", "runner", name)
+	case err != nil:
+		s.opts.Logger.Warn("deregister runner before scale-down", "runner", name, "err", err)
+	case h.busy || h.cancelled:
+		// The guest dequeued a job, or shutdown cancelled it, meanwhile.
+	default:
+		h.cancelled = true
+		h.cancel()
+	}
 }
 
 func (s *Scheduler) launchOne(ctx context.Context) {
