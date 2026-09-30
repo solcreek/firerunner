@@ -968,6 +968,43 @@ func TestScaleDownRetriesAfterRemovalError(t *testing.T) {
 	waitRunning(t, s, 0)
 }
 
+// TestScaleDownBoundsARemoverThatIgnoresCtx verifies a removal stuck past the
+// deadline (e.g. queued behind scaleset.Client's mutex) returns the VM to idle
+// instead of leaving it removing, and hidden from live, indefinitely.
+func TestScaleDownBoundsARemoverThatIgnoresCtx(t *testing.T) {
+	old := removeTimeout
+	removeTimeout = 50 * time.Millisecond
+	defer func() { removeTimeout = old }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{}, 8)
+	stuck := make(chan struct{})
+	defer close(stuck)
+	var calls atomic.Int64
+	rm := removerFunc(func(context.Context, string) error {
+		calls.Add(1)
+		<-stuck // ignores ctx
+		return nil
+	})
+	s := New(Options{Max: 4, Provisioner: idleProv(entered), JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	startIdle(t, ctx, s, entered, 1)
+
+	s.Reconcile(ctx, 0)
+	waitCalls(t, &calls, 1)
+	waitNotRemoving(t, s)
+	if got := s.Running(); got != 1 {
+		t.Fatalf("running=%d want 1: a timed-out removal must not cancel the VM", got)
+	}
+	s.mu.Lock()
+	live := s.live()
+	s.mu.Unlock()
+	if live != 1 {
+		t.Fatalf("live=%d want 1 once the removal timed out", live)
+	}
+}
+
 func waitCalls(t *testing.T, n *atomic.Int64, want int64) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)

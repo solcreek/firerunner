@@ -31,9 +31,9 @@ type RunnerRemover interface {
 	RemoveRunner(ctx context.Context, name string) error
 }
 
-// removeTimeout bounds one deregistration round trip. On timeout the VM is
-// left running and the next scale-down retries it.
-const removeTimeout = 15 * time.Second
+// removeTimeout bounds how long a VM stays removing. On timeout the VM goes
+// back to idle and the next scale-down retries it. A var so tests can shorten it.
+var removeTimeout = 15 * time.Second
 
 // Options configures a Scheduler.
 type Options struct {
@@ -234,7 +234,18 @@ func (s *Scheduler) scaleDown(desired int) (int, []string) {
 func (s *Scheduler) removeThenCancel(ctx context.Context, name string) {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), removeTimeout)
 	defer cancel()
-	err := s.opts.Remover.RemoveRunner(rctx, name)
+	// Wait on the deadline, not on the call: a Remover may block without
+	// honouring ctx (scaleset.Client queues every call on one mutex). A call
+	// that outlives the deadline and then succeeds leaves an idle VM whose
+	// runner is gone; the next scale-down finds it unknown and cancels it.
+	done := make(chan error, 1)
+	go func() { done <- s.opts.Remover.RemoveRunner(rctx, name) }()
+	var err error
+	select {
+	case err = <-done:
+	case <-rctx.Done():
+		err = rctx.Err()
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

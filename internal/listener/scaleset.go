@@ -39,11 +39,16 @@ type Config struct {
 // ScaleSet is the production Listener. Constructing it registers an ephemeral
 // runner scale set with GitHub; Close deregisters it.
 type ScaleSet struct {
-	cfg        Config
-	log        *slog.Logger
-	client     *scaleset.Client
-	session    *scaleset.MessageSessionClient
-	scaleSetID int
+	cfg    Config
+	log    *slog.Logger
+	client *scaleset.Client
+	// removeClient serves only runner deregistration. scaleset.Client holds one
+	// non-context-aware mutex across every call, so sharing client would let a
+	// slow JIT generation stall a scale-down past its deadline, and a slow
+	// removal delay the next scale-up.
+	removeClient *scaleset.Client
+	session      *scaleset.MessageSessionClient
+	scaleSetID   int
 	// created is true only when this process created the scale set (rather than
 	// reusing a pre-existing one). Close deletes the scale set only when created,
 	// so it never deregisters a set another instance is relying on.
@@ -61,6 +66,10 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 	}
 
 	client, err := newClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	removeClient, err := newClient(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -100,6 +109,7 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 		}
 	}
 	client.SetSystemInfo(systemInfo(cfg, scaleSet.ID))
+	removeClient.SetSystemInfo(systemInfo(cfg, scaleSet.ID))
 
 	session, err := openSessionWithRetry(ctx, client, scaleSet.ID, owner, cfg.Logger)
 	if err != nil {
@@ -113,7 +123,7 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 	cfg.Logger.Info("registered runner scale set",
 		"name", cfg.Name, "scaleSetID", scaleSet.ID, "group", cfg.RunnerGroup, "reused", reused)
 
-	return &ScaleSet{cfg: cfg, log: cfg.Logger, client: client, session: session, scaleSetID: scaleSet.ID, created: !reused}, nil
+	return &ScaleSet{cfg: cfg, log: cfg.Logger, client: client, removeClient: removeClient, session: session, scaleSetID: scaleSet.ID, created: !reused}, nil
 }
 
 // openSessionWithRetry opens a message session, retrying while GitHub reports a
@@ -156,7 +166,7 @@ func isSessionConflict(err error) bool {
 // JIT returns a JIT source bound to this scale set, satisfying
 // scheduler.JITSource.
 func (s *ScaleSet) JIT() *JITSource {
-	return &JITSource{client: s.client, scaleSetID: s.scaleSetID, namePrefix: s.cfg.Name}
+	return &JITSource{client: s.client, remover: s.removeClient, scaleSetID: s.scaleSetID, namePrefix: s.cfg.Name}
 }
 
 // Run implements Listener: long-poll GitHub and drive onDesired.
@@ -274,6 +284,7 @@ func (a *scaler) HandleJobCompleted(_ context.Context, j *scaleset.JobCompleted)
 // JITSource generates just-in-time runner registrations against the scale set.
 type JITSource struct {
 	client     *scaleset.Client
+	remover    runnerRemover
 	scaleSetID int
 	namePrefix string
 }
@@ -288,19 +299,26 @@ func (j *JITSource) Generate(ctx context.Context, _ core.RunnerSpec) (name, jitC
 	return name, cfg.EncodedJITConfig, nil
 }
 
+// runnerRemover is the part of *scaleset.Client that RemoveRunner uses, so the
+// error mapping can be tested without GitHub.
+type runnerRemover interface {
+	GetRunnerByName(ctx context.Context, runnerName string) (*scaleset.RunnerReference, error)
+	RemoveRunner(ctx context.Context, runnerID int64) error
+}
+
 // RemoveRunner implements scheduler.RunnerRemover: it deregisters the named
 // runner, returning core.ErrRunnerBusy when GitHub refuses because the runner
 // already has a job assigned. A runner GitHub no longer knows is already gone,
 // so that is success.
 func (j *JITSource) RemoveRunner(ctx context.Context, name string) error {
-	r, err := j.client.GetRunnerByName(ctx, name)
+	r, err := j.remover.GetRunnerByName(ctx, name)
 	if err != nil {
 		return fmt.Errorf("look up runner %q: %w", name, err)
 	}
 	if r == nil {
 		return nil
 	}
-	err = j.client.RemoveRunner(ctx, int64(r.ID))
+	err = j.remover.RemoveRunner(ctx, int64(r.ID))
 	switch {
 	case err == nil, errors.Is(err, scaleset.RunnerNotFoundError):
 		return nil
