@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strconv"
@@ -847,6 +848,381 @@ func TestScaleDownPreservesMin(t *testing.T) {
 
 	s.Reconcile(ctx, 0) // demand 0, but Min=1 keeps one warm
 	waitRunning(t, s, 1)
+}
+
+// removerFunc adapts a function to RunnerRemover.
+type removerFunc func(ctx context.Context, name string) error
+
+func (f removerFunc) RemoveRunner(ctx context.Context, name string) error { return f(ctx, name) }
+
+// idleProv launches VMs that stay idle until cancelled, reporting each launch
+// on entered.
+func idleProv(entered chan<- struct{}) provFunc {
+	return func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		entered <- struct{}{}
+		<-vmCtx.Done()
+		return nil
+	}
+}
+
+func startIdle(t *testing.T, ctx context.Context, s *Scheduler, entered <-chan struct{}, n int) {
+	t.Helper()
+	s.Reconcile(ctx, n)
+	for i := 0; i < n; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("launch never started")
+		}
+	}
+	waitRunning(t, s, n)
+}
+
+// TestScaleDownDeregistersBeforeCancelling verifies that with a Remover, an
+// idle VM is cancelled only after GitHub has deregistered its runner.
+func TestScaleDownDeregistersBeforeCancelling(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{}, 8)
+	removing := make(chan string, 8)
+	allow := make(chan struct{})
+	rm := removerFunc(func(_ context.Context, name string) error {
+		removing <- name
+		<-allow
+		return nil
+	})
+	s := New(Options{Max: 4, Provisioner: idleProv(entered), JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	startIdle(t, ctx, s, entered, 2)
+
+	s.Reconcile(ctx, 1)
+	select {
+	case <-removing:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scale-down never deregistered a runner")
+	}
+	// While the removal is in flight the VM must still be running.
+	time.Sleep(50 * time.Millisecond)
+	if got := s.Running(); got != 2 {
+		t.Fatalf("running=%d want 2 before GitHub confirmed the removal", got)
+	}
+	close(allow)
+	waitRunning(t, s, 1)
+}
+
+// TestScaleDownSparesRunnerGitHubAssigned verifies that when GitHub refuses
+// the removal because a job is assigned, the VM survives and is treated as
+// busy, so later scale-downs leave it alone.
+func TestScaleDownSparesRunnerGitHubAssigned(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{}, 8)
+	var calls atomic.Int64
+	rm := removerFunc(func(context.Context, string) error {
+		calls.Add(1)
+		return fmt.Errorf("remove: %w", core.ErrRunnerBusy)
+	})
+	s := New(Options{Max: 4, Provisioner: idleProv(entered), JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	startIdle(t, ctx, s, entered, 1)
+
+	s.Reconcile(ctx, 0)
+	waitCalls(t, &calls, 1)
+	waitIdleBusy(t, s)
+
+	s.Reconcile(ctx, 0) // a busy VM is never picked again
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("remover called %d times, want 1", got)
+	}
+	if got := s.Running(); got != 1 {
+		t.Fatalf("running=%d want 1: the assigned runner was cancelled", got)
+	}
+}
+
+// TestScaleDownRetriesAfterRemovalError verifies an unexplained removal
+// failure leaves the VM running and idle, so the next scale-down retries it.
+func TestScaleDownRetriesAfterRemovalError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{}, 8)
+	var calls atomic.Int64
+	rm := removerFunc(func(context.Context, string) error {
+		if calls.Add(1) == 1 {
+			return errors.New("503")
+		}
+		return nil
+	})
+	s := New(Options{Max: 4, Provisioner: idleProv(entered), JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	startIdle(t, ctx, s, entered, 1)
+
+	s.Reconcile(ctx, 0)
+	waitCalls(t, &calls, 1)
+	waitNotRemoving(t, s)
+	if got := s.Running(); got != 1 {
+		t.Fatalf("running=%d want 1 after a failed removal", got)
+	}
+
+	s.Reconcile(ctx, 0)
+	waitRunning(t, s, 0)
+}
+
+// TestScaleDownAppliesASlowRemovalAndNeverDuplicatesIt verifies a removal that
+// answers late is still acted on (its VM is cancelled, not left idle while
+// deregistered), and that repeated scale-downs meanwhile start no second
+// attempt for the same VM.
+func TestScaleDownAppliesASlowRemovalAndNeverDuplicatesIt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{}, 8)
+	release := make(chan struct{})
+	var calls atomic.Int64
+	rm := removerFunc(func(context.Context, string) error {
+		calls.Add(1)
+		<-release
+		return nil
+	})
+	s := New(Options{Max: 4, Provisioner: idleProv(entered), JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	startIdle(t, ctx, s, entered, 1)
+
+	for i := 0; i < 3; i++ {
+		s.Reconcile(ctx, 0)
+	}
+	waitCalls(t, &calls, 1)
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("remover called %d times while one removal was in flight, want 1", got)
+	}
+	if got := s.Running(); got != 1 {
+		t.Fatalf("running=%d want 1 before the removal answered", got)
+	}
+
+	close(release)
+	waitRunning(t, s, 0)
+}
+
+// TestDemandRiseReclaimsQueuedRemovals verifies that when demand comes back
+// while removals are still queued, those VMs return to the idle pool instead of
+// being deregistered one by one; only the removal already running proceeds.
+func TestDemandRiseReclaimsQueuedRemovals(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{}, 8)
+	release := make(chan struct{})
+	var calls atomic.Int64
+	rm := removerFunc(func(context.Context, string) error {
+		calls.Add(1)
+		<-release
+		return nil
+	})
+	s := New(Options{Max: 3, Provisioner: idleProv(entered), JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	startIdle(t, ctx, s, entered, 3)
+
+	s.Reconcile(ctx, 0) // one removal runs, two queue
+	waitCalls(t, &calls, 1)
+	s.Reconcile(ctx, 3) // demand is back before the queue drains
+
+	s.mu.Lock()
+	live, queued := s.live(), len(s.removeQ)
+	s.mu.Unlock()
+	if live != 2 || queued != 0 {
+		t.Fatalf("live=%d queued=%d want 2 reclaimed and an empty queue", live, queued)
+	}
+
+	close(release)
+	waitRunning(t, s, 2) // only the in-flight removal went through
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("remover called %d times, want 1", got)
+	}
+}
+
+// TestUnconfirmedRemovalStaysRemovingUntilSettled verifies an
+// ErrRemovalUnknown answer keeps the VM out of live and retries until GitHub
+// gives a definite one.
+func TestUnconfirmedRemovalStaysRemovingUntilSettled(t *testing.T) {
+	old := removeRetryDelay
+	removeRetryDelay = 10 * time.Millisecond
+	defer func() { removeRetryDelay = old }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{}, 8)
+	settle := make(chan struct{})
+	var calls atomic.Int64
+	rm := removerFunc(func(context.Context, string) error {
+		calls.Add(1)
+		select {
+		case <-settle:
+			return nil
+		default:
+			return fmt.Errorf("remove: %w", core.ErrRemovalUnknown)
+		}
+	})
+	s := New(Options{Max: 4, Provisioner: idleProv(entered), JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	startIdle(t, ctx, s, entered, 1)
+
+	s.Reconcile(ctx, 0)
+	waitCalls(t, &calls, 3) // retried, not abandoned
+	s.mu.Lock()
+	live := s.live()
+	s.mu.Unlock()
+	if live != 0 {
+		t.Fatalf("live=%d want 0 while the removal is unconfirmed", live)
+	}
+
+	close(settle)
+	waitRunning(t, s, 0)
+}
+
+// TestRemoveLoopStopsOnShutdown verifies shutdown ends a removal loop that is
+// retrying an unconfirmed removal, instead of retrying with no delay. The VM
+// is busy, so the drain's idle cancel leaves it alone — the case that used to
+// spin.
+func TestRemoveLoopStopsOnShutdown(t *testing.T) {
+	old := removeRetryDelay
+	removeRetryDelay = time.Hour // only shutdown can end the wait
+	defer func() { removeRetryDelay = old }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	release := make(chan struct{})
+	busyCh := make(chan func(), 1)
+	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		busyCh <- onBusy
+		select {
+		case <-vmCtx.Done():
+		case <-release:
+		}
+		return nil
+	})
+	var calls atomic.Int64
+	var onBusy func()
+	rm := removerFunc(func(context.Context, string) error {
+		if calls.Add(1) == 1 {
+			onBusy() // the guest dequeues a job while the removal is in flight
+		}
+		return fmt.Errorf("remove: %w", core.ErrRemovalUnknown)
+	})
+	s := New(Options{Max: 2, Provisioner: prov, JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	s.Reconcile(ctx, 1)
+	onBusy = <-busyCh
+	waitRunning(t, s, 1)
+
+	s.Reconcile(ctx, 0)
+	waitCalls(t, &calls, 1)
+	cancel()
+	waitRemoverStopped(t, s)
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("remover called %d times across shutdown, want 1", got)
+	}
+
+	close(release)
+	s.Drain()
+}
+
+// TestUnconfirmedRemovalOfABusyVMIsNotRetried verifies that once the guest
+// has dequeued a job, an unconfirmed removal is dropped rather than retried:
+// the runner is plainly still registered.
+func TestUnconfirmedRemovalOfABusyVMIsNotRetried(t *testing.T) {
+	old := removeRetryDelay
+	removeRetryDelay = 10 * time.Millisecond
+	defer func() { removeRetryDelay = old }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	busyCh := make(chan func(), 1)
+	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		busyCh <- onBusy
+		<-vmCtx.Done()
+		return nil
+	})
+	var calls atomic.Int64
+	var onBusy func()
+	rm := removerFunc(func(context.Context, string) error {
+		calls.Add(1)
+		onBusy()
+		return fmt.Errorf("remove: %w", core.ErrRemovalUnknown)
+	})
+	s := New(Options{Max: 2, Provisioner: prov, JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	s.Reconcile(ctx, 1)
+	onBusy = <-busyCh
+	waitRunning(t, s, 1)
+
+	s.Reconcile(ctx, 0)
+	waitRemoverStopped(t, s)
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("remover called %d times for a busy VM, want 1", got)
+	}
+	if got := s.Running(); got != 1 {
+		t.Fatalf("running=%d want 1: the busy VM must survive", got)
+	}
+}
+
+func waitRemoverStopped(t *testing.T, s *Scheduler) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		s.mu.Lock()
+		active := s.removerActive
+		s.mu.Unlock()
+		if !active {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("removeLoop never stopped")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+func waitCalls(t *testing.T, n *atomic.Int64, want int64) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for n.Load() < want {
+		select {
+		case <-deadline:
+			t.Fatalf("calls=%d want %d", n.Load(), want)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+func waitNotRemoving(t *testing.T, s *Scheduler) {
+	t.Helper()
+	waitHandles(t, s, func(h *vmHandle) bool { return !h.removing })
+}
+
+func waitIdleBusy(t *testing.T, s *Scheduler) {
+	t.Helper()
+	waitHandles(t, s, func(h *vmHandle) bool { return !h.removing && h.busy && !h.cancelled })
+}
+
+func waitHandles(t *testing.T, s *Scheduler, ok func(*vmHandle) bool) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		s.mu.Lock()
+		all := len(s.active) > 0
+		for _, h := range s.active {
+			all = all && ok(h)
+		}
+		s.mu.Unlock()
+		if all {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("handles never reached the expected state")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
 }
 
 func TestBackoffDelay(t *testing.T) {

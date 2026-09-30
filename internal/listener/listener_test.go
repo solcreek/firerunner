@@ -3,6 +3,7 @@ package listener
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -225,6 +226,79 @@ func TestIsSessionConflict(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := isSessionConflict(tc.err); got != tc.want {
 				t.Fatalf("isSessionConflict(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+type lookup struct {
+	ref *scaleset.RunnerReference
+	err error
+}
+
+// fakeRemover answers GetRunnerByName from lookups in order (the last one
+// repeats) and RemoveRunner with removeErr.
+type fakeRemover struct {
+	lookups   []lookup
+	removeErr error
+	removed   []int64
+	looked    int
+}
+
+func (f *fakeRemover) GetRunnerByName(context.Context, string) (*scaleset.RunnerReference, error) {
+	l := f.lookups[min(f.looked, len(f.lookups)-1)]
+	f.looked++
+	return l.ref, l.err
+}
+
+func (f *fakeRemover) RemoveRunner(_ context.Context, id int64) error {
+	f.removed = append(f.removed, id)
+	return f.removeErr
+}
+
+// TestJITSourceRemoveRunnerMapsErrors pins the contract the scheduler relies
+// on: only JobStillRunning reads as busy; a runner GitHub no longer knows is
+// gone; an ambiguous DELETE failure is settled by asking GitHub again, and is
+// ErrRemovalUnknown only when that also fails; any other error means the
+// runner is still registered.
+func TestJITSourceRemoveRunnerMapsErrors(t *testing.T) {
+	ref := &scaleset.RunnerReference{ID: 42, Name: "r"}
+	found := lookup{ref: ref}
+	gone := lookup{}
+	down := lookup{err: errors.New("503")}
+	cases := []struct {
+		name        string
+		fake        fakeRemover
+		wantErr     bool
+		wantBusy    bool
+		wantUnknown bool
+		wantRemove  bool
+	}{
+		{"removed", fakeRemover{lookups: []lookup{found}}, false, false, false, true},
+		{"unknown runner", fakeRemover{lookups: []lookup{gone}}, false, false, false, false},
+		{"lookup failure", fakeRemover{lookups: []lookup{down}}, true, false, false, false},
+		{"not found on remove", fakeRemover{lookups: []lookup{found}, removeErr: fmt.Errorf("req: %w: gone", scaleset.RunnerNotFoundError)}, false, false, false, true},
+		{"job assigned", fakeRemover{lookups: []lookup{found}, removeErr: fmt.Errorf("req: %w: busy", scaleset.JobStillRunningError)}, true, true, false, true},
+		{"remove failed, verify finds it", fakeRemover{lookups: []lookup{found, found}, removeErr: errors.New("503")}, true, false, false, true},
+		{"remove failed, verify finds it gone", fakeRemover{lookups: []lookup{found, gone}, removeErr: context.DeadlineExceeded}, false, false, false, true},
+		{"remove failed, verify fails", fakeRemover{lookups: []lookup{found, down}, removeErr: context.DeadlineExceeded}, true, false, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := tc.fake
+			j := &JITSource{remover: &f}
+			err := j.RemoveRunner(context.Background(), "r")
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, tc.wantErr)
+			}
+			if got := errors.Is(err, core.ErrRunnerBusy); got != tc.wantBusy {
+				t.Fatalf("errors.Is(err, ErrRunnerBusy)=%v want %v (err=%v)", got, tc.wantBusy, err)
+			}
+			if got := errors.Is(err, core.ErrRemovalUnknown); got != tc.wantUnknown {
+				t.Fatalf("errors.Is(err, ErrRemovalUnknown)=%v want %v (err=%v)", got, tc.wantUnknown, err)
+			}
+			if got := len(f.removed) == 1 && f.removed[0] == 42; got != tc.wantRemove {
+				t.Fatalf("removed=%v wantRemove=%v", f.removed, tc.wantRemove)
 			}
 		})
 	}

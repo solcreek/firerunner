@@ -299,12 +299,14 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			return fmt.Errorf("tier %q: %w", t.Name, err)
 		}
 		listeners = append(listeners, lis)
+		jit := lis.JIT()
 		scheds = append(scheds, scheduler.New(scheduler.Options{
 			Max:         t.Max,
 			Min:         t.Min,
 			Spec:        t.Spec(),
 			Provisioner: prov,
-			JIT:         lis.JIT(),
+			JIT:         jit,
+			Remover:     jit,
 			Logger:      tlog,
 			Pending:     &pending,
 		}))
