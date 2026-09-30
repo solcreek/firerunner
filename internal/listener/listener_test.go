@@ -3,6 +3,7 @@ package listener
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -225,6 +226,59 @@ func TestIsSessionConflict(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := isSessionConflict(tc.err); got != tc.want {
 				t.Fatalf("isSessionConflict(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+type fakeRemover struct {
+	ref       *scaleset.RunnerReference
+	lookupErr error
+	removeErr error
+	removed   []int64
+}
+
+func (f *fakeRemover) GetRunnerByName(context.Context, string) (*scaleset.RunnerReference, error) {
+	return f.ref, f.lookupErr
+}
+
+func (f *fakeRemover) RemoveRunner(_ context.Context, id int64) error {
+	f.removed = append(f.removed, id)
+	return f.removeErr
+}
+
+// TestJITSourceRemoveRunnerMapsErrors pins the mapping the scheduler relies on:
+// only JobStillRunning reads as busy, and a runner GitHub no longer knows is
+// already gone.
+func TestJITSourceRemoveRunnerMapsErrors(t *testing.T) {
+	ref := &scaleset.RunnerReference{ID: 42, Name: "r"}
+	cases := []struct {
+		name       string
+		fake       fakeRemover
+		wantErr    bool
+		wantBusy   bool
+		wantRemove bool
+	}{
+		{"removed", fakeRemover{ref: ref}, false, false, true},
+		{"unknown runner", fakeRemover{}, false, false, false},
+		{"not found on remove", fakeRemover{ref: ref, removeErr: fmt.Errorf("req: %w: gone", scaleset.RunnerNotFoundError)}, false, false, true},
+		{"job assigned", fakeRemover{ref: ref, removeErr: fmt.Errorf("req: %w: busy", scaleset.JobStillRunningError)}, true, true, true},
+		{"other remove failure", fakeRemover{ref: ref, removeErr: errors.New("503")}, true, false, true},
+		{"lookup failure", fakeRemover{lookupErr: errors.New("503")}, true, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := tc.fake
+			j := &JITSource{remover: &f}
+			err := j.RemoveRunner(context.Background(), "r")
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, tc.wantErr)
+			}
+			if got := errors.Is(err, core.ErrRunnerBusy); got != tc.wantBusy {
+				t.Fatalf("errors.Is(err, ErrRunnerBusy)=%v want %v (err=%v)", got, tc.wantBusy, err)
+			}
+			if got := len(f.removed) == 1 && f.removed[0] == 42; got != tc.wantRemove {
+				t.Fatalf("removed=%v wantRemove=%v", f.removed, tc.wantRemove)
 			}
 		})
 	}
