@@ -271,11 +271,19 @@ var removeRetryDelay = 2 * time.Second
 // attempts in flight. It waits for each answer rather than racing a deadline:
 // an abandoned call could still succeed and leave a deregistered VM counted as
 // live. The Remover bounds each attempt (see RunnerRemover).
+//
+// Shutdown ends the loop: the drain cancels idle VMs itself and lets busy ones
+// finish, so a removal still queued or awaiting a retry has nothing left to
+// protect, and retrying it without the delay would only hammer GitHub.
 func (s *Scheduler) removeLoop(ctx context.Context) {
 	for {
 		s.mu.Lock()
-		name, ok := s.nextRemoval()
+		name, ok := "", false
+		if ctx.Err() == nil {
+			name, ok = s.nextRemoval()
+		}
 		if !ok {
+			s.removeQ = nil
 			s.removerActive = false
 			s.mu.Unlock()
 			return
@@ -292,15 +300,22 @@ func (s *Scheduler) removeLoop(ctx context.Context) {
 	}
 }
 
-// nextRemoval pops the next queued VM that is still waiting to be removed.
-// Callers must hold s.mu.
+// nextRemoval pops the next queued VM that is still waiting to be removed. A
+// VM whose guest dequeued a job while queued leaves the queue for good: its
+// runner is plainly still registered and busy. Callers must hold s.mu.
 func (s *Scheduler) nextRemoval() (string, bool) {
 	for len(s.removeQ) > 0 {
 		name := s.removeQ[0]
 		s.removeQ = s.removeQ[1:]
-		if h := s.active[name]; h != nil && h.removing && !h.cancelled {
-			return name, true
+		h := s.active[name]
+		if h == nil || !h.removing || h.cancelled {
+			continue
 		}
+		if h.busy {
+			h.removing = false
+			continue
+		}
+		return name, true
 	}
 	return "", false
 }
@@ -317,7 +332,7 @@ func (s *Scheduler) settleRemoval(name string, err error) bool {
 	if h == nil || h.cancelled {
 		return false // exited, or shutdown reaped it, while we waited
 	}
-	if errors.Is(err, core.ErrRemovalUnknown) {
+	if errors.Is(err, core.ErrRemovalUnknown) && !h.busy {
 		s.opts.Logger.Warn("runner removal unconfirmed; retrying", "runner", name, "err", err)
 		s.removeQ = append(s.removeQ, name)
 		return true
